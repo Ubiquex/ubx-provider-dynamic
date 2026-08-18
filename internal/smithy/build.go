@@ -71,6 +71,29 @@ func Build(doc *Model, providerName string, known KnownNames) (map[string]*Built
 			notes = append(notes, schemaNotes(providerName, res.Noun, tr.Notes)...)
 		}
 
+		// createOp's own OUTPUT is real, additional schema signal Checkpoint
+		// 1 did not yet translate -- a real, structural gap Checkpoint 2's
+		// own live testing surfaced (not assumed from reading the code):
+		// SQS's own real CreateQueueRequest (create input) and
+		// GetQueueAttributesResult (read output) neither one carries
+		// QueueUrl at all -- it exists ONLY on CreateQueueResult (create
+		// OUTPUT), yet GetQueueAttributes' own real INPUT REQUIRES it to
+		// look the queue up at all. Without merging create's own output
+		// too, "queue_url" was never a real schema attribute, and a real
+		// ReadResource call had no identifying value to send -- confirmed
+		// live via TestServer_RealSQSReadResource failing with an empty
+		// request body before this fix.
+		var createOutputAttrs []*tfprotov6.SchemaAttribute
+		if createOp.Output != nil {
+			s, err := conv.Convert(createOp.Output.Target)
+			if err != nil {
+				return nil, notes, fmt.Errorf("resource %s: create output: %w", res.Noun, err)
+			}
+			tr := uschema.NewTranslator()
+			createOutputAttrs = tr.BuildTopLevel(s, providerName+"."+res.Noun+".create_output")
+			notes = append(notes, schemaNotes(providerName, res.Noun, tr.Notes)...)
+		}
+
 		readOp := doc.Shapes[res.ReadOperationID]
 		var readAttrs []*tfprotov6.SchemaAttribute
 		if readOp.Output != nil {
@@ -83,11 +106,13 @@ func Build(doc *Model, providerName string, known KnownNames) (map[string]*Built
 			notes = append(notes, schemaNotes(providerName, res.Noun, tr.Notes)...)
 		}
 
-		merged := uschema.MergeResourceAttributes(createAttrs, readAttrs)
+		merged := uschema.MergeResourceAttributes(uschema.MergeResourceAttributes(createAttrs, createOutputAttrs), readAttrs)
 		if len(merged) == 0 {
-			notes = append(notes, fmt.Sprintf("[schema] %s: neither the create input nor the read output yielded any attributes -- skipped", res.Noun))
+			notes = append(notes, fmt.Sprintf("[schema] %s: neither the create input/output nor the read output yielded any attributes -- skipped", res.Noun))
 			continue
 		}
+
+		ensureIdentifyingAttrsPresent(&merged, doc, res.ReadOperationID)
 
 		block := &tfprotov6.SchemaBlock{Version: 1, Attributes: merged}
 		objType, ok := block.ValueType().(tftypes.Object)
@@ -110,6 +135,51 @@ func Build(doc *Model, providerName string, known KnownNames) (map[string]*Built
 	}
 
 	return out, notes, nil
+}
+
+// ensureIdentifyingAttrsPresent guarantees every REQUIRED member of
+// readOperationID's own real input shape has a corresponding schema
+// attribute -- Smithy's own real equivalent of dynserver/build.go's
+// identical ensurePathParamsPresent, needed for the identical real reason:
+// a CRUD executor cannot look a resource instance up without a real value
+// to send, and a real AWS read operation's own required input (e.g. SQS's
+// GetQueueAttributes needs QueueUrl) is not guaranteed to appear in create
+// input/output or read output at all -- merging create's own output
+// (this file's own recent change) covers SQS's own real case, but is not a
+// universal guarantee across every real AWS service's own shape, so this
+// exists as the same honest fallback dynserver's own OpenAPI path takes:
+// synthesize a plain, Required string attribute for anything still
+// missing, rather than leaving the resource unable to address its own
+// instances.
+func ensureIdentifyingAttrsPresent(attrs *[]*tfprotov6.SchemaAttribute, doc *Model, readOperationID string) {
+	readOp, ok := doc.Shapes[readOperationID]
+	if !ok || readOp.Input == nil {
+		return
+	}
+	inputShape, ok := doc.Shapes[readOp.Input.Target]
+	if !ok {
+		return
+	}
+	have := map[string]bool{}
+	for _, a := range *attrs {
+		have[a.Name] = true
+	}
+	for memberName, member := range inputShape.Members {
+		if !member.HasTrait("smithy.api#required") {
+			continue
+		}
+		snake := uschema.ToSnakeCase(memberName)
+		if have[snake] {
+			continue
+		}
+		*attrs = append(*attrs, &tfprotov6.SchemaAttribute{
+			Name:        snake,
+			Type:        tftypes.String,
+			Required:    true,
+			Description: "identifying value required by the read operation, not part of the API's own create/read response representation",
+		})
+		have[snake] = true
+	}
 }
 
 func schemaNotes(providerName, noun string, notes []uschema.Note) []string {

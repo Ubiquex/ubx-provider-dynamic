@@ -99,6 +99,31 @@ type Provider struct {
 	BaseURL      string           `toml:"base_url"`
 	Auth         Auth             `toml:"auth"`
 
+	// TargetPrefix is UBI-158 Phase 4 Checkpoint 2's own real, confirmed
+	// finding: AWS's own published Smithy models (schema_source = "smithy")
+	// carry NO field at all for the awsJson1_0/awsJson1_1 wire protocols'
+	// own real X-Amz-Target header prefix -- confirmed directly this
+	// session by diffing real aws-cli --debug request traces against the
+	// real, same-session-fetched Smithy model files for three structurally
+	// different services: SQS's real target prefix is "AmazonSQS" (a real
+	// "Amazon"+sdkId shape), DynamoDB's is "DynamoDB_20120810" (service
+	// name + real API version, NOT the same shape at all), neither of which
+	// appears anywhere in either service's own model JSON. Guessing this
+	// (e.g. always "Amazon"+sdkId) would silently misfire against
+	// DynamoDB-shaped services -- AWS's own UnknownOperationException is
+	// the real, loud failure a wrong guess would produce, but this
+	// provider does not guess at all: TargetPrefix is required, explicit
+	// config for any Smithy-sourced provider whose model resolves to
+	// awsJson1_0/awsJson1_1 (validated once the model is loaded and its
+	// real protocol is known -- see smithy.Build's own caller in main.go --
+	// not here, since this table's own validate() runs before any model
+	// fetch). Unused for every other real protocol (restJson1/restXml
+	// derive everything from the model's own smithy.api#http trait;
+	// awsQuery/ec2Query derive their own Action/Version framing from the
+	// model's own operation name and service Version field, both real,
+	// present fields).
+	TargetPrefix string `toml:"target_prefix"`
+
 	// Retry/Timeouts/Resources are UBI-158 Phase 3's own execution-
 	// semantics config -- see execution.go's own doc comment. All
 	// optional: an absent [retry]/[timeouts] table, or an absent
