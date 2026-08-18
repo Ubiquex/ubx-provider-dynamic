@@ -8,11 +8,14 @@ Launched by `ubx` exactly like any HashiCorp provider binary
 (`provider.Acquire` / `provider.Launch`, same subprocess-launch mechanism,
 same tfplugin gRPC handshake) — zero special-casing in `ubx` core.
 
-## Status: Phase 3
+## Status: Phase 4 Checkpoint 1 (AWS via Smithy: schema + naming)
 
-Layers 1-4, auth, and execution semantics (retry/backoff, per-operation
-timeouts, async polling, field-level drift). SigV4 itself, Smithy, and the
-conformance gate remain out of scope.
+Layers 1-4, auth, execution semantics, and now a second schema source
+(Smithy) with real discovery/translation/naming, proven against real AWS
+models. Real per-protocol wire execution against AWS (Checkpoint 2), SigV4
+signing itself, and the conformance gate remain out of scope -- see
+`internal/smithy`'s own doc comments and `main.go`'s own explicit refusal
+to serve a Smithy-sourced provider until Checkpoint 2 lands.
 
 1. **tfplugin server** (`internal/dynserver`, `cmd/ubx-provider-dynamic`) —
    the real gRPC surface, served via `terraform-plugin-go`'s own
@@ -61,6 +64,26 @@ conformance gate remain out of scope.
    `classifyRESTError` doc comment for why this specific split is what lets
    `ubx` core's own reconcile-by-query (`docs/executor.md` in the
    `ubiquex` monorepo) do its job instead of this provider guessing.
+7. **Smithy schema source** (`internal/smithy`, UBI-158 Phase 4 Checkpoint 1)
+   — `schema_source = "smithy"`: AWS's own real, official, daily-published
+   service models (`github.com/aws/api-models-aws`, confirmed live). Real
+   findings, not assumed: AWS's own published models declare no Smithy
+   `resource` shapes in practice, so resources are grouped by a real,
+   AWS-wide verb+noun operation-naming convention instead
+   (`Create`/`Run` + `Get`/`Describe` + `Update`/`Modify`/`Put`/`Set` +
+   `Delete`); Smithy shapes convert into the *exact same* `openapi3.Schema`
+   tree Phase 1's translator already consumes, unchanged (`toschema.go`),
+   including Smithy's own `oneOf`-shaped tagged unions activating that
+   translator's existing lossy-union-collapse path for free. The naming
+   compatibility layer (`naming.go`) resolves a real HashiCorp-compatible
+   name via a formula (`aws_<endpointPrefix>_<noun>`) checked against a
+   real, embedded snapshot of `hashicorp/aws`'s own live resource names
+   (dumped via `ubx`'s own `provider.Acquire`/`Launch`) — with a documented,
+   confirmed-live exception: EC2's own naming is genuinely irregular
+   (`aws_instance`/`aws_vpc` drop the service prefix entirely; EBS gets its
+   own distinct prefix) and needs a bare-name fallback or an honestly
+   unresolved result, not a forced formula. See `internal/smithy`'s own
+   package doc comments for the full, real findings.
 
 `internal/wire` (tftypes ↔ plain JSON) and `internal/restexec` (real HTTP
 CRUD execution) are the layer-4/6 glue a Dynamic Provider needs that a real
@@ -154,6 +177,20 @@ homepage = "lowercase"
 `<derived_type_name>` is this provider's own `<provider>_<resource>` name
 (e.g. `github_full_repository`) — run discovery once (any command, or the
 live validation tests) to see the real, derived names for a given spec.
+
+Smithy (`schema_url` points directly at one real AWS service's own model
+file):
+
+```toml
+[dynamic_providers.aws]
+schema_source = "smithy"
+schema_url = "https://raw.githubusercontent.com/aws/api-models-aws/main/models/sqs/service/2012-11-05/sqs-2012-11-05.json"
+base_url = "https://sqs.us-east-1.amazonaws.com"
+```
+
+Running this today (Checkpoint 1) prints real discovery/naming results to
+stderr, then refuses to serve — real request execution against AWS is
+Checkpoint 2.
 
 ## Testing
 

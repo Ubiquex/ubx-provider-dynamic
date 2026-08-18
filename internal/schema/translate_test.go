@@ -231,8 +231,8 @@ func TestTfName(t *testing.T) {
 		"default_branch": "default_branch",
 	}
 	for in, want := range cases {
-		if got := tfName(in); got != want {
-			t.Errorf("tfName(%q) = %q, want %q", in, got, want)
+		if got := ToSnakeCase(in); got != want {
+			t.Errorf("ToSnakeCase(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
