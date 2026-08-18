@@ -9,6 +9,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
 	"github.com/ubiquex/ubx-provider-dynamic/internal/auth"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/restexec"
 )
 
@@ -44,7 +45,7 @@ func TestServer_AuthenticatedReadResource_RealAuthFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resources, notes, err := Build(buildTestDoc(), "test")
+	resources, notes, err := Build(buildTestDoc(), "test", config.Provider{})
 	if err != nil {
 		t.Fatalf("Build: %v (notes: %v)", err, notes)
 	}
@@ -76,7 +77,7 @@ func TestServer_UnauthenticatedReadResource_RealRejection(t *testing.T) {
 	ts := httptest.NewServer(requireHeaderMiddleware(api.handler(), "Authorization", "Bearer real-secret-token"))
 	defer ts.Close()
 
-	resources, notes, err := Build(buildTestDoc(), "test")
+	resources, notes, err := Build(buildTestDoc(), "test", config.Provider{})
 	if err != nil {
 		t.Fatalf("Build: %v (notes: %v)", err, notes)
 	}

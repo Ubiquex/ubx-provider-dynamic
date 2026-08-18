@@ -14,6 +14,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
+	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/openapi"
 )
 
@@ -44,7 +45,7 @@ func validateSpec(t *testing.T, providerName, url string, wantAtLeastOneOf []str
 		t.Fatalf("load %s spec: %v", providerName, err)
 	}
 
-	resources, notes, err := Build(doc, providerName)
+	resources, notes, err := Build(doc, providerName, config.Provider{})
 	if err != nil {
 		t.Fatalf("build %s resources: %v", providerName, err)
 	}

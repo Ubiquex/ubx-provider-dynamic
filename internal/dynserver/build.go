@@ -11,28 +11,48 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
+	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/resourcemap"
 	uschema "github.com/ubiquex/ubx-provider-dynamic/internal/schema"
 )
 
 // ResourceType is one fully-built, ready-to-serve resource: its discovered
-// CRUD operations (resourcemap.Resource) plus its final, merged tfplugin
-// schema.
+// CRUD operations (resourcemap.Resource), its final, merged tfplugin
+// schema, and its own resolved UBI-158 Phase 3 execution policy (Timeouts
+// are provider-wide, so every ResourceType shares one resolved value;
+// Async/Drift are genuinely per-resource-type, resolved from
+// cfg.Resources[TypeName] if present, zero-value otherwise -- Async's own
+// zero value has Enabled=false, Drift's own zero value ignores/normalizes
+// nothing, both real, safe "do nothing extra" defaults for a resource a
+// config author hasn't configured either for).
 type ResourceType struct {
 	resourcemap.Resource
 	Schema     *tfprotov6.Schema
 	ObjectType tftypes.Object
+	Timeouts   Timeouts
+	Async      AsyncPolicy
+	Drift      DriftPolicy
 }
 
 // Build discovers every CRUD-shaped resource in doc and translates each
 // one's schema, returning them keyed by TypeName alongside every layer 2/3
 // Note collected along the way (translation decisions, skipped/heuristic
 // resource-mapping calls) -- the real substance of Phase 1's own "report
-// back" requirement.
-func Build(doc *openapi3.T, providerName string) (map[string]*ResourceType, []string, error) {
+// back" requirement. cfg supplies Phase 3's own execution-semantics
+// config (retry/timeouts/async/drift); the retry policy itself is
+// resolved by the caller (main.go) directly onto the restexec.Client, not
+// here -- Build's own job is per-resource-type policy, retry is
+// provider-wide and belongs on the Client that already carries BaseURL/
+// Authenticator.
+func Build(doc *openapi3.T, providerName string, cfg config.Provider) (map[string]*ResourceType, []string, error) {
 	resources, mapNotes, err := resourcemap.Discover(doc, providerName)
 	if err != nil {
 		return nil, nil, fmt.Errorf("resource mapping: %w", err)
+	}
+
+	timeouts, err := resolveTimeouts(cfg.Timeouts)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve timeouts: %w", err)
 	}
 
 	var notes []string
@@ -75,7 +95,24 @@ func Build(doc *openapi3.T, providerName string) (map[string]*ResourceType, []st
 			notes = append(notes, fmt.Sprintf("[schema] %s.%s: %s", res.TypeName, n.Path, n.Detail))
 		}
 
-		out[res.TypeName] = &ResourceType{Resource: res, Schema: schemaOut, ObjectType: objType}
+		resCfg := cfg.Resources[res.TypeName]
+		async, err := resolveAsyncPolicy(resCfg.Async)
+		if err != nil {
+			return nil, notes, fmt.Errorf("resource %s: resolve async policy: %w", res.TypeName, err)
+		}
+		drift, err := resolveDriftPolicy(resCfg.Drift)
+		if err != nil {
+			return nil, notes, fmt.Errorf("resource %s: resolve drift policy: %w", res.TypeName, err)
+		}
+
+		out[res.TypeName] = &ResourceType{
+			Resource:   res,
+			Schema:     schemaOut,
+			ObjectType: objType,
+			Timeouts:   timeouts,
+			Async:      async,
+			Drift:      drift,
+		}
 	}
 
 	return out, notes, nil

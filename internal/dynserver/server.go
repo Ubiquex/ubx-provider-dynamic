@@ -4,12 +4,27 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
 	"github.com/ubiquex/ubx-provider-dynamic/internal/restexec"
 )
+
+// withOperationTimeout bounds one real HTTP call to d, independent of
+// ubx core's own ambient --ship deadline (docs/executor.md: core sets no
+// per-RPC timeout of its own around ApplyResourceChange/ReadResource --
+// this is UBI-158 Phase 3's own answer to that gap). d<=0 (Timeouts
+// resolved from a zero-value config.TimeoutsConfig, e.g. in a test that
+// constructs a Server directly rather than via Build) means "no
+// additional bound," deferring entirely to ctx's own existing deadline.
+func withOperationTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, d)
+}
 
 // Server is the real tfprotov6.ProviderServer this binary serves over
 // tf6server.Serve -- the tfplugin server layer (layer 1), wired to the
@@ -43,6 +58,30 @@ func (s *Server) resourceType(typeName string) (*ResourceType, error) {
 
 func diagError(summary, detail string) []*tfprotov6.Diagnostic {
 	return []*tfprotov6.Diagnostic{{Severity: tfprotov6.DiagnosticSeverityError, Summary: summary, Detail: detail}}
+}
+
+// classifyRESTError translates a restexec.Client.Do error into exactly one
+// of: a terminal Diagnostic (a real, structured rejection -- safe to
+// report, since ubx core's own docs/executor.md taxonomy never retries a
+// Diagnostic-bearing response within one ship invocation, cli/stateadapter.go's
+// real implementation of that rule), or a plain, propagated Go error
+// (ambiguous -- returned as-is so THIS RPC method's own (nil, err) return
+// reaches ubx core exactly the way a dropped connection or context
+// deadline would, triggering reconcile-by-query rather than a guess).
+//
+// This is the load-bearing seam UBI-158 Phase 3 exists to get right: every
+// earlier Phase 1/2 call site wrapped every restexec failure as a
+// Diagnostic unconditionally, which meant a merely transient failure (a
+// 503, a dropped connection) got classified exactly like a real, certain
+// rejection -- ubx core would never retry it, never verify ground truth,
+// just mark the resource failed on a guess. See restexec.IsTerminal's own
+// doc comment for why "not terminal" is the deliberate default whenever
+// genuinely uncertain.
+func classifyRESTError(op string, err error) (diags []*tfprotov6.Diagnostic, ambiguous error) {
+	if restexec.IsTerminal(err) {
+		return diagError(op, err.Error()), nil
+	}
+	return nil, fmt.Errorf("%s: %w", op, err)
 }
 
 // --- Provider-level RPCs ---
@@ -144,7 +183,10 @@ func (s *Server) ImportResourceState(ctx context.Context, req *tfprotov6.ImportR
 		return &tfprotov6.ImportResourceStateResponse{Diagnostics: diagError("invalid import ID", err.Error())}, nil
 	}
 
-	newVal, diags := s.readFromAPI(ctx, rt, params)
+	newVal, diags, ambiguous := s.readFromAPI(ctx, rt, params)
+	if ambiguous != nil {
+		return nil, ambiguous
+	}
 	if diags != nil {
 		return &tfprotov6.ImportResourceStateResponse{Diagnostics: diags}, nil
 	}
@@ -184,7 +226,10 @@ func (s *Server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 		return &tfprotov6.ReadResourceResponse{Diagnostics: diagError("read resource", err.Error())}, nil
 	}
 
-	newVal, diags := s.readFromAPI(ctx, rt, params)
+	newVal, diags, ambiguous := s.readFromAPI(ctx, rt, params)
+	if ambiguous != nil {
+		return nil, ambiguous
+	}
 	if diags != nil {
 		return &tfprotov6.ReadResourceResponse{Diagnostics: diags}, nil
 	}
@@ -195,13 +240,19 @@ func (s *Server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 		return &tfprotov6.ReadResourceResponse{}, nil
 	}
 
-	// allPathParams, not just rt.PathParams: a create-only path attribute
-	// (e.g. "org" on a resource read at /repos/{owner}/{repo} but created
-	// at /orgs/{org}/repos) is never part of any read response either --
-	// it must keep being carried forward from state on every read, not
-	// just at create/update, or it would silently go null the first time
-	// this resource is refreshed.
-	merged, err := mergeCarryForward(*newVal, current, allPathParams(rt))
+	normalized, err := applyNormalizers(*newVal, rt.Drift.Normalize)
+	if err != nil {
+		return &tfprotov6.ReadResourceResponse{Diagnostics: diagError("normalize read result", err.Error())}, nil
+	}
+
+	// carryForwardFields, not just rt.PathParams: a create-only path
+	// attribute (e.g. "org" on a resource read at /repos/{owner}/{repo}
+	// but created at /orgs/{org}/repos) is never part of any read
+	// response either -- it must keep being carried forward from state
+	// on every read, not just at create/update, or it would silently go
+	// null the first time this resource is refreshed. Drift.Ignore fields
+	// ride the identical mechanism (UBI-158 Phase 3).
+	merged, err := mergeCarryForward(normalized, current, carryForwardFields(rt))
 	if err != nil {
 		return &tfprotov6.ReadResourceResponse{Diagnostics: diagError("merge read result", err.Error())}, nil
 	}
@@ -212,26 +263,33 @@ func (s *Server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 	return &tfprotov6.ReadResourceResponse{NewState: &dv}, nil
 }
 
-// readFromAPI performs the real GET, returning (nil, nil) for a genuine
-// 404 (not-found is not an error here, it's ReadResource's own real
-// "this resource is gone" signal) and (nil, diags) for any other failure.
-func (s *Server) readFromAPI(ctx context.Context, rt *ResourceType, params map[string]string) (*tftypes.Value, []*tfprotov6.Diagnostic) {
+// readFromAPI performs the real GET, returning (nil, nil, nil) for a
+// genuine 404 (not-found is not an error here, it's ReadResource's own
+// real "this resource is gone" signal), (nil, diags, nil) for a terminal
+// failure, and (nil, nil, err) for an ambiguous one -- see
+// classifyRESTError's own doc comment for why these are kept distinct
+// rather than all becoming Diagnostics.
+func (s *Server) readFromAPI(ctx context.Context, rt *ResourceType, params map[string]string) (*tftypes.Value, []*tfprotov6.Diagnostic, error) {
+	ctx, cancel := withOperationTimeout(ctx, rt.Timeouts.Read)
+	defer cancel()
+
 	path, err := restexec.BuildPath(rt.ReadPath, params)
 	if err != nil {
-		return nil, diagError("build read request", err.Error())
+		return nil, diagError("build read request", err.Error()), nil
 	}
-	_, body, err := s.Client.Do(ctx, "GET", path, nil)
+	_, body, _, err := s.Client.Do(ctx, "GET", path, nil)
 	if err != nil {
 		if restexec.IsNotFound(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, diagError("read resource", err.Error())
+		diags, ambiguous := classifyRESTError("read resource", err)
+		return nil, diags, ambiguous
 	}
 	v, err := valueFromResponse(body, rt.ObjectType)
 	if err != nil {
-		return nil, diagError("decode API response", err.Error())
+		return nil, diagError("decode API response", err.Error()), nil
 	}
-	return &v, nil
+	return &v, nil, nil
 }
 
 // PlanResourceChange is deliberately minimal, matching the same real
@@ -299,20 +357,49 @@ func (s *Server) applyCreate(ctx context.Context, rt *ResourceType, req *tfproto
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("encode create request body", err.Error())}, nil
 	}
 
-	_, respBody, err := s.Client.Do(ctx, rt.CreateMethod, path, body)
+	doCtx, cancel := withOperationTimeout(ctx, rt.Timeouts.Create)
+	_, respBody, respHeader, err := s.Client.Do(doCtx, rt.CreateMethod, path, body)
+	cancel()
 	if err != nil {
-		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("create resource", err.Error())}, nil
+		diags, ambiguous := classifyRESTError("create resource", err)
+		if ambiguous != nil {
+			// Real, load-bearing consequence of ship.go's own
+			// retryCreateOnDependencyNotVisible (docs/executor.md, UBI-92):
+			// that mechanism only ever fires on a TERMINAL, not-found-shaped
+			// diagnostic -- an ambiguous error here (this branch) instead
+			// leaves the resource at unknown_post_timeout for a human or a
+			// future `ubx ship` re-run to resolve, exactly like ship.go's
+			// own documented "create has no lookup key to reconcile against
+			// yet" limitation already accepts for every other ambiguous
+			// create failure. This provider does not try to do better than
+			// core already does here.
+			return nil, ambiguous
+		}
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diags}, nil
 	}
 
 	newVal, err := valueFromResponse(respBody, rt.ObjectType)
 	if err != nil {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("decode create response", err.Error())}, nil
 	}
-	merged, err := mergeCarryForward(newVal, planned, allPathParams(rt))
+	normalized, err := applyNormalizers(newVal, rt.Drift.Normalize)
+	if err != nil {
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("normalize create result", err.Error())}, nil
+	}
+	merged, err := mergeCarryForward(normalized, planned, carryForwardFields(rt))
 	if err != nil {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("merge create result", err.Error())}, nil
 	}
-	dv, err := tfprotov6.NewDynamicValue(rt.ObjectType, merged)
+
+	final, diags, err := s.finalizeAfterWrite(ctx, rt, respBody, respHeader, merged)
+	if err != nil {
+		return nil, err
+	}
+	if diags != nil {
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diags}, nil
+	}
+
+	dv, err := tfprotov6.NewDynamicValue(rt.ObjectType, final)
 	if err != nil {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("encode new state", err.Error())}, nil
 	}
@@ -346,20 +433,39 @@ func (s *Server) applyUpdate(ctx context.Context, rt *ResourceType, req *tfproto
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("encode update request body", err.Error())}, nil
 	}
 
-	_, respBody, err := s.Client.Do(ctx, rt.UpdateMethod, path, body)
+	doCtx, cancel := withOperationTimeout(ctx, rt.Timeouts.Update)
+	_, respBody, respHeader, err := s.Client.Do(doCtx, rt.UpdateMethod, path, body)
+	cancel()
 	if err != nil {
-		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("update resource", err.Error())}, nil
+		diags, ambiguous := classifyRESTError("update resource", err)
+		if ambiguous != nil {
+			return nil, ambiguous
+		}
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diags}, nil
 	}
 
 	newVal, err := valueFromResponse(respBody, rt.ObjectType)
 	if err != nil {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("decode update response", err.Error())}, nil
 	}
-	merged, err := mergeCarryForward(newVal, planned, allPathParams(rt))
+	normalized, err := applyNormalizers(newVal, rt.Drift.Normalize)
+	if err != nil {
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("normalize update result", err.Error())}, nil
+	}
+	merged, err := mergeCarryForward(normalized, planned, carryForwardFields(rt))
 	if err != nil {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("merge update result", err.Error())}, nil
 	}
-	dv, err := tfprotov6.NewDynamicValue(rt.ObjectType, merged)
+
+	final, diags, err := s.finalizeAfterWrite(ctx, rt, respBody, respHeader, merged)
+	if err != nil {
+		return nil, err
+	}
+	if diags != nil {
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diags}, nil
+	}
+
+	dv, err := tfprotov6.NewDynamicValue(rt.ObjectType, final)
 	if err != nil {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("encode new state", err.Error())}, nil
 	}
@@ -396,15 +502,39 @@ func (s *Server) applyDestroy(ctx context.Context, rt *ResourceType, req *tfprot
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("build delete request", err.Error())}, nil
 	}
 
-	if _, _, err := s.Client.Do(ctx, "DELETE", path, nil); err != nil {
-		if !restexec.IsNotFound(err) {
-			return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("destroy resource", err.Error())}, nil
+	doCtx, cancel := withOperationTimeout(ctx, rt.Timeouts.Delete)
+	_, _, _, err = s.Client.Do(doCtx, "DELETE", path, nil)
+	cancel()
+	if err != nil && !restexec.IsNotFound(err) {
+		// Already gone (IsNotFound) is a real, honest destroy, not a lie
+		// (docs/executor.md's own UBI-44 finding: a lying destroy is one
+		// that reports success without the delete ever having taken
+		// effect; a 404 on delete means it already had) -- falls through
+		// to the clean success below, same as an ordinary successful
+		// DELETE.
+		//
+		// Everything else genuinely failed to delete. A terminal
+		// rejection (403/409/...) is reported as a Diagnostic and, per
+		// ship.go's own documented asymmetry (UBI-44: "terminal Apply
+		// errors get no read-back added"), core marks this failed
+		// immediately -- correct, since a real, structured rejection IS
+		// certainty. An ambiguous failure (network error, 5xx exhausted)
+		// is returned as a plain error instead: core's own
+		// reconcileDestroyLoop then verifies via a real ReadResource
+		// whether the delete secretly landed anyway, exactly the
+		// discipline this provider must not try to reimplement itself.
+		diags, ambiguous := classifyRESTError("destroy resource", err)
+		if ambiguous != nil {
+			return nil, ambiguous
 		}
-		// Already gone -- a real, honest destroy, not a lie (docs/executor.md's
-		// own UBI-44 finding: a lying destroy is one that reports success
-		// without the delete ever having taken effect; a 404 on delete
-		// means it already had).
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diags}, nil
 	}
+	// A clean response here (success, or already-gone) is NOT the final
+	// word for a destroy -- core's own ReadResource-based post-destroy
+	// read-back (UBI-44, docs/executor.md) verifies it independently
+	// before ever recording `destroyed`. This provider does not need its
+	// own read-back: returning a clean response is exactly what triggers
+	// core's universal one.
 	return &tfprotov6.ApplyResourceChangeResponse{}, nil
 }
 
@@ -461,20 +591,27 @@ func (s *Server) CloseEphemeralResource(context.Context, *tfprotov6.CloseEphemer
 	return &tfprotov6.CloseEphemeralResourceResponse{Diagnostics: diagError("not supported", "this provider defines no ephemeral resources")}, nil
 }
 
-func allPathParams(rt *ResourceType) []string {
+// carryForwardFields is every attribute name ReadResource/ApplyResourceChange's
+// own NewState construction must always echo back from prior/planned
+// state rather than whatever the API's fresh response says: read- and
+// create-path params (never part of the API's own JSON representation at
+// all -- see ensurePathParamsPresent) union'd with rt.Drift.Ignore (UBI-158
+// Phase 3: a field a config author has declared should never be reported
+// as drift, regardless of what the API returns for it -- the identical
+// mechanism, just a second real reason to use it).
+func carryForwardFields(rt *ResourceType) []string {
 	seen := map[string]bool{}
 	var out []string
-	for _, p := range rt.PathParams {
-		if !seen[p] {
-			seen[p] = true
-			out = append(out, p)
+	add := func(fields []string) {
+		for _, f := range fields {
+			if !seen[f] {
+				seen[f] = true
+				out = append(out, f)
+			}
 		}
 	}
-	for _, p := range rt.CreatePathParams {
-		if !seen[p] {
-			seen[p] = true
-			out = append(out, p)
-		}
-	}
+	add(rt.PathParams)
+	add(rt.CreatePathParams)
+	add(rt.Drift.Ignore)
 	return out
 }

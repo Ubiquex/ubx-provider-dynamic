@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
+	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/restexec"
 )
 
@@ -158,7 +159,7 @@ func splitPath(p string) []string {
 
 func buildTestServer(t *testing.T, baseURL string) (*Server, *ResourceType) {
 	t.Helper()
-	resources, notes, err := Build(buildTestDoc(), "test")
+	resources, notes, err := Build(buildTestDoc(), "test", config.Provider{})
 	if err != nil {
 		t.Fatalf("Build: %v (notes: %v)", err, notes)
 	}

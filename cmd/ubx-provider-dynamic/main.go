@@ -56,7 +56,7 @@ func run() error {
 		return fmt.Errorf("load OpenAPI spec: %w", err)
 	}
 
-	resources, notes, err := dynserver.Build(doc, name)
+	resources, notes, err := dynserver.Build(doc, name, cfg)
 	if err != nil {
 		return fmt.Errorf("build resource schemas: %w", err)
 	}
@@ -72,10 +72,17 @@ func run() error {
 		return fmt.Errorf("build authenticator: %w", err)
 	}
 
+	retryPolicy, err := dynserver.ResolveRetryPolicy(cfg.Retry)
+	if err != nil {
+		return fmt.Errorf("resolve retry policy: %w", err)
+	}
+	client := restexec.NewClient(cfg.BaseURL, authenticator)
+	client.Retry = retryPolicy
+
 	server := &dynserver.Server{
 		ProviderName: name,
 		Resources:    resources,
-		Client:       restexec.NewClient(cfg.BaseURL, authenticator),
+		Client:       client,
 	}
 
 	return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {

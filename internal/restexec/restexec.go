@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // Authenticator is Phase 2's own real seam, stubbed here per Phase 1's
@@ -35,15 +36,25 @@ type Client struct {
 	BaseURL       string
 	HTTPClient    *http.Client
 	Authenticator Authenticator
+
+	// Retry governs transport-level resilience (429/5xx/network-error
+	// retries) -- see RetryPolicy's own doc comment for how this differs
+	// from ubx core's reconcile-by-query. Zero value (Client constructed
+	// as a literal rather than via NewClient) means MaxAttempts<=0, which
+	// Do treats as exactly one attempt, no retries -- the safe default for
+	// any caller that doesn't explicitly opt in.
+	Retry RetryPolicy
 }
 
 // NewClient returns a Client with a real, bounded-timeout http.Client --
 // never http.DefaultClient, which has no timeout at all and would let a
 // hung real API leave ubx's own executor blocked indefinitely (the same
 // "retryable vs terminal" discipline docs/executor.md already applies to
-// tfplugin providers themselves applies here, one layer further out).
+// tfplugin providers themselves applies here, one layer further out) --
+// and DefaultRetryPolicy already applied, overridable by setting Retry
+// directly afterward.
 func NewClient(baseURL string, auth Authenticator) *Client {
-	return &Client{BaseURL: baseURL, HTTPClient: &http.Client{}, Authenticator: auth}
+	return &Client{BaseURL: baseURL, HTTPClient: &http.Client{}, Authenticator: auth, Retry: DefaultRetryPolicy()}
 }
 
 // BuildPath substitutes an OpenAPI-style path template's {param} segments
@@ -67,28 +78,73 @@ func BuildPath(template string, params map[string]string) (string, error) {
 	return strings.Join(segs, "/"), nil
 }
 
-// Do performs one real HTTP request: method against path (already
-// substituted, see BuildPath), with body marshaled to a JSON request body
-// when non-nil (nil for GET/DELETE, which real REST APIs never expect a
-// body on). Returns the decoded JSON response body (nil for a 204 No
-// Content, or any real empty body) -- the caller (dynserver) is
-// responsible for converting it into a tftypes.Value via wire.FromJSON
-// against the resource's own schema.
-func (c *Client) Do(ctx context.Context, method, path string, body any) (statusCode int, decoded any, err error) {
+// Do performs one real HTTP request, retrying internally per c.Retry when
+// the response (or the attempt itself) signals a transient condition --
+// see RetryPolicy's own doc comment. method/path are as doOnce's own; body
+// marshals to a JSON request body when non-nil (nil for GET/DELETE, which
+// real REST APIs never expect a body on). Returns the decoded JSON
+// response body (nil for a 204 No Content, or any real empty body) and the
+// real response header set (UBI-158 Phase 3: a Dynamic Provider's own
+// async-operation polling needs to read a real header like `Location` to
+// find where to poll next, something a plain decoded-JSON-body return
+// alone could never carry) -- the caller (dynserver) is responsible for
+// converting the body into a tftypes.Value via wire.FromJSON against the
+// resource's own schema, and for classifying a non-nil err via
+// IsTerminal/IsAmbiguous before deciding how to report it to ubx core.
+func (c *Client) Do(ctx context.Context, method, path string, body any) (statusCode int, decoded any, header http.Header, err error) {
+	var lastHeader http.Header
+	var lastStatus int
+
+	for attempt := 0; attempt < c.Retry.maxAttempts(); attempt++ {
+		if attempt > 0 {
+			wait := c.Retry.backoff(attempt-1, lastStatus, lastHeader)
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return 0, nil, nil, fmt.Errorf("restexec: %s %s: %w", method, path, ctx.Err())
+			}
+		}
+
+		statusCode, decoded, lastHeader, err = c.doOnce(ctx, method, path, body)
+		lastStatus = statusCode
+		if err == nil {
+			return statusCode, decoded, lastHeader, nil
+		}
+		// statusCode == 0 means the attempt never got a real HTTP response
+		// at all (a network-level failure: dial/TLS/reset/timeout) --
+		// exactly the kind of transient condition retrying is for, same as
+		// a real 5xx. isRetryableStatus alone would treat 0 as "not
+		// retryable" (it isn't 408/429/5xx), which would wrongly stop
+		// retrying on the most common transient failure shape.
+		if statusCode != 0 && !isRetryableStatus(statusCode) {
+			return statusCode, decoded, lastHeader, err
+		}
+	}
+	return statusCode, decoded, lastHeader, err
+}
+
+// doOnce performs exactly one HTTP attempt -- no retries, no backoff --
+// returning the response's own header set alongside the usual
+// (statusCode, decoded, err) so Do's own retry loop can consult
+// Retry-After/rate-limit headers on a failure. statusCode is 0 for a
+// failure that never got a real HTTP response at all (a network-level
+// error, distinguishable from a real non-2xx response, which always
+// carries a real status code and an *APIError).
+func (c *Client) doOnce(ctx context.Context, method, path string, body any) (statusCode int, decoded any, header http.Header, err error) {
 	u := strings.TrimSuffix(c.BaseURL, "/") + path
 
 	var reqBody io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			return 0, nil, fmt.Errorf("restexec: marshal request body: %w", err)
+			return 0, nil, nil, fmt.Errorf("restexec: marshal request body: %w", err)
 		}
 		reqBody = bytes.NewReader(b)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, u, reqBody)
 	if err != nil {
-		return 0, nil, fmt.Errorf("restexec: build request: %w", err)
+		return 0, nil, nil, fmt.Errorf("restexec: build request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	if reqBody != nil {
@@ -96,46 +152,49 @@ func (c *Client) Do(ctx context.Context, method, path string, body any) (statusC
 	}
 	if c.Authenticator != nil {
 		if err := c.Authenticator.Apply(req); err != nil {
-			return 0, nil, fmt.Errorf("restexec: apply auth: %w", err)
+			return 0, nil, nil, fmt.Errorf("restexec: apply auth: %w", err)
 		}
 	}
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("restexec: %s %s: %w", method, path, err)
+		return 0, nil, nil, fmt.Errorf("restexec: %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return resp.StatusCode, nil, fmt.Errorf("restexec: read response body: %w", err)
+		return resp.StatusCode, nil, resp.Header, fmt.Errorf("restexec: read response body: %w", err)
 	}
 
 	if resp.StatusCode >= 400 {
-		return resp.StatusCode, nil, &APIError{StatusCode: resp.StatusCode, Method: method, Path: path, Body: string(raw)}
+		return resp.StatusCode, nil, resp.Header, &APIError{StatusCode: resp.StatusCode, Method: method, Path: path, Body: string(raw), Header: resp.Header}
 	}
 
 	if len(strings.TrimSpace(string(raw))) == 0 {
-		return resp.StatusCode, nil, nil
+		return resp.StatusCode, nil, resp.Header, nil
 	}
 
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var out any
 	if err := dec.Decode(&out); err != nil {
-		return resp.StatusCode, nil, fmt.Errorf("restexec: decode JSON response: %w", err)
+		return resp.StatusCode, nil, resp.Header, fmt.Errorf("restexec: decode JSON response: %w", err)
 	}
-	return resp.StatusCode, out, nil
+	return resp.StatusCode, out, resp.Header, nil
 }
 
 // APIError is a real, non-2xx REST response -- Error() includes the status
 // and a truncated body so a Diagnostic built from it is actually
-// actionable, not just "request failed."
+// actionable, not just "request failed." Header is the real response
+// header set, kept so Do's own retry loop can read Retry-After/rate-limit
+// signals even after wrapping the failure as an error.
 type APIError struct {
 	StatusCode int
 	Method     string
 	Path       string
 	Body       string
+	Header     http.Header
 }
 
 func (e *APIError) Error() string {
