@@ -8,10 +8,11 @@ Launched by `ubx` exactly like any HashiCorp provider binary
 (`provider.Acquire` / `provider.Launch`, same subprocess-launch mechanism,
 same tfplugin gRPC handshake) — zero special-casing in `ubx` core.
 
-## Status: Phase 2
+## Status: Phase 3
 
-Layers 1-4 plus auth. Async execution semantics, drift rules, Smithy, and
-the conformance gate remain out of scope.
+Layers 1-4, auth, and execution semantics (retry/backoff, per-operation
+timeouts, async polling, field-level drift). SigV4 itself, Smithy, and the
+conformance gate remain out of scope.
 
 1. **tfplugin server** (`internal/dynserver`, `cmd/ubx-provider-dynamic`) —
    the real gRPC surface, served via `terraform-plugin-go`'s own
@@ -46,6 +47,20 @@ the conformance gate remain out of scope.
    `Authenticator` interface already needs no change to support it.
    Credentials are always an env var *reference* (`value_env`,
    `client_secret_env`, ...), never a literal value in config.
+6. **Execution semantics** (`internal/restexec`, `internal/dynserver`) —
+   real transport-level retry/backoff (`Retry-After`, a configurable
+   rate-limit-reset header, exponential-with-jitter fallback), per-CRUD-
+   operation timeouts independent of `ubx`'s own ambient `--ship` budget,
+   generic async/long-running-operation polling (poll-until-terminal,
+   declared per resource type in config, not modeled on any one real
+   provider), and field-level drift rules (`ignore`/`normalize`, declared
+   per resource type). The load-bearing correctness piece: every real REST
+   failure is classified terminal (a real, structured rejection — reported
+   as a tfplugin Diagnostic) or ambiguous (returned as a plain Go error
+   from the RPC method instead) — see `internal/dynserver/server.go`'s own
+   `classifyRESTError` doc comment for why this specific split is what lets
+   `ubx` core's own reconcile-by-query (`docs/executor.md` in the
+   `ubiquex` monorepo) do its job instead of this provider guessing.
 
 `internal/wire` (tftypes ↔ plain JSON) and `internal/restexec` (real HTTP
 CRUD execution) are the layer-4/6 glue a Dynamic Provider needs that a real
@@ -103,6 +118,42 @@ client_id_env = "EXAMPLE_CLIENT_ID"
 client_secret_env = "EXAMPLE_CLIENT_SECRET"
 scopes = ["read", "write"]
 ```
+
+Execution semantics example:
+
+```toml
+[dynamic_providers.<name>.retry]
+max_attempts = 5
+initial_backoff = "200ms"
+max_backoff = "30s"
+jitter = true
+respect_retry_after = true
+rate_limit_reset_header = "X-RateLimit-Reset"   # real, confirmed live against GitHub's own API
+
+[dynamic_providers.<name>.timeouts]
+create = "90s"
+read = "20s"
+default = "30s"
+
+[dynamic_providers.<name>.resources.<derived_type_name>.async]
+enabled = true
+operation_id_field = "operation_id"       # or operation_id_header = "Location"
+poll_path_template = "/jobs/{operation_id}"
+status_field = "status"
+terminal_success_values = ["succeeded"]
+terminal_failure_values = ["failed", "cancelled"]
+poll_interval = "5s"
+poll_timeout = "10m"
+
+[dynamic_providers.<name>.resources.<derived_type_name>.drift]
+ignore = ["updated_at"]
+[dynamic_providers.<name>.resources.<derived_type_name>.drift.normalize]
+homepage = "lowercase"
+```
+
+`<derived_type_name>` is this provider's own `<provider>_<resource>` name
+(e.g. `github_full_repository`) — run discovery once (any command, or the
+live validation tests) to see the real, derived names for a given spec.
 
 ## Testing
 

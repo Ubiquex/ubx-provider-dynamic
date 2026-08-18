@@ -84,6 +84,15 @@ type Provider struct {
 	SchemaURL    string           `toml:"schema_url"`
 	BaseURL      string           `toml:"base_url"`
 	Auth         Auth             `toml:"auth"`
+
+	// Retry/Timeouts/Resources are UBI-158 Phase 3's own execution-
+	// semantics config -- see execution.go's own doc comment. All
+	// optional: an absent [retry]/[timeouts] table, or an absent
+	// [resources.<type>] entry for a given resource, falls back to
+	// dynserver's own real, documented defaults.
+	Retry     RetryConfig               `toml:"retry"`
+	Timeouts  TimeoutsConfig            `toml:"timeouts"`
+	Resources map[string]ResourceConfig `toml:"resources"`
 }
 
 func (p Provider) validate() error {
@@ -104,7 +113,7 @@ func (p Provider) validate() error {
 	if p.BaseURL == "" {
 		return fmt.Errorf("dynamic_providers.%s: base_url is required", p.Name)
 	}
-	return nil
+	return p.validateDurations()
 }
 
 // file is .ubx/config's shape, restricted to the one table this package
