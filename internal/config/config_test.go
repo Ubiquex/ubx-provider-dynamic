@@ -1,0 +1,103 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func writeConfig(t *testing.T, dir, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, ".ubx"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".ubx", "config"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadNamed_Success(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[dynamic_providers.github]
+schema_source = "openapi"
+schema_url = "https://example.invalid/openapi.json"
+base_url = "https://api.github.com"
+`)
+	p, err := LoadNamed(dir, "github")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Name != "github" || p.SchemaSource != SchemaSourceOpenAPI || p.BaseURL != "https://api.github.com" {
+		t.Fatalf("unexpected provider: %+v", p)
+	}
+}
+
+func TestLoadNamed_WalksUpward(t *testing.T) {
+	root := t.TempDir()
+	writeConfig(t, root, `
+[dynamic_providers.datadog]
+schema_source = "openapi"
+schema_url = "https://example.invalid/dd.json"
+base_url = "https://api.datadoghq.com"
+`)
+	sub := filepath.Join(root, "a", "b", "c")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadNamed(sub, "datadog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.BaseURL != "https://api.datadoghq.com" {
+		t.Fatalf("unexpected provider: %+v", p)
+	}
+}
+
+func TestLoadNamed_UnknownName(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[dynamic_providers.github]
+schema_source = "openapi"
+schema_url = "https://example.invalid/openapi.json"
+base_url = "https://api.github.com"
+`)
+	_, err := LoadNamed(dir, "nope")
+	if err == nil {
+		t.Fatal("expected error for undeclared name")
+	}
+}
+
+func TestLoadNamed_MissingSchemaURL(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[dynamic_providers.github]
+schema_source = "openapi"
+base_url = "https://api.github.com"
+`)
+	_, err := LoadNamed(dir, "github")
+	if err == nil {
+		t.Fatal("expected validation error for missing schema_url")
+	}
+}
+
+func TestLoadNamed_UnimplementedSchemaSource(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[dynamic_providers.aws]
+schema_source = "aws_ccapi"
+base_url = "https://cloudcontrolapi.us-east-1.amazonaws.com"
+`)
+	_, err := LoadNamed(dir, "aws")
+	if err == nil {
+		t.Fatal("expected error for unimplemented schema_source")
+	}
+}
+
+func TestLoadNamed_NoConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	_, err := LoadNamed(dir, "github")
+	if err == nil {
+		t.Fatal("expected error when no .ubx/config exists")
+	}
+}
