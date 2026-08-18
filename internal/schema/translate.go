@@ -253,7 +253,7 @@ func (t *Translator) buildProperties(s *openapi3.Schema, path string) []*tfproto
 			policy.readOnly = prop.ReadOnly
 			policy.writeOnly = prop.WriteOnly
 		}
-		attrs = append(attrs, t.BuildAttribute(tfName(name), propRef, policy, propPath))
+		attrs = append(attrs, t.BuildAttribute(ToSnakeCase(name), propRef, policy, propPath))
 	}
 	return attrs
 }
@@ -497,12 +497,16 @@ func orEmpty(s *openapi3.Schema) *openapi3.Schema {
 	return s
 }
 
-// tfName converts an OpenAPI property name (any real casing/punctuation --
-// camelCase, kebab-case, and dotted names all appear in real specs) into
-// ubx's own snake_case attribute-naming convention, matching the
-// <provider>_<resource> convention resourcemap.go applies at the resource-
-// type level.
-func tfName(openAPIName string) string {
+// ToSnakeCase converts an OpenAPI property name (any real casing/
+// punctuation -- camelCase, kebab-case, and dotted names all appear in
+// real specs) into ubx's own snake_case attribute-naming convention,
+// matching the <provider>_<resource> convention resourcemap.go applies at
+// the resource-type level. Exported (UBI-158 Phase 4): internal/smithy's
+// own naming compatibility layer reuses this identical algorithm for
+// Smithy's own PascalCase operation nouns -- the target convention is the
+// exact same one, ubx's own snake_case, regardless of which schema source
+// produced the name.
+func ToSnakeCase(openAPIName string) string {
 	var b strings.Builder
 	prevLower := false
 	for _, r := range openAPIName {

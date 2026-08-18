@@ -36,15 +36,29 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// SchemaSourceType is schema_source's declared value -- which of UBI-158's
-// three tiers this provider's schema is derived from. Only SchemaSourceOpenAPI
-// has a real implementation in Phase 1; SchemaSourceInline and
-// SchemaSourceAWSCCAPI are named so a config referencing them fails with a
-// clear "not yet implemented" error rather than an unrecognized-value one.
+// SchemaSourceType is schema_source's declared value -- which tier this
+// provider's schema is derived from. SchemaSourceOpenAPI (Phase 1) and
+// SchemaSourceSmithy (Phase 4) have real implementations; SchemaSourceInline
+// and SchemaSourceAWSCCAPI are named so a config referencing them fails
+// with a clear "not yet implemented" error rather than an
+// unrecognized-value one.
+//
+// Real, deliberate deviation from UBI-158's own original three-tier design
+// (openapi/inline/aws_ccapi), flagged here rather than silently folded in:
+// this session's own Phase 4 prompt named "Smithy" as AWS's real schema
+// source, not "aws_ccapi" (the CloudFormation Cloud Control API registry
+// tier the original ticket described) -- these are two genuinely
+// different, real AWS schema sources (Smithy models AWS itself generates
+// its own SDKs from vs. the separate CloudFormation resource-provider
+// schema registry), not the same tier under two names. SchemaSourceSmithy
+// is therefore a real, new fourth value, and SchemaSourceAWSCCAPI is left
+// exactly as it was -- a real, distinct, still-unimplemented tier of its
+// own, not superseded by this phase.
 type SchemaSourceType string
 
 const (
 	SchemaSourceOpenAPI  SchemaSourceType = "openapi"
+	SchemaSourceSmithy   SchemaSourceType = "smithy"
 	SchemaSourceInline   SchemaSourceType = "inline"
 	SchemaSourceAWSCCAPI SchemaSourceType = "aws_ccapi"
 )
@@ -100,14 +114,14 @@ func (p Provider) validate() error {
 		return fmt.Errorf("dynamic_providers.%s: schema_source is required", p.Name)
 	}
 	switch p.SchemaSource {
-	case SchemaSourceOpenAPI:
+	case SchemaSourceOpenAPI, SchemaSourceSmithy:
 		// implemented
 	case SchemaSourceInline, SchemaSourceAWSCCAPI:
-		return fmt.Errorf("dynamic_providers.%s: schema_source %q is a real UBI-158 tier but not yet implemented (Phase 1 covers openapi only)", p.Name, p.SchemaSource)
+		return fmt.Errorf("dynamic_providers.%s: schema_source %q is a real UBI-158 tier but not yet implemented", p.Name, p.SchemaSource)
 	default:
-		return fmt.Errorf("dynamic_providers.%s: unrecognized schema_source %q (want one of: openapi, inline, aws_ccapi)", p.Name, p.SchemaSource)
+		return fmt.Errorf("dynamic_providers.%s: unrecognized schema_source %q (want one of: openapi, smithy, inline, aws_ccapi)", p.Name, p.SchemaSource)
 	}
-	if p.SchemaSource == SchemaSourceOpenAPI && p.SchemaURL == "" {
+	if (p.SchemaSource == SchemaSourceOpenAPI || p.SchemaSource == SchemaSourceSmithy) && p.SchemaURL == "" {
 		return fmt.Errorf("dynamic_providers.%s: schema_url is required when schema_source is %q", p.Name, p.SchemaSource)
 	}
 	if p.BaseURL == "" {
