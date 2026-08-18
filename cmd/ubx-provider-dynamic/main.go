@@ -18,6 +18,8 @@ import (
 	"github.com/ubiquex/ubx-provider-dynamic/internal/openapi"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/restexec"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/smithy"
+	smithyserver "github.com/ubiquex/ubx-provider-dynamic/internal/smithy/server"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/smithy/wireexec"
 )
 
 // nameEnvVar is how a launched process learns which [dynamic_providers.<name>]
@@ -52,20 +54,20 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// UBI-158 Phase 4 Checkpoint 1: Smithy schema discovery/translation/
-	// naming are real and proven (internal/smithy's own tests, run against
-	// real AWS models) -- run the real pipeline here too, so a config
-	// author gets real, useful discovery/naming output even today. Serving
-	// a Smithy-sourced resource through the real tfplugin RPC surface still
-	// needs a real per-protocol wire executor (restJson1/restXml/
-	// awsJson1_x/awsQuery/ec2Query) that doesn't exist yet -- Checkpoint 2's
-	// own explicit scope -- so this refuses to serve afterward rather than
-	// silently pretending a provider that can discover resources but
-	// cannot actually apply/read any of them is ready.
+	// UBI-158 Phase 4 Checkpoint 2: real per-protocol wire execution
+	// (internal/smithy/wireexec) and real SigV4 signing (internal/auth)
+	// now both exist and are verified against real AWS -- this binary
+	// actually serves a Smithy-sourced provider, completing what
+	// Checkpoint 1 discovered/translated/named but deliberately left
+	// refusing to serve.
 	if cfg.SchemaSource == config.SchemaSourceSmithy {
 		smithyDoc, err := smithy.Load(cfg.SchemaURL)
 		if err != nil {
 			return fmt.Errorf("load Smithy model: %w", err)
+		}
+		svc, err := smithy.FindService(smithyDoc)
+		if err != nil {
+			return fmt.Errorf("find Smithy service: %w", err)
 		}
 		built, notes, err := smithy.Build(smithyDoc, name, smithy.DefaultKnownNames())
 		if err != nil {
@@ -74,11 +76,44 @@ func run() error {
 		for _, n := range notes {
 			fmt.Fprintln(os.Stderr, "ubx-provider-dynamic:", n)
 		}
-		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: discovered %d resources from %s\n", len(built), cfg.SchemaURL)
+		if len(built) == 0 {
+			return fmt.Errorf("no CRUD-shaped resources discovered in %s -- nothing to serve", cfg.SchemaURL)
+		}
+		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: discovered %d resources from %s (protocol: %s)\n", len(built), cfg.SchemaURL, svc.Protocol)
 		for hcName, res := range built {
 			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic:   %s (naming: %s)\n", hcName, res.NameStrategy)
 		}
-		return fmt.Errorf("schema_source = %q: discovery/translation/naming succeeded (see above), but real request execution against AWS's own per-protocol wire formats is not yet wired into this binary's own serving path (UBI-158 Phase 4 Checkpoint 2) -- this provider cannot yet serve %s", cfg.SchemaSource, name)
+
+		if (svc.Protocol == smithy.ProtocolAWSJSON10 || svc.Protocol == smithy.ProtocolAWSJSON11) && cfg.TargetPrefix == "" {
+			return fmt.Errorf("schema_source = %q: service protocol %s requires target_prefix in [dynamic_providers.%s] config -- see config.Provider.TargetPrefix's own doc comment for why AWS's real Smithy model carries no such field itself", cfg.SchemaSource, svc.Protocol, name)
+		}
+
+		authenticator, err := auth.Build(cfg.Auth.Type, cfg.Auth.Params)
+		if err != nil {
+			return fmt.Errorf("build authenticator: %w", err)
+		}
+		retryPolicy, err := dynserver.ResolveRetryPolicy(cfg.Retry)
+		if err != nil {
+			return fmt.Errorf("resolve retry policy: %w", err)
+		}
+		restClient := restexec.NewClient(cfg.BaseURL, authenticator)
+		restClient.Retry = retryPolicy
+
+		wireClient := &wireexec.Client{
+			Rest:         restClient,
+			Model:        smithyDoc,
+			Service:      svc,
+			TargetPrefix: cfg.TargetPrefix,
+		}
+		server := &smithyserver.Server{
+			ProviderName: name,
+			Resources:    built,
+			Model:        smithyDoc,
+			Wire:         wireClient,
+		}
+		return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
+			return server
+		})
 	}
 
 	doc, err := openapi.Load(cfg.SchemaURL)

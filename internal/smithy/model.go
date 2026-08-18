@@ -104,6 +104,22 @@ func (s Shape) HasTrait(name string) bool {
 	return ok
 }
 
+// TraitInto decodes a member-level trait's own JSON value into out --
+// Member's own real counterpart to Shape.Trait, needed by wireexec
+// (Checkpoint 2) for member-level traits whose value carries real content
+// (smithy.api#httpQuery/httpHeader's own string value, the real wire query
+// parameter/header name to use), not just presence.
+func (m Member) TraitInto(name string, out any) (present bool, err error) {
+	raw, ok := m.Traits[name]
+	if !ok {
+		return false, nil
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		return true, fmt.Errorf("trait %s: %w", name, err)
+	}
+	return true, nil
+}
+
 // Trait decodes trait name's own JSON value into out, reporting whether it
 // was present at all -- err is only non-nil if the trait WAS present but
 // didn't decode into the requested shape (a real, honest failure, never
