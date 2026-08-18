@@ -6,6 +6,7 @@ require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/getkin/kin-openapi v0.147.0
 	github.com/hashicorp/terraform-plugin-go v0.31.0
+	golang.org/x/oauth2 v0.36.0
 )
 
 require (

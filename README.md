@@ -8,10 +8,10 @@ Launched by `ubx` exactly like any HashiCorp provider binary
 (`provider.Acquire` / `provider.Launch`, same subprocess-launch mechanism,
 same tfplugin gRPC handshake) — zero special-casing in `ubx` core.
 
-## Status: Phase 1
+## Status: Phase 2
 
-Layers 1-4 only. Auth, async execution, drift rules, Smithy, and the
-conformance gate are explicitly out of scope for this phase.
+Layers 1-4 plus auth. Async execution semantics, drift rules, Smithy, and
+the conformance gate remain out of scope.
 
 1. **tfplugin server** (`internal/dynserver`, `cmd/ubx-provider-dynamic`) —
    the real gRPC surface, served via `terraform-plugin-go`'s own
@@ -20,8 +20,8 @@ conformance gate are explicitly out of scope for this phase.
 2. **Schema translation** (`internal/schema`) — OpenAPI 3.x schemas into
    tfplugin's type system, using protocol v6's real nested-attributes
    feature. Every lossy decision (`oneOf`/`anyOf` collapse, free-form
-   objects, mixed-type unions) is recorded as a `Note`, never silently
-   flattened.
+   objects, mixed-type unions, self-referential schemas) is recorded as a
+   `Note`, never silently flattened.
 3. **Resource mapping** (`internal/resourcemap`) — OpenAPI paths/operations
    into CRUD resources, paired by response-schema identity (not path
    structure — real APIs, GitHub's own included, create a resource at a
@@ -29,10 +29,23 @@ conformance gate are explicitly out of scope for this phase.
    `<provider>_<resource>` naming.
 4. **Config layer** (`internal/config`) — reads a stack's own
    `.ubx/config`, a `[dynamic_providers.<name>]` table (`schema_source`,
-   `schema_url`, `base_url`). See the package doc comment for why this
-   table is named differently from the ticket's original
+   `schema_url`, `base_url`, `auth`). See the package doc comment for why
+   this table is named differently from the ticket's original
    `[providers.<name>]` text, and why it's read directly off disk rather
    than delivered via `ConfigureProvider`.
+5. **Auth** (`internal/auth`) — pluggable, not a fixed enum: each real type
+   self-registers a `Factory` (the same shape `database/sql` drivers use).
+   Real implementations: `api_key_header` (one or more header/env pairs —
+   covers GitHub's single `Authorization: Bearer` and Datadog's real
+   two-header `DD-API-KEY`/`DD-APPLICATION-KEY` scheme with no
+   service-specific code) and `oauth2_client_credentials` (RFC 6749 §4.4,
+   built on `golang.org/x/oauth2/clientcredentials`). `aws_sigv4` is
+   registered with its real config shape (`region`/`service`/
+   `credential_source`) but `Apply` refuses until Phase 4 — see
+   `internal/auth/sigv4.go`'s own doc comment for why the existing
+   `Authenticator` interface already needs no change to support it.
+   Credentials are always an env var *reference* (`value_env`,
+   `client_secret_env`, ...), never a literal value in config.
 
 `internal/wire` (tftypes ↔ plain JSON) and `internal/restexec` (real HTTP
 CRUD execution) are the layer-4/6 glue a Dynamic Provider needs that a real
@@ -54,6 +67,41 @@ go run ./cmd/ubx-provider-dynamic
 schema_source = "openapi"
 schema_url = "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json"
 base_url = "https://api.github.com"
+
+[dynamic_providers.github.auth]
+type = "api_key_header"
+[[dynamic_providers.github.auth.params.headers]]
+name = "Authorization"
+value_env = "GITHUB_TOKEN"
+value_prefix = "Bearer "
+
+[dynamic_providers.datadog]
+schema_source = "openapi"
+schema_url = "https://raw.githubusercontent.com/DataDog/datadog-api-client-go/master/.generator/schemas/v1/openapi.yaml"
+base_url = "https://api.datadoghq.com"
+
+[dynamic_providers.datadog.auth]
+type = "api_key_header"
+[[dynamic_providers.datadog.auth.params.headers]]
+name = "DD-API-KEY"
+value_env = "DATADOG_API_KEY"
+[[dynamic_providers.datadog.auth.params.headers]]
+name = "DD-APPLICATION-KEY"
+value_env = "DATADOG_APP_KEY"
+```
+
+(the `params` segment is required — `config.Auth.Params` decodes from TOML's own `params` key, confirmed by an end-to-end parse test, `internal/config/auth_integration_test.go`.)
+
+`oauth2_client_credentials` example:
+
+```toml
+[dynamic_providers.<name>.auth]
+type = "oauth2_client_credentials"
+[dynamic_providers.<name>.auth.params]
+token_url = "https://example.com/oauth/token"
+client_id_env = "EXAMPLE_CLIENT_ID"
+client_secret_env = "EXAMPLE_CLIENT_SECRET"
+scopes = ["read", "write"]
 ```
 
 ## Testing

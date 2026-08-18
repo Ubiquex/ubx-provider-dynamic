@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6/tf6server"
 
+	"github.com/ubiquex/ubx-provider-dynamic/internal/auth"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/dynserver"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/openapi"
@@ -66,10 +67,15 @@ func run() error {
 		return fmt.Errorf("no CRUD-shaped resources discovered in %s -- nothing to serve", cfg.SchemaURL)
 	}
 
+	authenticator, err := auth.Build(cfg.Auth.Type, cfg.Auth.Params)
+	if err != nil {
+		return fmt.Errorf("build authenticator: %w", err)
+	}
+
 	server := &dynserver.Server{
 		ProviderName: name,
 		Resources:    resources,
-		Client:       restexec.NewClient(cfg.BaseURL, nil), // auth: Phase 2
+		Client:       restexec.NewClient(cfg.BaseURL, authenticator),
 	}
 
 	return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {

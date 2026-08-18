@@ -53,9 +53,12 @@ const (
 // 2, stub the interface but don't implement auth types yet"). The shape
 // (a discriminated Type plus a free-form Params bag) is settled so Phase 2
 // is additive -- filling Params' real meaning per Type -- not a reshape of
-// this table. Any non-empty Type in Phase 1 is accepted at parse time (so a
-// config author can write ahead) but rejected with a clear error the moment
-// something actually tries to use it (see auth.Resolve).
+// this table. Real, semantic validation of Type/Params (e.g. "params.headers
+// must be non-empty for api_key_header") is deliberately NOT done here --
+// that's internal/auth.Build's own job (Phase 2), keeping this package a
+// dumb data holder rather than needing to know about every real auth type
+// that exists. An empty Type means no authentication at all, unchanged from
+// Phase 1.
 type Auth struct {
 	Type   string         `toml:"type"`
 	Params map[string]any `toml:"params"`
