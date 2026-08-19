@@ -88,7 +88,7 @@ type op struct {
 //
 // A "resource," for this package's purposes, requires at minimum a read
 // operation (a GET on a path ending in a trailing {param} segment) AND a
-// matching create operation (a POST anywhere in the document whose own
+// matching create operation (a POST or PUT anywhere in the document whose own
 // response references the identical component schema) -- read-only paths
 // with no discoverable create are real (GitHub has many: rate_limit,
 // meta, ...) but are data sources, not resources, genuinely out of this
@@ -129,7 +129,7 @@ func Discover(doc *openapi3.T, providerName string) ([]Resource, []Note, error) 
 
 		create, createOp := findCreate(ops, rc.path, refName, respSchema)
 		if create == nil {
-			notes = append(notes, Note{Path: rc.path, Detail: "no matching create (POST) operation found by response-schema or parent-collection-path match -- read-only, modeled as a data source concern, not a resource (out of Phase 1 scope)"})
+			notes = append(notes, Note{Path: rc.path, Detail: "no matching create (POST or PUT) operation found by response-schema or parent-collection-path match -- read-only, modeled as a data source concern, not a resource (out of Phase 1 scope)"})
 			continue
 		}
 
@@ -234,22 +234,37 @@ func findSibling(ops []op, path, method string) *openapi3.Operation {
 	return nil
 }
 
-// findCreate looks for a POST whose own response references the identical
-// component schema as the read path (the real, reliable cross-API pairing
-// key -- see the package doc comment), preferring the fewest path
-// parameters (the shallowest/most general creation endpoint -- e.g.
-// GitHub's own /user/repos over a more specific one, when both exist)
-// and, as a tie-break, the shortest path string, both purely for
+// findCreate looks for a POST or PUT whose own response references the
+// identical component schema as the read path (the real, reliable
+// cross-API pairing key -- see the package doc comment), preferring the
+// fewest path parameters (the shallowest/most general creation endpoint
+// -- e.g. GitHub's own /user/repos over a more specific one, when both
+// exist) and, as a tie-break, the shortest path string, both purely for
 // determinism (CLAUDE.md's own standing rule) since either real match is
-// equally valid. Falls back to a POST on the read path's own immediate
-// parent collection (path with its trailing {param} segment stripped) only
-// when no response-schema match exists at all -- a real but weaker
-// heuristic, since some real POST operations return 202/204 with no body
-// to match against.
+// equally valid. PUT is a real, generic create signal, not an
+// Azure-specific special case: ARM's own real convention (and any REST
+// API's own idempotent-upsert convention -- ARM is not the only one) is
+// PUT-to-the-item-path-itself, not POST-to-a-collection -- confirmed
+// live against Azure's own real Microsoft.Compute spec, whose
+// virtualMachines item path's GET/PUT/PATCH operations all reference the
+// identical #/definitions/VirtualMachine response schema, so this same
+// response-schema-identity match already catches it correctly once PUT
+// is a candidate method, with no separate same-path special case needed.
+// The existing fewest-path-params tiebreak still correctly prefers a
+// real POST-to-collection endpoint over an item-path PUT whenever BOTH
+// exist for the same resource (an item path binds every one of its own
+// path params, so it can never have FEWER than its own creating
+// collection endpoint) -- confirmed by inspection, not just assumed:
+// GitHub's/Kubernetes'/Datadog's own real POST-based resources are
+// unaffected by this widening. Falls back to a POST on the read path's
+// own immediate parent collection (path with its trailing {param}
+// segment stripped) only when no response-schema match exists at all --
+// a real but weaker heuristic, since some real POST operations return
+// 202/204 with no body to match against.
 func findCreate(ops []op, readPath, refName string, readSchema *openapi3.Schema) (*openapi3.Operation, *op) {
 	var matches []op
 	for _, o := range ops {
-		if o.method != "POST" {
+		if o.method != "POST" && o.method != "PUT" {
 			continue
 		}
 		candidateRef, candidateSchema := ResponseSchema(o.sub)

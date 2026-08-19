@@ -131,6 +131,90 @@ func TestDiscover_NoPaths(t *testing.T) {
 // (apiextensions-apiserver's own CustomResourceDefinition), proving the
 // "last 3 segments, middle one a real version token" heuristic generalizes
 // across both without hardcoding either real prefix depth.
+// buildARMShapedDoc mirrors Azure's own real ARM convention, confirmed
+// live against the real Microsoft.Compute spec: a resource is created via
+// PUT on the EXACT SAME item path as its own GET, not POST-to-a-collection
+// the way GitHub's own convention works -- no POST operation anywhere in
+// the document at all.
+func buildARMShapedDoc() *openapi3.T {
+	vmSchema := openapi3.NewObjectSchema().
+		WithProperty("id", openapi3.NewStringSchema()).
+		WithProperty("name", openapi3.NewStringSchema())
+	vmSchemaRef := openapi3.NewSchemaRef("#/components/schemas/VirtualMachine", vmSchema)
+
+	readOp := &openapi3.Operation{OperationID: "vm/get", Responses: responses200(vmSchemaRef)}
+	putOp := &openapi3.Operation{OperationID: "vm/createOrUpdate", Responses: responses200(vmSchemaRef)}
+	deleteOp := &openapi3.Operation{OperationID: "vm/delete", Responses: openapi3.NewResponses()}
+
+	doc := &openapi3.T{OpenAPI: "3.0.3", Info: &openapi3.Info{Title: "t", Version: "1"}}
+	doc.Paths = openapi3.NewPaths(
+		openapi3.WithPath("/subscriptions/{subscriptionId}/resourceGroups/{rg}/virtualMachines/{vmName}", &openapi3.PathItem{
+			Get: readOp, Put: putOp, Delete: deleteOp,
+		}),
+	)
+	return doc
+}
+
+func TestDiscover_ARMShapedCreateIsPUTOnTheSameItemPath(t *testing.T) {
+	doc := buildARMShapedDoc()
+	resources, _, err := Discover(doc, "azure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("expected exactly one resource (a real, generic PUT-only create/update convention -- ARM is not the only API that creates with PUT), got %d: %+v", len(resources), resources)
+	}
+	r := resources[0]
+	const itemPath = "/subscriptions/{subscriptionId}/resourceGroups/{rg}/virtualMachines/{vmName}"
+	if r.CreateMethod != "PUT" || r.CreatePath != itemPath {
+		t.Fatalf("expected create via PUT on the item path itself, got %s %s", r.CreateMethod, r.CreatePath)
+	}
+	// The identical real PUT operation ALSO serves as this resource's own
+	// update (ARM's real idempotent-upsert semantics: PUT creates if
+	// absent, replaces if present) -- both findCreate and findSibling
+	// independently arriving at the same real operation is correct, not
+	// a bug to reconcile away.
+	if r.UpdateMethod != "PUT" {
+		t.Fatalf("expected PUT update (the same real upsert operation), got %q", r.UpdateMethod)
+	}
+	if r.DeleteOperation == nil {
+		t.Fatal("expected a delete operation")
+	}
+}
+
+// TestFindCreate_PrefersPOSTOverPUTWhenBothMatch confirms the existing
+// fewest-path-params tiebreak still correctly favors a real
+// POST-to-collection create endpoint over an item-path PUT when a
+// provider's own real spec offers both for the same resource shape (a
+// real, common combination: create via POST, full-replace via PUT) --
+// the PUT-as-create widening must never regress a provider that already
+// works correctly via POST (GitHub/Kubernetes/Datadog).
+func TestFindCreate_PrefersPOSTOverPUTWhenBothMatch(t *testing.T) {
+	widgetSchema := openapi3.NewObjectSchema().WithProperty("id", openapi3.NewStringSchema())
+	widgetRef := openapi3.NewSchemaRef("#/components/schemas/Widget", widgetSchema)
+
+	readOp := &openapi3.Operation{OperationID: "widget/get", Responses: responses200(widgetRef)}
+	postOp := &openapi3.Operation{OperationID: "widget/create", Responses: responses201(widgetRef)}
+	putOp := &openapi3.Operation{OperationID: "widget/replace", Responses: responses200(widgetRef)}
+
+	doc := &openapi3.T{OpenAPI: "3.0.3", Info: &openapi3.Info{Title: "t", Version: "1"}}
+	doc.Paths = openapi3.NewPaths(
+		openapi3.WithPath("/widgets/{id}", &openapi3.PathItem{Get: readOp, Put: putOp}),
+		openapi3.WithPath("/widgets", &openapi3.PathItem{Post: postOp}),
+	)
+
+	resources, _, err := Discover(doc, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("expected exactly one resource, got %d: %+v", len(resources), resources)
+	}
+	if r := resources[0]; r.CreateMethod != "POST" || r.CreatePath != "/widgets" {
+		t.Fatalf("expected the real POST-to-collection endpoint to win over the item-path PUT, got %s %s", r.CreateMethod, r.CreatePath)
+	}
+}
+
 func TestSplitQualifiedRefName_RealKubernetesShapes(t *testing.T) {
 	cases := []struct {
 		ref, wantService, wantNoun string
