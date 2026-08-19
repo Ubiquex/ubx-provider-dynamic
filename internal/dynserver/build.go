@@ -49,6 +49,17 @@ type ResourceType struct {
 	// differently-typed response attribute on this type.
 	PathParamAttr       map[string]string
 	CreatePathParamAttr map[string]string
+
+	// Signals carries the real enum/constraint data uschema.CollectSignals
+	// found in this resource's own create-request and read-response
+	// OpenAPI schemas, merged into one combined tree (uschema.MergeSignalMaps)
+	// the same way merged above already combines createAttrs/readAttrs
+	// themselves -- keyed by ToSnakeCase(name) at every level, matching
+	// this resource's own Schema attribute names (and therefore
+	// ir.Field.WireName, on ubiquex's own side) exactly. nil when the
+	// underlying schemas carried no real constraint/enum signal at all,
+	// never a placeholder empty map.
+	Signals map[string]*uschema.FieldSignal
 }
 
 // Build discovers every CRUD-shaped resource in doc and translates each
@@ -82,13 +93,16 @@ func Build(doc *openapi3.T, providerName string, cfg config.Provider) (map[strin
 		tr := uschema.NewTranslator()
 
 		var createAttrs []*tfprotov6.SchemaAttribute
+		var signals map[string]*uschema.FieldSignal
 		if reqSchema := resourcemap.RequestBodySchema(res.CreateOperation); reqSchema != nil {
 			createAttrs = tr.BuildTopLevel(reqSchema, res.TypeName+".create")
+			signals = uschema.MergeSignalMaps(signals, uschema.CollectSignals(reqSchema))
 		}
 
 		var readAttrs []*tfprotov6.SchemaAttribute
 		if _, respSchema := resourcemap.ResponseSchema(res.ReadOperation); respSchema != nil {
 			readAttrs = tr.BuildTopLevel(respSchema, res.TypeName+".read")
+			signals = uschema.MergeSignalMaps(signals, uschema.CollectSignals(respSchema))
 		}
 
 		merged := uschema.MergeResourceAttributes(createAttrs, readAttrs)
@@ -137,6 +151,7 @@ func Build(doc *openapi3.T, providerName string, cfg config.Provider) (map[strin
 			Drift:               drift,
 			PathParamAttr:       pathParamAttr,
 			CreatePathParamAttr: createPathParamAttr,
+			Signals:             signals,
 		}
 	}
 
