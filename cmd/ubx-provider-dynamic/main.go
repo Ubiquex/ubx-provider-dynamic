@@ -15,6 +15,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6/tf6server"
 
 	"github.com/ubiquex/ubx-provider-dynamic/internal/auth"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/cloudformation"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/cloudformation/ccapi"
+	cfnserver "github.com/ubiquex/ubx-provider-dynamic/internal/cloudformation/server"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/discoverydoc"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/dynserver"
@@ -193,6 +196,57 @@ func run() error {
 			resources[typeName] = &dynserver.ResourceType{Schema: br.Schema}
 		}
 		server := &dynserver.Server{ProviderName: name, Resources: resources}
+		return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
+			return server
+		})
+	}
+
+	// cloudformation: AWS's real, published CloudFormation resource-
+	// provider schema registry (internal/cloudformation's own doc comment
+	// has the full real research) -- real, full execution, not
+	// schema-layer-only like discoverydoc above: Cloud Control API's own
+	// real, fixed operation set (internal/cloudformation/ccapi) makes
+	// Create/Read/Update/Delete/List real against ANY real CFN-registered
+	// resource type, generic across all of them (no per-service wire
+	// protocol work needed, unlike Smithy).
+	if cfg.SchemaSource == config.SchemaSourceCloudFormation {
+		files, err := cloudformation.Fetch(cfg.SchemaURL)
+		if err != nil {
+			return fmt.Errorf("fetch CloudFormation registry: %w", err)
+		}
+		built, notes, err := cloudformation.Build(files, smithy.DefaultKnownNames())
+		if err != nil {
+			return fmt.Errorf("build CloudFormation resource schemas: %w", err)
+		}
+		for _, n := range notes {
+			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [cloudformation] %s: %s\n", n.TypeName, n.Detail)
+		}
+		if len(built) == 0 {
+			return fmt.Errorf("no resources discovered in %s -- nothing to serve", cfg.SchemaURL)
+		}
+		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: discovered %d real CFN resources from %s\n", len(built), cfg.SchemaURL)
+
+		if *dumpSignalsFlag {
+			// Real, honest, named gap mirroring Smithy's own identical one
+			// above: CFN's own real schema dialect has no separate
+			// constraint/enum trait system this package extracts signals
+			// from yet.
+			fmt.Fprintln(os.Stderr, "ubx-provider-dynamic: --dump-signals: not yet implemented for schema_source = \"cloudformation\" -- emitting an empty, real result, not an error")
+			return json.NewEncoder(os.Stdout).Encode(map[string]map[string]*uschema.FieldSignal{})
+		}
+
+		authenticator, err := auth.Build(cfg.Auth.Type, cfg.Auth.Params)
+		if err != nil {
+			return fmt.Errorf("build authenticator: %w", err)
+		}
+		retryPolicy, err := dynserver.ResolveRetryPolicy(cfg.Retry)
+		if err != nil {
+			return fmt.Errorf("resolve retry policy: %w", err)
+		}
+		restClient := restexec.NewClient(cfg.BaseURL, authenticator)
+		restClient.Retry = retryPolicy
+
+		server := cfnserver.New(name, built, &ccapi.Client{Rest: restClient})
 		return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
 			return server
 		})

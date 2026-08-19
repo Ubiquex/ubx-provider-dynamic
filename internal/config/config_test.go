@@ -85,12 +85,29 @@ func TestLoadNamed_UnimplementedSchemaSource(t *testing.T) {
 	dir := t.TempDir()
 	writeConfig(t, dir, `
 [dynamic_providers.aws]
-schema_source = "aws_ccapi"
+schema_source = "inline"
 base_url = "https://cloudcontrolapi.us-east-1.amazonaws.com"
 `)
 	_, err := LoadNamed(dir, "aws")
 	if err == nil {
 		t.Fatal("expected error for unimplemented schema_source")
+	}
+}
+
+func TestLoadNamed_CloudFormation(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[dynamic_providers.aws]
+schema_source = "cloudformation"
+schema_url = "https://schema.cloudformation.us-east-1.amazonaws.com/CloudformationSchema.zip"
+base_url = "https://cloudcontrolapi.us-east-1.amazonaws.com"
+`)
+	p, err := LoadNamed(dir, "aws")
+	if err != nil {
+		t.Fatalf("LoadNamed: %v", err)
+	}
+	if p.SchemaSource != SchemaSourceCloudFormation {
+		t.Fatalf("SchemaSource = %q, want %q", p.SchemaSource, SchemaSourceCloudFormation)
 	}
 }
 

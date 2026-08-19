@@ -37,31 +37,34 @@ import (
 )
 
 // SchemaSourceType is schema_source's declared value -- which tier this
-// provider's schema is derived from. SchemaSourceOpenAPI (Phase 1) and
-// SchemaSourceSmithy (Phase 4) have real implementations; SchemaSourceInline
-// and SchemaSourceAWSCCAPI are named so a config referencing them fails
-// with a clear "not yet implemented" error rather than an
-// unrecognized-value one.
+// provider's schema is derived from. SchemaSourceOpenAPI (Phase 1),
+// SchemaSourceSmithy (Phase 4), SchemaSourceDiscoveryDoc, and
+// SchemaSourceCloudFormation (this checkpoint) have real implementations;
+// SchemaSourceInline is named so a config referencing it fails with a
+// clear "not yet implemented" error rather than an unrecognized-value one.
 //
-// Real, deliberate deviation from UBI-158's own original three-tier design
-// (openapi/inline/aws_ccapi), flagged here rather than silently folded in:
-// this session's own Phase 4 prompt named "Smithy" as AWS's real schema
-// source, not "aws_ccapi" (the CloudFormation Cloud Control API registry
-// tier the original ticket described) -- these are two genuinely
-// different, real AWS schema sources (Smithy models AWS itself generates
-// its own SDKs from vs. the separate CloudFormation resource-provider
-// schema registry), not the same tier under two names. SchemaSourceSmithy
-// is therefore a real, new fourth value, and SchemaSourceAWSCCAPI is left
-// exactly as it was -- a real, distinct, still-unimplemented tier of its
-// own, not superseded by this phase.
+// Real, deliberate rename, flagged here rather than silently folded in:
+// this tier was previously named SchemaSourceAWSCCAPI ("aws_ccapi"),
+// UBI-158's own original name for "the CloudFormation Cloud Control API
+// registry tier," left unimplemented through Phase 4 (that phase's own
+// doc comment, still readable in git history, explicitly named this same
+// gap and deliberately left it alone). Implementing it this checkpoint
+// surfaced a real naming problem with the old name: "aws_ccapi" named
+// the EXECUTION mechanism (Cloud Control API), not the SCHEMA source
+// (the separate CloudFormation resource-provider schema registry) --
+// inconsistent with every other real value here, which all name schema
+// sources (openapi/smithy/discovery_docs), never execution mechanisms.
+// Renamed to "cloudformation" (the schema registry's own real name) for
+// that consistency; execution goes through Cloud Control API regardless
+// of what the schema-source value is called (internal/cloudformation/ccapi).
 type SchemaSourceType string
 
 const (
-	SchemaSourceOpenAPI      SchemaSourceType = "openapi"
-	SchemaSourceSmithy       SchemaSourceType = "smithy"
-	SchemaSourceInline       SchemaSourceType = "inline"
-	SchemaSourceAWSCCAPI     SchemaSourceType = "aws_ccapi"
-	SchemaSourceDiscoveryDoc SchemaSourceType = "discovery_docs"
+	SchemaSourceOpenAPI        SchemaSourceType = "openapi"
+	SchemaSourceSmithy         SchemaSourceType = "smithy"
+	SchemaSourceInline         SchemaSourceType = "inline"
+	SchemaSourceCloudFormation SchemaSourceType = "cloudformation"
+	SchemaSourceDiscoveryDoc   SchemaSourceType = "discovery_docs"
 )
 
 // Auth is a stub, per UBI-158 Phase 1's own explicit scope ("Auth is Phase
@@ -140,15 +143,18 @@ func (p Provider) validate() error {
 		return fmt.Errorf("dynamic_providers.%s: schema_source is required", p.Name)
 	}
 	switch p.SchemaSource {
-	case SchemaSourceOpenAPI, SchemaSourceSmithy, SchemaSourceDiscoveryDoc:
+	case SchemaSourceOpenAPI, SchemaSourceSmithy, SchemaSourceDiscoveryDoc, SchemaSourceCloudFormation:
 		// implemented
-	case SchemaSourceInline, SchemaSourceAWSCCAPI:
+	case SchemaSourceInline:
 		return fmt.Errorf("dynamic_providers.%s: schema_source %q is a real UBI-158 tier but not yet implemented", p.Name, p.SchemaSource)
 	default:
-		return fmt.Errorf("dynamic_providers.%s: unrecognized schema_source %q (want one of: openapi, smithy, discovery_docs, inline, aws_ccapi)", p.Name, p.SchemaSource)
+		return fmt.Errorf("dynamic_providers.%s: unrecognized schema_source %q (want one of: openapi, smithy, discovery_docs, cloudformation, inline)", p.Name, p.SchemaSource)
 	}
 	if (p.SchemaSource == SchemaSourceOpenAPI || p.SchemaSource == SchemaSourceSmithy || p.SchemaSource == SchemaSourceDiscoveryDoc) && p.SchemaURL == "" {
 		return fmt.Errorf("dynamic_providers.%s: schema_url is required when schema_source is %q", p.Name, p.SchemaSource)
+	}
+	if p.SchemaSource == SchemaSourceCloudFormation && p.SchemaURL == "" {
+		return fmt.Errorf("dynamic_providers.%s: schema_url is required when schema_source is %q (the real CloudFormation registry zip URL)", p.Name, p.SchemaSource)
 	}
 	if p.BaseURL == "" {
 		return fmt.Errorf("dynamic_providers.%s: base_url is required", p.Name)
