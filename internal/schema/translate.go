@@ -269,11 +269,11 @@ func (t *Translator) buildProperties(s *openapi3.Schema, path string) []*tfproto
 func (t *Translator) buildType(s *openapi3.Schema, path string) tftypes.Type {
 	switch {
 	case len(s.OneOf) > 0:
-		return t.buildUnion(s.OneOf, "oneOf", path)
+		return t.buildComposedType(s, path, func() tftypes.Type { return t.buildUnion(s.OneOf, "oneOf", path) })
 	case len(s.AnyOf) > 0:
-		return t.buildUnion(s.AnyOf, "anyOf", path)
+		return t.buildComposedType(s, path, func() tftypes.Type { return t.buildUnion(s.AnyOf, "anyOf", path) })
 	case len(s.AllOf) > 0:
-		return t.buildAllOf(s, path)
+		return t.buildComposedType(s, path, func() tftypes.Type { return t.buildAllOf(s, path) })
 	case s.Type.Is("array"):
 		return t.buildArray(s, path)
 	case isObjectType(s):
@@ -370,6 +370,43 @@ func (t *Translator) buildMap(s *openapi3.Schema, path string) tftypes.Type {
 //     coherent static shape at all in tfplugin's type system --
 //     DynamicPseudoType, fully opaque to Terraform's own type-checking,
 //     the same honest fallback a schema-less value gets.
+// buildComposedType wraps buildFn (buildUnion for oneOf/anyOf, buildAllOf
+// for allOf) with this Translator's own real, existing cycle guard
+// (enterObject/exitObject) -- keyed on s ITSELF, the real, stable,
+// $ref-deduped schema pointer that DECLARES the oneOf/anyOf/allOf, not
+// the fresh, synthetic *openapi3.Schema buildUnion/buildAllOf each
+// construct internally to hand off to buildProperties.
+//
+// Real, structural finding, checkpoint 12: without this, a real,
+// INDIRECT cycle through a oneOf/anyOf/allOf composition was
+// completely invisible to enterObject's own pointer-identity check --
+// buildProperties (called via buildUnion's "allObjects" branch or
+// buildAllOf) only ever sees that fresh, newly-allocated merged object,
+// never the real branch schemas' own stable pointers, so the SAME real
+// cycle that buildProperties' own direct self-reference case catches
+// immediately sailed straight through here every time, all the way to
+// defaultMaxDepth, before finally degrading to dynamic. Confirmed live
+// against Datadog's own real, published logs-pipeline schema
+// (LogsProcessor, a real oneOf whose own branches include
+// LogsPipelineProcessor, whose own "processors" property is an array of
+// LogsProcessor again -- a genuine, real, intentional recursive
+// structure, not a spec bug) -- before this fix, that real field
+// resolved 60 levels deep (defaultMaxDepth, not a coincidence), every
+// level literally named "processors", in both the generated SDK code's
+// own struct tree AND cli/sdk.go's own --list-undescribed gap-list
+// output. With this fix in place, keying on LogsProcessor's own real
+// schema pointer, the SAME real cycle is caught the SECOND time
+// buildType visits it -- exactly the depth a real, honest "self-
+// referential, recursion stops here" Note already documents for every
+// OTHER real occurrence of this same guard.
+func (t *Translator) buildComposedType(s *openapi3.Schema, path string, buildFn func() tftypes.Type) tftypes.Type {
+	if !t.enterObject(s, path) {
+		return tftypes.DynamicPseudoType
+	}
+	defer t.exitObject()
+	return buildFn()
+}
+
 func (t *Translator) buildUnion(branches openapi3.SchemaRefs, kind, path string) tftypes.Type {
 	resolved := make([]*openapi3.Schema, 0, len(branches))
 	for _, b := range branches {

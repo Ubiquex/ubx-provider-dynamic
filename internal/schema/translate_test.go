@@ -220,6 +220,81 @@ func TestBuildAttribute_SelfReferentialSchema_DoesNotHang(t *testing.T) {
 	}
 }
 
+// TestBuildAttribute_IndirectCycleThroughOneOf_CaughtQuickly is the real,
+// direct regression test for checkpoint 12's own fix: a cycle that goes
+// THROUGH a oneOf/anyOf/allOf composition (buildUnion's own "allObjects"
+// branch hands a freshly-synthesized *openapi3.Schema to buildProperties,
+// never the real branch schemas' own stable pointers) was completely
+// invisible to enterObject's own pointer-identity cycle guard before this
+// fix -- confirmed live against Datadog's own real, published
+// logs-pipeline schema (LogsProcessor, a real oneOf whose own
+// LogsPipelineProcessor branch has a "processors" property that is an
+// array of LogsProcessor again): the real field resolved all the way to
+// defaultMaxDepth (60), not a true infinite hang, but a real, useless
+// 60-level-deep field tree, every level literally named "processors".
+// This test reproduces the identical real shape (a oneOf whose own
+// object branch nests an array of the same oneOf again) and proves the
+// fix catches it at the SECOND real occurrence, the same real depth
+// every other self-referential case in this file already terminates at.
+func TestBuildAttribute_IndirectCycleThroughOneOf_CaughtQuickly(t *testing.T) {
+	processor := &openapi3.Schema{}
+	pipeline := openapi3.NewObjectSchema().
+		WithProperty("name", openapi3.NewStringSchema())
+	processorsArray := openapi3.NewArraySchema()
+	processorsArray.Items = openapi3.NewSchemaRef("#/components/schemas/Processor", processor)
+	pipeline.Properties["processors"] = openapi3.NewSchemaRef("", processorsArray)
+
+	processor.OneOf = openapi3.SchemaRefs{
+		openapi3.NewSchemaRef("#/components/schemas/Pipeline", pipeline),
+		openapi3.NewSchemaRef("", openapi3.NewObjectSchema().WithProperty("type", openapi3.NewStringSchema())),
+	}
+
+	tr := NewTranslator()
+	done := make(chan *tfprotov6.SchemaAttribute, 1)
+	go func() {
+		done <- tr.BuildAttribute("processor", openapi3.NewSchemaRef("#/components/schemas/Processor", processor), fieldPolicy{}, "root")
+	}()
+
+	var attr *tfprotov6.SchemaAttribute
+	select {
+	case attr = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("BuildAttribute hung on an indirect oneOf cycle -- cycle guard did not stop recursion")
+	}
+
+	foundCycleNote := false
+	for _, n := range tr.Notes {
+		if strings.Contains(n.Detail, "self-referential") {
+			foundCycleNote = true
+		}
+	}
+	if !foundCycleNote {
+		t.Fatalf("expected a self-referential Note, got %+v", tr.Notes)
+	}
+
+	// The real, load-bearing assertion: the resulting attribute tree must
+	// be shallow (the cycle caught within a few real levels), never
+	// anywhere near defaultMaxDepth -- proving this is a real fix, not
+	// just a slower path to the same 60-level-deep tree.
+	depth := 0
+	var walk func(a *tfprotov6.SchemaAttribute, d int)
+	walk = func(a *tfprotov6.SchemaAttribute, d int) {
+		if d > depth {
+			depth = d
+		}
+		if a.NestedType == nil {
+			return
+		}
+		for _, inner := range a.NestedType.Attributes {
+			walk(inner, d+1)
+		}
+	}
+	walk(attr, 0)
+	if depth > 5 {
+		t.Fatalf("resulting attribute tree is %d levels deep, want a shallow tree (the cycle caught quickly, not run to defaultMaxDepth)", depth)
+	}
+}
+
 func TestTfName(t *testing.T) {
 	cases := map[string]string{
 		"full_name":      "full_name",
