@@ -198,7 +198,20 @@ func Discover(doc *Document, providerName string) ([]Resource, []Note, error) {
 				if !createFound {
 					notes = append(notes, Note{Path: pathStr, Detail: "no matching create (\"create\" or \"insert\") method -- read-only, modeled as a data source concern, not a resource"})
 				} else {
-					noun := singularize(name)
+					// Real, live-confirmed finding: a Discovery Document's
+					// own resource-tree keys are camelCase
+					// ("backendBuckets", "targetHttpProxies", ...), unlike
+					// OpenAPI's own ref names (already snake_case by the
+					// time deriveNoun sees them) -- caught only by
+					// actually generating Go code against the real,
+					// live, configured GCP Compute document (95 real
+					// resources), which rejected a raw camelCase wire
+					// name outright. uschema.ToSnakeCase is the identical
+					// real conversion internal/schema.translate.go's own
+					// ToSnakeCase already applies to every OpenAPI
+					// property name, reused here for the resource noun
+					// itself, not invented separately.
+					noun := singularize(uschema.ToSnakeCase(name))
 					typeName := providerName + "_" + doc.Name + "_" + noun
 					if seenTypeNames[typeName] {
 						notes = append(notes, Note{Path: pathStr, Detail: fmt.Sprintf("resource type name %q already claimed by another resource path -- skipped rather than disambiguated", typeName)})

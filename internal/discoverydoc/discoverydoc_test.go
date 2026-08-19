@@ -179,3 +179,40 @@ func TestConvertSchema_ArrayOfObjects(t *testing.T) {
 		t.Fatalf("expected a resolved 'Item' object with an 'id' property in Items, got %+v", s.Items)
 	}
 }
+
+// TestDiscover_CamelCaseResourceKey_SnakeCased is a real regression test
+// for a real bug caught only by actually generating Go code against the
+// live, configured GCP Compute discovery document (95 real resources):
+// a Discovery Document's own resource-tree keys are camelCase
+// ("backendBuckets", "targetHttpProxies"), unlike OpenAPI's own already-
+// snake_case ref names -- a raw camelCase noun reached every per-language
+// template's own real "only lowercase ascii + digits + underscore"
+// wire-name guard and failed generation outright.
+func TestDiscover_CamelCaseResourceKey_SnakeCased(t *testing.T) {
+	doc := &Document{
+		Name: "compute",
+		Schemas: map[string]*rawSchema{
+			"BackendBucket": {Type: "object", Properties: map[string]*rawSchema{
+				"name": {Type: "string"},
+			}},
+		},
+		Resources: map[string]*rawResource{
+			"backendBuckets": {
+				Methods: map[string]*rawMethod{
+					"get":    {HTTPMethod: "GET", FlatPath: "v1/projects/{project}/global/backendBuckets/{backendBucket}", Response: &rawRef{Ref: "BackendBucket"}},
+					"insert": {HTTPMethod: "POST", FlatPath: "v1/projects/{project}/global/backendBuckets", Request: &rawRef{Ref: "BackendBucket"}},
+				},
+			},
+		},
+	}
+	resources, _, err := Discover(doc, "google")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("expected exactly one resource, got %d: %+v", len(resources), resources)
+	}
+	if got := resources[0].TypeName; got != "google_compute_backend_bucket" {
+		t.Fatalf("TypeName = %q, want the real, wire-name-safe snake_case form %q", got, "google_compute_backend_bucket")
+	}
+}
