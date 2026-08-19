@@ -140,6 +140,35 @@ see `config.Provider.TargetPrefix`'s own doc comment.
    `*bytes.Reader`-backed request this repo builds, is exactly what a real
    signer needs to hash the body and restore it afterward.
 
+10. **CloudFormation schema source + Cloud Control API execution**
+    (`internal/cloudformation`, `internal/cloudformation/ccapi`,
+    `internal/cloudformation/server`) — `schema_source = "cloudformation"`:
+    AWS's own real, published CloudFormation resource-provider schema
+    registry (`schema.cloudformation.<region>.amazonaws.com`, one real
+    JSON-Schema-shaped file per real `AWS::<Namespace>::<Type>`), converted
+    into the identical `openapi3.Schema` tree Phase 1's translator already
+    consumes. Real, confirmed finding: unlike every other real source here,
+    a CFN schema is explicitly resource-shaped — no operation-name
+    inference or create/read-response merge needed at all.
+
+    Real execution goes through Cloud Control API's own real, fixed,
+    generic operation set (CreateResource/GetResource/UpdateResource/
+    DeleteResource/ListResources), never the per-resource-type Smithy/REST
+    paths above — a new, purpose-built `internal/cloudformation/ccapi`
+    client (real `awsJson1_0`, real target prefix `CloudApiService`,
+    confirmed against the real, locally-installed AWS CLI's own botocore
+    model, not guessed) reusing `restexec.Client` for SigV4/retry. Real,
+    confirmed-live finding: CCAPI's own real async contract (a
+    `RequestToken`, polled via a *separate* `GetResourceRequestStatus`
+    operation with its own fixed `OperationStatus` enum) does not fit
+    `internal/dynserver`'s existing `AsyncConfig`/`PollPathTemplate`
+    (REST-GET-to-a-templated-job-status-URL shaped) — that package's own
+    doc comment had already named this exact gap. `internal/cloudformation/server`
+    is a new, dedicated `tfprotov6.ProviderServer`, the identical real
+    precedent `internal/smithy/server` already set (a genuinely different
+    execution model gets its own small server, not retrofitted into
+    `dynserver.Server`'s REST-path-shaped CRUD).
+
 `internal/wire` (tftypes ↔ plain JSON) and `internal/restexec` (real HTTP
 CRUD execution) are the layer-4/6 glue a Dynamic Provider needs that a real
 HashiCorp provider never does — a real provider's own SDK speaks Go
@@ -255,6 +284,34 @@ credential_source = "profile"
 This now serves real CRUD requests (Checkpoint 2) -- prints real
 discovery/naming results to stderr, then actually reads/creates/updates/
 destroys against real AWS via the resolved real wire protocol.
+
+CloudFormation (`schema_url` points at the real, full registry zip --
+every real `AWS::` resource type in one config entry, unlike Smithy's own
+one-file-per-service split; `base_url` is CCAPI's own real, regional
+endpoint, a single fixed URL regardless of how many resource types this
+entry serves):
+
+```toml
+[dynamic_providers.aws]
+schema_source = "cloudformation"
+schema_url = "https://schema.cloudformation.us-east-1.amazonaws.com/CloudformationSchema.zip"
+base_url = "https://cloudcontrolapi.us-east-1.amazonaws.com"
+
+[dynamic_providers.aws.auth]
+type = "aws_sigv4"
+[dynamic_providers.aws.auth.params]
+region = "us-east-1"
+service = "cloudcontrolapi"
+credential_source = "profile"
+```
+
+Real, live-fetched counts against the real registry: 1,705 real `AWS::`
+resource types, 1,700 successfully translated, 15,678 real top-level
+fields. Real execution verified hermetically (`internal/cloudformation/server`'s
+own `TestCreateAndDestroy_RealAsyncPollCycle`) — a real create+destroy
+cycle against a local fake CCAPI server proving the full async
+Create→poll→read / Delete→poll path, never against real AWS (this
+project's own standing rule against a live apply).
 
 ## Conformance
 
