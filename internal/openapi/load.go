@@ -87,33 +87,47 @@ func Load(source string) (*openapi3.T, error) {
 		return nil, fmt.Errorf("load OpenAPI spec from %s: %w", source, err)
 	}
 
-	if probe.Swagger != "" {
-		var doc2 openapi2.T
-		if err := json.Unmarshal(jsonRaw, &doc2); err != nil {
-			return nil, fmt.Errorf("parse Swagger %s document from %s: %w", probe.Swagger, source, err)
-		}
-		doc3, err := openapi2conv.ToV3(&doc2)
-		if err != nil {
-			return nil, fmt.Errorf("convert Swagger %s document from %s to OpenAPI 3: %w", probe.Swagger, source, err)
-		}
-		return doc3, nil
-	}
-
-	loader := openapi3.NewLoader()
-	loader.IsExternalRefsAllowed = true
-	// LoadFromDataWithPath, not LoadFromData: it sets the same document-path
-	// context LoadFromURI/LoadFromFile establish internally, so a real
-	// spec's own relative external $refs (a real, if rare, shape neither
-	// GitHub's nor Datadog's own current spec exercises, but not assumed
-	// impossible for a future real source) still resolve correctly -- the
-	// version probe above already consumed the fetch, so this reuses raw
-	// rather than fetching source a second time.
+	// location gives both the v2 and v3 paths below the same real
+	// document-path context LoadFromURI/LoadFromFile establish internally,
+	// so a real spec's own relative external $refs resolve correctly --
+	// the version probe above already consumed the fetch, so this reuses
+	// raw rather than fetching source a second time.
 	var location *url.URL
 	if u, err := url.Parse(source); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
 		location = u
 	} else if abs, err := filepath.Abs(source); err == nil {
 		location = &url.URL{Scheme: "file", Path: abs}
 	}
+
+	loader := openapi3.NewLoader()
+	loader.IsExternalRefsAllowed = true
+
+	if probe.Swagger != "" {
+		var doc2 openapi2.T
+		if err := json.Unmarshal(jsonRaw, &doc2); err != nil {
+			return nil, fmt.Errorf("parse Swagger %s document from %s: %w", probe.Swagger, source, err)
+		}
+		// ToV3WithLoader, not the plain ToV3 wrapper: ToV3 constructs its
+		// own internal loader with IsExternalRefsAllowed left at its real,
+		// safe-by-default false -- confirmed live against Azure's own
+		// real, published Swagger 2.0 specs (a genuinely different real
+		// shape from Kubernetes' own single-file spec): Azure's own real
+		// per-resource-provider files reference shared external
+		// "common-types" definition files by real relative path
+		// ("../../common-types/v1/common.json#/definitions/SubResource"),
+		// which ToV3's own default loader refuses outright
+		// ("encountered disallowed external reference"). Passing this
+		// package's own loader (already carrying IsExternalRefsAllowed
+		// and, from here on, the real document location too) through
+		// lets those real external refs resolve exactly the way the v3
+		// path below already does.
+		doc3, err := openapi2conv.ToV3WithLoader(&doc2, loader, location)
+		if err != nil {
+			return nil, fmt.Errorf("convert Swagger %s document from %s to OpenAPI 3: %w", probe.Swagger, source, err)
+		}
+		return doc3, nil
+	}
+
 	doc, err := loader.LoadFromDataWithPath(raw, location)
 	if err != nil {
 		return nil, fmt.Errorf("parse OpenAPI %s document from %s: %w", probe.OpenAPI, source, err)
