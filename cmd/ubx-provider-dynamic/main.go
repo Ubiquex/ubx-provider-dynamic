@@ -16,6 +16,7 @@ import (
 
 	"github.com/ubiquex/ubx-provider-dynamic/internal/auth"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/discoverydoc"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/dynserver"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/openapi"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/restexec"
@@ -144,6 +145,54 @@ func run() error {
 			Model:        smithyDoc,
 			Wire:         wireClient,
 		}
+		return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
+			return server
+		})
+	}
+
+	// discoverydoc: the third real schema-source format, GCP's own
+	// Discovery Documents (that package's own doc comment has the full
+	// real research). Schema-layer only, the identical real precedent
+	// this binary's own Kubernetes checkpoint set (discover + translate,
+	// prove it live via GetProviderSchema; real REST wire execution --
+	// Configure/Create/Read/Update/Delete against a real GCP endpoint --
+	// is separate, deliberately not attempted here, the same staging
+	// Smithy's own real Phase 1 -> Phase 4 already used). dynserver.Server
+	// is reused UNCHANGED for GetProviderSchema (confirmed by direct
+	// inspection: that RPC reads ONLY ResourceType.Schema, nothing else);
+	// every OTHER real RPC on this Server would need Client/ObjectType/
+	// PathParamAttr this branch never populates -- a real, honest gap for
+	// the future execution checkpoint, not exercised by this binary's own
+	// real schema-fetch/--dump-signals usage today.
+	if cfg.SchemaSource == config.SchemaSourceDiscoveryDoc {
+		ddoc, err := discoverydoc.Load(cfg.SchemaURL)
+		if err != nil {
+			return fmt.Errorf("load discovery document: %w", err)
+		}
+		built, notes, err := discoverydoc.Build(ddoc, name)
+		if err != nil {
+			return fmt.Errorf("build resource schemas: %w", err)
+		}
+		for _, n := range notes {
+			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [discoverydoc] %s: %s\n", n.Path, n.Detail)
+		}
+		if len(built) == 0 {
+			return fmt.Errorf("no CRUD-shaped resources discovered in %s -- nothing to serve", cfg.SchemaURL)
+		}
+
+		if *dumpSignalsFlag {
+			out := make(map[string]map[string]*uschema.FieldSignal, len(built))
+			for typeName, br := range built {
+				out[typeName] = br.Signals
+			}
+			return json.NewEncoder(os.Stdout).Encode(out)
+		}
+
+		resources := make(map[string]*dynserver.ResourceType, len(built))
+		for typeName, br := range built {
+			resources[typeName] = &dynserver.ResourceType{Schema: br.Schema}
+		}
+		server := &dynserver.Server{ProviderName: name, Resources: resources}
 		return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
 			return server
 		})

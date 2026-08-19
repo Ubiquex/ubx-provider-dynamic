@@ -1,0 +1,427 @@
+// Package discoverydoc translates a real GCP Discovery Document (the
+// third real schema-source format alongside OpenAPI and Smithy) into the
+// same real *tfprotov6.Schema shape internal/schema.Translator already
+// produces for OpenAPI -- schema-layer only, matching UBI-158 Phase 1's
+// own original Kubernetes-checkpoint precedent (discover + translate
+// first, real REST wire execution is separate, later work; see this
+// package's own doc comment on Build for exactly what's out of scope).
+//
+// Real, confirmed structural finding (fetched live against Google Cloud
+// Pub/Sub's own real, published discovery document,
+// https://pubsub.googleapis.com/$discovery/rest?version=v1, before
+// writing any code here): a Discovery Document's own real shape is
+// GENUINELY different from OpenAPI's at the document level (a recursive
+// resources.<name>.resources/methods tree instead of a flat Paths map,
+// explicit method KEYS named "get"/"create"/"patch"/"delete" instead of
+// resourcemap's own response-schema-identity heuristic -- GCP's own real
+// convention is MORE reliable here, needing no heuristic at all) but its
+// own "schemas" component dialect is close enough to OpenAPI's schema
+// object (type/properties/items/additionalProperties/enum/description/
+// readOnly/$ref) that this package converts a Discovery Document schema
+// into a real, already-resolved *openapi3.Schema tree and hands it
+// STRAIGHT to internal/schema.Translator's existing, mature,
+// heavily-tested BuildTopLevel -- real code reuse of the one genuinely
+// hard, load-bearing layer (nested object/array/map/union field
+// translation), not a second, parallel implementation of it.
+//
+// Real, confirmed finding this reuse depends on, checked directly
+// against Pub/Sub's own real schemas before relying on it: Discovery
+// Documents carry NO required-field signal at the schema/body level at
+// all -- neither a per-property "required" boolean nor an object-level
+// "required" array anywhere in the real, live document (grepped, not
+// assumed) -- only "readOnly" (a real, structured boolean, the identical
+// OpenAPI convention Translator already reads). This is not a gap this
+// package works around: it means every converted property naturally
+// resolves to Optional (readOnly=false) or Computed (readOnly=true)
+// through Translator's own existing fieldPolicy logic, unchanged, with
+// zero special-casing needed here for GCP's own real "requiredness is
+// enforced server-side, not declared in the schema" convention.
+package discoverydoc
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
+
+	uschema "github.com/ubiquex/ubx-provider-dynamic/internal/schema"
+)
+
+// Document is one real, parsed Discovery Document -- the fields this
+// package actually reads, not a full re-implementation of Google's own
+// discovery schema (real, deliberate scope: everything else in a real
+// document, batchPath/icons/auth/..., is genuinely irrelevant to schema
+// translation).
+type Document struct {
+	Name             string                  `json:"name"`
+	DiscoveryVersion string                  `json:"discoveryVersion"`
+	BaseURL          string                  `json:"baseUrl"`
+	RootURL          string                  `json:"rootUrl"`
+	ServicePath      string                  `json:"servicePath"`
+	Schemas          map[string]*rawSchema   `json:"schemas"`
+	Resources        map[string]*rawResource `json:"resources"`
+}
+
+type rawResource struct {
+	Methods   map[string]*rawMethod   `json:"methods"`
+	Resources map[string]*rawResource `json:"resources"`
+}
+
+type rawMethod struct {
+	ID             string               `json:"id"`
+	HTTPMethod     string               `json:"httpMethod"`
+	Path           string               `json:"path"`
+	FlatPath       string               `json:"flatPath"`
+	Description    string               `json:"description"`
+	Parameters     map[string]*rawParam `json:"parameters"`
+	ParameterOrder []string             `json:"parameterOrder"`
+	Request        *rawRef              `json:"request"`
+	Response       *rawRef              `json:"response"`
+}
+
+type rawParam struct {
+	Type     string `json:"type"`
+	Location string `json:"location"`
+	Required bool   `json:"required"`
+}
+
+type rawRef struct {
+	Ref string `json:"$ref"`
+}
+
+// rawSchema is one real Discovery-Document schema entry -- deliberately
+// NOT a full JSON Schema implementation, only the real, confirmed
+// vocabulary Pub/Sub's own live document actually uses (see this
+// package's own doc comment for what was checked, not assumed).
+type rawSchema struct {
+	Type                 string                `json:"type"`
+	Format               string                `json:"format"`
+	Description          string                `json:"description"`
+	Ref                  string                `json:"$ref"`
+	Properties           map[string]*rawSchema `json:"properties"`
+	Items                *rawSchema            `json:"items"`
+	AdditionalProperties *rawSchema            `json:"additionalProperties"`
+	Enum                 []string              `json:"enum"`
+	ReadOnly             bool                  `json:"readOnly"`
+}
+
+// Load fetches and parses a real Discovery Document from source (an
+// http(s) URL -- every real, published Google API discovery document is
+// served this way; a bare file path is not a real usage shape for this
+// source, unlike openapi.Load's own local-file convenience).
+func Load(source string) (*Document, error) {
+	req, err := http.NewRequest(http.MethodGet, source, nil)
+	if err != nil {
+		return nil, fmt.Errorf("discovery document %q: %w", source, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch discovery document %q: %w", source, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch discovery document %q: HTTP %d", source, resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read discovery document %q: %w", source, err)
+	}
+	var doc Document
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, fmt.Errorf("parse discovery document %q: %w", source, err)
+	}
+	if doc.Resources == nil {
+		return nil, fmt.Errorf("discovery document %q: no top-level \"resources\" -- not a real Discovery Document, or an API with nothing CRUD-shaped to offer", source)
+	}
+	return &doc, nil
+}
+
+// Resource is one real, CRUD-shaped resource this package discovered --
+// the schema-layer-only real fields this checkpoint's own scope needs
+// (real HTTP method + path template for each real operation found,
+// enough for a future, separate REST-execution checkpoint to consume
+// directly; NOT wired to any execution today -- see Build's own doc
+// comment).
+type Resource struct {
+	TypeName string
+
+	ReadPath   string
+	ReadMethod *rawMethod
+
+	CreatePath   string
+	CreateMethod string
+	createMethod *rawMethod
+
+	UpdateMethod string
+	updateMethod *rawMethod
+
+	HasDelete bool
+}
+
+// Note mirrors internal/schema.Note/internal/resourcemap.Note's own
+// real role: a specific, worth-surfacing discovery/translation decision,
+// never silently dropped.
+type Note struct {
+	Path   string
+	Detail string
+}
+
+// Discover walks doc's own real resources tree (recursively, in
+// deterministic key order) and returns every node that carries a real
+// "get" method -- GCP's own real, explicit, reliable CRUD signal (no
+// response-schema-identity heuristic needed the way OpenAPI's flatter,
+// less structured paths require; internal/resourcemap's own doc comment
+// has the full account of why THAT heuristic exists at all -- GCP simply
+// doesn't need it). A node with "get" but no "create"/"insert" is a
+// real, read-only data-source concern, recorded as a Note and skipped,
+// the identical "skip, don't fail" discipline resourcemap's own Discover
+// already uses.
+func Discover(doc *Document, providerName string) ([]Resource, []Note, error) {
+	var resources []Resource
+	var notes []Note
+	seenTypeNames := map[string]bool{}
+
+	var walk func(node map[string]*rawResource, path []string)
+	walk = func(node map[string]*rawResource, path []string) {
+		for _, name := range sortedKeys(node) {
+			r := node[name]
+			nodePath := append(append([]string{}, path...), name)
+			pathStr := strings.Join(nodePath, ".")
+
+			if get, ok := r.Methods["get"]; ok && get != nil {
+				create, createFound := firstMethod(r.Methods, "create", "insert")
+				if !createFound {
+					notes = append(notes, Note{Path: pathStr, Detail: "no matching create (\"create\" or \"insert\") method -- read-only, modeled as a data source concern, not a resource"})
+				} else {
+					noun := singularize(name)
+					typeName := providerName + "_" + doc.Name + "_" + noun
+					if seenTypeNames[typeName] {
+						notes = append(notes, Note{Path: pathStr, Detail: fmt.Sprintf("resource type name %q already claimed by another resource path -- skipped rather than disambiguated", typeName)})
+					} else {
+						seenTypeNames[typeName] = true
+						update, updateFound := firstMethod(r.Methods, "patch", "update")
+						res := Resource{
+							TypeName:     typeName,
+							ReadPath:     get.FlatPath,
+							ReadMethod:   get,
+							CreatePath:   create.FlatPath,
+							CreateMethod: strings.ToUpper(create.HTTPMethod),
+							createMethod: create,
+						}
+						if updateFound {
+							res.UpdateMethod = strings.ToUpper(update.HTTPMethod)
+							res.updateMethod = update
+						} else {
+							notes = append(notes, Note{Path: pathStr, Detail: "no \"patch\" or \"update\" method -- modeled as create/delete-only, no in-place update"})
+						}
+						if _, ok := r.Methods["delete"]; ok {
+							res.HasDelete = true
+						} else {
+							notes = append(notes, Note{Path: pathStr, Detail: "no \"delete\" method -- modeled without a real destroy operation"})
+						}
+						resources = append(resources, res)
+					}
+				}
+			}
+
+			if r.Resources != nil {
+				walk(r.Resources, nodePath)
+			}
+		}
+	}
+	walk(doc.Resources, nil)
+
+	sort.Slice(resources, func(i, j int) bool { return resources[i].TypeName < resources[j].TypeName })
+	return resources, notes, nil
+}
+
+func firstMethod(methods map[string]*rawMethod, names ...string) (*rawMethod, bool) {
+	for _, n := range names {
+		if m, ok := methods[n]; ok && m != nil {
+			return m, true
+		}
+	}
+	return nil, false
+}
+
+func sortedKeys(m map[string]*rawResource) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// singularize is the identical, deliberately approximate "trailing s
+// stripped" heuristic internal/resourcemap.deriveNoun's own fallback
+// path already uses for the same real reason: pulling in a real
+// inflection engine for this one naming step isn't proportionate.
+func singularize(s string) string {
+	return strings.TrimSuffix(s, "s")
+}
+
+// Build translates every resource Discover found into a real, merged
+// *tfprotov6.Schema (create request + read response, the identical
+// real merge semantics internal/dynserver.Build's own OpenAPI path
+// already uses) plus its own combined enum/constraint FieldSignal tree.
+//
+// Real, deliberate, honestly-scoped limitation: this checkpoint is
+// schema-layer only, the identical real precedent UBI-158 Phase 1 set
+// for Kubernetes (discover + translate first, prove it live, real REST
+// wire execution is separate, later work -- Smithy's own real Phase 1 ->
+// Phase 4 staging is the same shape again). Build does NOT wire any real
+// HTTP execution path -- ReadPath/CreatePath/CreateMethod/UpdateMethod on
+// the returned BuiltResource are real, correct strings (GCP's own real
+// flatPath/httpMethod), ready for a future, separate checkpoint to
+// consume, but nothing in THIS package calls restexec or wires a
+// dynserver.Server today.
+func Build(doc *Document, providerName string) (map[string]*BuiltResource, []Note, error) {
+	resources, notes, err := Discover(doc, providerName)
+	if err != nil {
+		return nil, notes, err
+	}
+
+	out := make(map[string]*BuiltResource, len(resources))
+	for _, res := range resources {
+		tr := uschema.NewTranslator()
+
+		var createAttrs []*tfprotov6.SchemaAttribute
+		var signals map[string]*uschema.FieldSignal
+		if reqSchema := resolveRef(res.createMethod.Request, doc); reqSchema != nil {
+			createAttrs = tr.BuildTopLevel(reqSchema, res.TypeName+".create")
+			signals = uschema.MergeSignalMaps(signals, uschema.CollectSignals(reqSchema))
+		}
+
+		var readAttrs []*tfprotov6.SchemaAttribute
+		if respSchema := resolveRef(res.ReadMethod.Response, doc); respSchema != nil {
+			readAttrs = tr.BuildTopLevel(respSchema, res.TypeName+".read")
+			signals = uschema.MergeSignalMaps(signals, uschema.CollectSignals(respSchema))
+		}
+
+		merged := uschema.MergeResourceAttributes(createAttrs, readAttrs)
+		if len(merged) == 0 {
+			notes = append(notes, Note{Path: res.TypeName, Detail: "neither the create request body nor the read response yielded any attributes -- skipped, no usable schema"})
+			continue
+		}
+
+		for _, n := range tr.Notes {
+			notes = append(notes, Note{Path: res.TypeName + "." + n.Path, Detail: n.Detail})
+		}
+
+		block := &tfprotov6.SchemaBlock{Version: 1, Attributes: merged}
+		schema := &tfprotov6.Schema{Version: 1, Block: block}
+
+		out[res.TypeName] = &BuiltResource{
+			Resource: res,
+			Schema:   schema,
+			Signals:  signals,
+		}
+	}
+
+	return out, notes, nil
+}
+
+// BuiltResource is Build's own real per-resource result -- the real,
+// translated schema plus the original Resource (real path/method
+// strings a future REST-execution checkpoint needs) and this resource's
+// own real, combined enum/constraint signal tree (identical real shape
+// internal/dynserver.ResourceType.Signals already carries for the
+// OpenAPI source, so ubiquex's own --dump-signals consumer needs no
+// per-source special-casing).
+type BuiltResource struct {
+	Resource Resource
+	Schema   *tfprotov6.Schema
+	Signals  map[string]*uschema.FieldSignal
+}
+
+// resolveRef resolves ref against doc.Schemas into a real
+// *openapi3.Schema tree, ready for internal/schema.Translator to
+// consume unchanged -- nil for an unresolvable or absent ref (a real,
+// honest "nothing to translate" case some real GCP methods have, e.g. a
+// request-body-less action-style POST; Translator's own BuildTopLevel
+// already handles a nil schema by returning no attributes, matching
+// resourcemap's own RequestBodySchema convention).
+func resolveRef(ref *rawRef, doc *Document) *openapi3.Schema {
+	if ref == nil || ref.Ref == "" {
+		return nil
+	}
+	return convertSchema(&rawSchema{Ref: ref.Ref}, doc.Schemas, map[string]bool{})
+}
+
+// convertSchema converts one real Discovery-Document schema node into a
+// real, already-resolved *openapi3.Schema -- $ref resolved directly
+// against all (a real, single-document, flat resolution; Discovery
+// Documents, unlike Azure's own multi-file OpenAPI specs, never
+// reference an external document), with a real cycle guard (active,
+// keyed by ref name) matching internal/schema.Translator's own real
+// object-identity cycle guard in spirit -- a real cycle here becomes a
+// real, honest DynamicPseudoType downstream (buildType's own existing
+// "no concrete type" fallback), never an infinite loop.
+func convertSchema(raw *rawSchema, all map[string]*rawSchema, active map[string]bool) *openapi3.Schema {
+	if raw == nil {
+		return openapi3.NewSchema()
+	}
+	if raw.Ref != "" {
+		if active[raw.Ref] {
+			return openapi3.NewSchema()
+		}
+		target, ok := all[raw.Ref]
+		if !ok {
+			return openapi3.NewSchema()
+		}
+		active[raw.Ref] = true
+		resolved := convertSchema(target, all, active)
+		delete(active, raw.Ref)
+		return resolved
+	}
+
+	var s *openapi3.Schema
+	switch raw.Type {
+	case "object":
+		s = openapi3.NewObjectSchema()
+		for _, name := range sortedSchemaKeys(raw.Properties) {
+			child := convertSchema(raw.Properties[name], all, active)
+			s.WithPropertyRef(name, openapi3.NewSchemaRef("", child))
+		}
+		if raw.AdditionalProperties != nil {
+			s.WithAdditionalProperties(convertSchema(raw.AdditionalProperties, all, active))
+		}
+	case "array":
+		s = openapi3.NewArraySchema()
+		s.Items = openapi3.NewSchemaRef("", convertSchema(raw.Items, all, active))
+	case "string":
+		s = openapi3.NewStringSchema()
+		for _, e := range raw.Enum {
+			s.Enum = append(s.Enum, e)
+		}
+	case "integer", "number":
+		s = openapi3.NewFloat64Schema()
+	case "boolean":
+		s = openapi3.NewBoolSchema()
+	default:
+		// Real, honest fallback -- a Discovery Document schema with no
+		// "type" at all (real, legal, e.g. "any") or a type this
+		// package has no real, confirmed case for yet (not invented
+		// speculatively; extend when a real, live document is found
+		// that needs it).
+		s = openapi3.NewSchema()
+	}
+	s.Description = raw.Description
+	s.ReadOnly = raw.ReadOnly
+	return s
+}
+
+func sortedSchemaKeys(m map[string]*rawSchema) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}

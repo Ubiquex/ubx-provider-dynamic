@@ -57,10 +57,11 @@ import (
 type SchemaSourceType string
 
 const (
-	SchemaSourceOpenAPI  SchemaSourceType = "openapi"
-	SchemaSourceSmithy   SchemaSourceType = "smithy"
-	SchemaSourceInline   SchemaSourceType = "inline"
-	SchemaSourceAWSCCAPI SchemaSourceType = "aws_ccapi"
+	SchemaSourceOpenAPI      SchemaSourceType = "openapi"
+	SchemaSourceSmithy       SchemaSourceType = "smithy"
+	SchemaSourceInline       SchemaSourceType = "inline"
+	SchemaSourceAWSCCAPI     SchemaSourceType = "aws_ccapi"
+	SchemaSourceDiscoveryDoc SchemaSourceType = "discovery_docs"
 )
 
 // Auth is a stub, per UBI-158 Phase 1's own explicit scope ("Auth is Phase
@@ -139,14 +140,14 @@ func (p Provider) validate() error {
 		return fmt.Errorf("dynamic_providers.%s: schema_source is required", p.Name)
 	}
 	switch p.SchemaSource {
-	case SchemaSourceOpenAPI, SchemaSourceSmithy:
+	case SchemaSourceOpenAPI, SchemaSourceSmithy, SchemaSourceDiscoveryDoc:
 		// implemented
 	case SchemaSourceInline, SchemaSourceAWSCCAPI:
 		return fmt.Errorf("dynamic_providers.%s: schema_source %q is a real UBI-158 tier but not yet implemented", p.Name, p.SchemaSource)
 	default:
-		return fmt.Errorf("dynamic_providers.%s: unrecognized schema_source %q (want one of: openapi, smithy, inline, aws_ccapi)", p.Name, p.SchemaSource)
+		return fmt.Errorf("dynamic_providers.%s: unrecognized schema_source %q (want one of: openapi, smithy, discovery_docs, inline, aws_ccapi)", p.Name, p.SchemaSource)
 	}
-	if (p.SchemaSource == SchemaSourceOpenAPI || p.SchemaSource == SchemaSourceSmithy) && p.SchemaURL == "" {
+	if (p.SchemaSource == SchemaSourceOpenAPI || p.SchemaSource == SchemaSourceSmithy || p.SchemaSource == SchemaSourceDiscoveryDoc) && p.SchemaURL == "" {
 		return fmt.Errorf("dynamic_providers.%s: schema_url is required when schema_source is %q", p.Name, p.SchemaSource)
 	}
 	if p.BaseURL == "" {
