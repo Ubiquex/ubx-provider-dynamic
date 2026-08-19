@@ -30,6 +30,20 @@ func TestLive_Datadog(t *testing.T) {
 		nil)
 }
 
+// TestLive_Kubernetes proves the real Swagger 2.0 -> OpenAPI 3 conversion
+// path (internal/openapi's own new real finding: Kubernetes' own real,
+// official API surface has no single-file OpenAPI 3.x document at all,
+// only a single-file Swagger 2.0 one) against Kubernetes' own real,
+// current, pinned (release-1.37, matching this project's own "explicit
+// version pins only" convention) swagger.json -- proving the FULL real
+// pipeline end to end (fetch, convert, resource-map, translate), not just
+// that the conversion function itself runs without erroring.
+func TestLive_Kubernetes(t *testing.T) {
+	requireLive(t)
+	validateSpec(t, "kubernetes", "https://raw.githubusercontent.com/kubernetes/kubernetes/release-1.37/api/openapi-spec/swagger.json",
+		nil)
+}
+
 func requireLive(t *testing.T) {
 	t.Helper()
 	if os.Getenv("UBX_LIVE_VALIDATION") == "" {

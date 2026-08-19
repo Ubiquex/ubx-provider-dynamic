@@ -19,6 +19,7 @@ package resourcemap
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -132,11 +133,14 @@ func Discover(doc *openapi3.T, providerName string) ([]Resource, []Note, error) 
 			continue
 		}
 
-		noun, nounNote := deriveNoun(refName, rc.path)
+		service, noun, nounNote := deriveNoun(refName, rc.path)
 		if nounNote != "" {
 			notes = append(notes, Note{Path: rc.path, Detail: nounNote})
 		}
 		typeName := providerName + "_" + noun
+		if service != "" {
+			typeName = providerName + "_" + service + "_" + noun
+		}
 		if existingPath, dup := seenTypeNames[typeName]; dup {
 			// Real, confirmed against GitHub's own spec: two distinct
 			// item paths can share one response schema on purpose --
@@ -376,16 +380,24 @@ func refString(ref string) string {
 	return ""
 }
 
-// deriveNoun picks the resource-type noun: the response component schema's
-// own name when one exists (the strong, real signal), snake_cased; falling
-// back to the read path's own last non-parameter segment, naively
-// singularized (trailing "s" stripped, real English-plural-only heuristic
-// -- documented as approximate, not a real inflection engine, since
-// pulling one in for this fallback path alone isn't proportionate to how
-// rarely real specs leave a response schema unnamed).
-func deriveNoun(refName, readPath string) (noun string, note string) {
+// deriveNoun picks the resource-type service (optional) and noun: the
+// response component schema's own name when one exists (the strong, real
+// signal), snake_cased -- further split into (service, noun) when that
+// name itself carries a real, structural service/group qualifier (see
+// splitQualifiedRefName) -- falling back to the read path's own last
+// non-parameter segment, naively singularized (trailing "s" stripped, real
+// English-plural-only heuristic -- documented as approximate, not a real
+// inflection engine, since pulling one in for this fallback path alone
+// isn't proportionate to how rarely real specs leave a response schema
+// unnamed) when no response schema name exists at all. service is always
+// "" in the fallback case -- a bare path segment carries no real service
+// signal to extract.
+func deriveNoun(refName, readPath string) (service, noun string, note string) {
 	if refName != "" {
-		return toSnakeCase(refName), ""
+		if svc, n, ok := splitQualifiedRefName(refName); ok {
+			return toSnakeCase(svc), toSnakeCase(n), ""
+		}
+		return "", toSnakeCase(refName), ""
 	}
 	segs := strings.Split(strings.TrimSuffix(readPath, "/"), "/")
 	var last string
@@ -399,7 +411,42 @@ func deriveNoun(refName, readPath string) (noun string, note string) {
 		last = "resource"
 	}
 	singular := strings.TrimSuffix(last, "s")
-	return toSnakeCase(singular), fmt.Sprintf("response schema has no component name (inline schema) -- resource noun %q derived from the read path itself instead, a weaker heuristic than the usual response-schema-name match", singular)
+	return "", toSnakeCase(singular), fmt.Sprintf("response schema has no component name (inline schema) -- resource noun %q derived from the read path itself instead, a weaker heuristic than the usual response-schema-name match", singular)
+}
+
+// apiVersionPattern matches a real API version token -- "v1", "v1beta1",
+// "v2alpha3", ... -- the real, load-bearing signal splitQualifiedRefName
+// uses to recognize a dotted, package-qualified response schema name's own
+// real structure, rather than guessing from segment count alone.
+var apiVersionPattern = regexp.MustCompile(`^v[0-9]+((alpha|beta)[0-9]+)?$`)
+
+// splitQualifiedRefName recognizes a real, structural naming convention
+// some OpenAPI-sourced APIs use for their own response component schema
+// names -- a dotted, package-qualified identifier whose own second-to-last
+// segment is a real API version token. Confirmed live against Kubernetes'
+// own real, converted-from-Swagger2 spec: "io.k8s.api.apps.v1.Deployment" and
+// "io.k8s.apiextensions-apiserver.pkg.apis.apiextensions.v1.CustomResourceDefinition"
+// are both real, both correctly split by taking the version token's own
+// immediate neighbors -- the segment before it as the real API group
+// (service), the segment after it as the real resource Kind (noun) --
+// without needing to hardcode either real prefix depth ("io.k8s.api." vs.
+// "io.k8s.<component>.pkg.apis.") as a special case.
+//
+// Deliberately generic, not Kubernetes-specific in code: any OpenAPI-sourced
+// spec whose own response schemas happen to share this real shape gets the
+// identical treatment; a spec whose ref names don't match it (GitHub's/
+// Datadog's own flatter, single-concept names, e.g. "full-repository") falls
+// through to deriveNoun's own existing, unchanged single-noun behavior.
+func splitQualifiedRefName(refName string) (service, noun string, ok bool) {
+	segs := strings.Split(refName, ".")
+	if len(segs) < 3 {
+		return "", "", false
+	}
+	version := segs[len(segs)-2]
+	if !apiVersionPattern.MatchString(version) {
+		return "", "", false
+	}
+	return segs[len(segs)-3], segs[len(segs)-1], true
 }
 
 func toSnakeCase(s string) string {

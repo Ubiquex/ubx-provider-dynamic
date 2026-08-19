@@ -121,3 +121,45 @@ func TestDiscover_NoPaths(t *testing.T) {
 		t.Fatal("expected error for nil Paths")
 	}
 }
+
+// TestSplitQualifiedRefName_RealKubernetesShapes proves the real, dotted,
+// package-qualified ref-name split against the exact real shapes confirmed
+// live against Kubernetes' own real, converted-from-Swagger2 spec this
+// session (the onboarding-pipeline naming work) -- both the common
+// "io.k8s.api.<group>.<version>.<Kind>" family and the real, structurally
+// different "io.k8s.<component>.pkg.apis.<group>.<version>.<Kind>" family
+// (apiextensions-apiserver's own CustomResourceDefinition), proving the
+// "last 3 segments, middle one a real version token" heuristic generalizes
+// across both without hardcoding either real prefix depth.
+func TestSplitQualifiedRefName_RealKubernetesShapes(t *testing.T) {
+	cases := []struct {
+		ref, wantService, wantNoun string
+	}{
+		{"io.k8s.api.apps.v1.Deployment", "apps", "Deployment"},
+		{"io.k8s.api.core.v1.Pod", "core", "Pod"},
+		{"io.k8s.api.admissionregistration.v1alpha1.MutatingAdmissionPolicy", "admissionregistration", "MutatingAdmissionPolicy"},
+		{"io.k8s.apiextensions-apiserver.pkg.apis.apiextensions.v1.CustomResourceDefinition", "apiextensions", "CustomResourceDefinition"},
+	}
+	for _, c := range cases {
+		service, noun, ok := splitQualifiedRefName(c.ref)
+		if !ok {
+			t.Errorf("splitQualifiedRefName(%q): ok = false, want true", c.ref)
+			continue
+		}
+		if service != c.wantService || noun != c.wantNoun {
+			t.Errorf("splitQualifiedRefName(%q) = (%q, %q), want (%q, %q)", c.ref, service, noun, c.wantService, c.wantNoun)
+		}
+	}
+}
+
+// TestSplitQualifiedRefName_NonQualifiedNamesUnaffected proves GitHub's/
+// Datadog's own real, flatter, single-concept ref names (no version-like
+// segment anywhere) correctly report ok=false -- deriveNoun's own existing,
+// unchanged single-noun fallback applies, not a false-positive split.
+func TestSplitQualifiedRefName_NonQualifiedNamesUnaffected(t *testing.T) {
+	for _, ref := range []string{"full-repository", "gist-simple", "Widget", "a.b"} {
+		if _, _, ok := splitQualifiedRefName(ref); ok {
+			t.Errorf("splitQualifiedRefName(%q): ok = true, want false (no real version-shaped segment present)", ref)
+		}
+	}
+}
