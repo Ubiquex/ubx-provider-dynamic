@@ -6,6 +6,7 @@ package dynserver
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
@@ -32,6 +33,22 @@ type ResourceType struct {
 	Timeouts   Timeouts
 	Async      AsyncPolicy
 	Drift      DriftPolicy
+
+	// PathParamAttr/CreatePathParamAttr map a real URL template parameter
+	// name (Resource.PathParams/CreatePathParams' own entries, which MUST
+	// stay literal -- restexec.BuildPath matches them against the "{name}"
+	// segments actually written in ReadPath/CreatePath, a real template,
+	// never renamed) to the SCHEMA ATTRIBUTE name state should actually be
+	// read from to get that parameter's own value. Identity for the
+	// overwhelming common case (no entry at all -- read the state
+	// attribute with the same name as the template parameter); only
+	// populated when ensurePathParamsPresent found a genuine name
+	// collision and had to synthesize a differently-named attribute (see
+	// its own doc comment) -- e.g. template parameter "owner" but schema
+	// attribute "owner_path", because "owner" itself is already a real,
+	// differently-typed response attribute on this type.
+	PathParamAttr       map[string]string
+	CreatePathParamAttr map[string]string
 }
 
 // Build discovers every CRUD-shaped resource in doc and translates each
@@ -80,8 +97,14 @@ func Build(doc *openapi3.T, providerName string, cfg config.Provider) (map[strin
 			continue
 		}
 
-		ensurePathParamsPresent(&merged, res.PathParams)
-		ensurePathParamsPresent(&merged, res.CreatePathParams)
+		pathParamAttr := ensurePathParamsPresent(&merged, res.PathParams)
+		if len(pathParamAttr) > 0 {
+			notes = append(notes, renameNotes(res.TypeName, pathParamAttr)...)
+		}
+		createPathParamAttr := ensurePathParamsPresent(&merged, res.CreatePathParams)
+		if len(createPathParamAttr) > 0 {
+			notes = append(notes, renameNotes(res.TypeName, createPathParamAttr)...)
+		}
 
 		block := &tfprotov6.SchemaBlock{Version: 1, Attributes: merged}
 		schemaOut := &tfprotov6.Schema{Version: 1, Block: block}
@@ -106,12 +129,14 @@ func Build(doc *openapi3.T, providerName string, cfg config.Provider) (map[strin
 		}
 
 		out[res.TypeName] = &ResourceType{
-			Resource:   res,
-			Schema:     schemaOut,
-			ObjectType: objType,
-			Timeouts:   timeouts,
-			Async:      async,
-			Drift:      drift,
+			Resource:            res,
+			Schema:              schemaOut,
+			ObjectType:          objType,
+			Timeouts:            timeouts,
+			Async:               async,
+			Drift:               drift,
+			PathParamAttr:       pathParamAttr,
+			CreatePathParamAttr: createPathParamAttr,
 		}
 	}
 
@@ -119,27 +144,93 @@ func Build(doc *openapi3.T, providerName string, cfg config.Provider) (map[strin
 }
 
 // ensurePathParamsPresent guarantees every read-path {param} segment has a
-// corresponding attribute in the merged set, Required+Computed-free (plain
-// Required string) if the OpenAPI schemas themselves never surfaced it as
-// its own named property -- real APIs very often don't (GitHub's own
-// "owner"/"repo" never appear as fields inside the repository JSON object
-// itself, only as path segments), and a CRUD executor genuinely cannot
-// build a request URL without them being real, settable resource attributes.
-func ensurePathParamsPresent(attrs *[]*tfprotov6.SchemaAttribute, pathParams []string) {
-	have := map[string]bool{}
+// corresponding, real STRING-or-number attribute in the merged set,
+// Required+Computed-free (plain Required string) if the OpenAPI schemas
+// themselves never surfaced it as its own named property -- real APIs very
+// often don't (GitHub's own "repo" never appears as a field inside the
+// repository JSON object itself, only as a path segment), and a CRUD
+// executor genuinely cannot build a request URL without them being real,
+// settable resource attributes.
+//
+// Real, confirmed finding, UBI-158 Phase 5 (the conformance gate): a path
+// parameter's own name can genuinely COLLIDE with an EXISTING, differently
+// -typed response attribute -- confirmed live against GitHub's own real
+// github_full_repository: the read path is "/repos/{owner}/{repo}", but
+// the response body ALSO carries its own real "owner" field, a nested
+// OBJECT (login/id/avatar_url/...), not a string. Before this fix, the
+// object attribute silently won -- extractStringAttrs/requestBody then
+// failed every real ReadResource/ApplyResourceChange call for this type
+// with "attribute type ... cannot be used as a path parameter," a
+// complete, structural inability to serve the resource at all, caught via
+// this session's own live conformance probes, not by inspection. The fix:
+// when the EXISTING attribute at that name is not itself string/number
+// (i.e. not something extractStringAttrs could ever use), leave it alone
+// (it's real, legitimate response data) and add a DISTINCTLY named
+// synthetic path-parameter attribute instead ("<name>_path", extended with
+// trailing underscores in the vanishingly unlikely event even THAT
+// collides) -- the returned map (template param name -> real attribute
+// name) becomes ResourceType.PathParamAttr/CreatePathParamAttr, since
+// Resource.PathParams/CreatePathParams themselves must stay literal (they
+// match ReadPath/CreatePath's own real "{name}" URL template segments).
+func ensurePathParamsPresent(attrs *[]*tfprotov6.SchemaAttribute, pathParams []string) map[string]string {
+	have := map[string]*tfprotov6.SchemaAttribute{}
 	for _, a := range *attrs {
-		have[a.Name] = true
+		have[a.Name] = a
 	}
+	renames := map[string]string{}
 	for _, p := range pathParams {
-		if have[p] {
+		if existing, ok := have[p]; ok {
+			// existing.Type is nil for a NestedType-shaped attribute (a
+			// real, common case -- GitHub's own "owner" is exactly this:
+			// a nested single-object attribute, Type unset, NestedType
+			// populated instead) -- never usable as a plain string path
+			// parameter regardless, so treat nil the same as any other
+			// incompatible type rather than panicking on a nil-interface
+			// method call.
+			if existing.Type != nil && (existing.Type.Is(tftypes.String) || existing.Type.Is(tftypes.Number)) {
+				continue
+			}
+			newName := p + "_path"
+			for have[newName] != nil {
+				newName += "_"
+			}
+			synthetic := &tfprotov6.SchemaAttribute{
+				Name:     newName,
+				Type:     tftypes.String,
+				Required: true,
+				Description: "path parameter, not part of the API's own resource representation " +
+					"(renamed from \"" + p + "\": that name is already used by a differently-typed, real response attribute)",
+			}
+			*attrs = append(*attrs, synthetic)
+			have[newName] = synthetic
+			renames[p] = newName
 			continue
 		}
-		*attrs = append(*attrs, &tfprotov6.SchemaAttribute{
+		synthetic := &tfprotov6.SchemaAttribute{
 			Name:        p,
 			Type:        tftypes.String,
 			Required:    true,
 			Description: "path parameter, not part of the API's own resource representation",
-		})
-		have[p] = true
+		}
+		*attrs = append(*attrs, synthetic)
+		have[p] = synthetic
 	}
+	return renames
+}
+
+// renameNotes reports every real path-parameter rename ensurePathParamsPresent
+// made for typeName -- surfaced the same way every other real, load-bearing
+// translation decision in this codebase is (schema.Note, resourcemap.Note),
+// never silently applied.
+func renameNotes(typeName string, renames map[string]string) []string {
+	names := make([]string, 0, len(renames))
+	for old := range renames {
+		names = append(names, old)
+	}
+	sort.Strings(names)
+	out := make([]string, 0, len(names))
+	for _, old := range names {
+		out = append(out, fmt.Sprintf("[build] %s: path parameter %q renamed to %q -- %q is already a real, differently-typed response attribute on this type", typeName, old, renames[old], old))
+	}
+	return out
 }

@@ -8,16 +8,24 @@ Launched by `ubx` exactly like any HashiCorp provider binary
 (`provider.Acquire` / `provider.Launch`, same subprocess-launch mechanism,
 same tfplugin gRPC handshake) — zero special-casing in `ubx` core.
 
-## Status: Phase 4 Checkpoint 2 (AWS via Smithy: wire protocols + SigV4)
+## Status: Phase 5 (the conformance gate)
 
-Layers 1-4, auth, execution semantics, and now a second, fully-serving
-schema source (Smithy): real discovery/translation/naming (Checkpoint 1)
-plus real per-protocol wire execution and real SigV4 signing (Checkpoint 2)
--- a Smithy-sourced provider actually serves real CRUD requests now,
-verified against live AWS (SigV4-signed `ListQueues`/`GetQueueAttributes`,
-and the compiled binary itself, launched exactly as `ubx` core would, real
-`ReadResource` against real SQS). The conformance gate (Phase 5) remains out
-of scope -- see `internal/smithy`'s own doc comments and
+All five UBI-158 phases now real and live-verified. Phases 1-4 built the
+engine (OpenAPI + Smithy schema sources, pluggable auth including real
+SigV4, execution semantics, real per-protocol wire execution). Phase 5
+applied `ubiquex`'s own existing, real adversarial conformance harness
+(`conformance/`, UBI-50/UBI-58) against this binary -- the same real,
+falsifiable probe suite (identity-shape, sensitive-echo, destroy-honesty,
+drift-detectability) every hand-written HashiCorp provider is held to, run
+against `github_full_repository` (OpenAPI-sourced) and `aws_sqs_queue`
+(Smithy-sourced), real create/destroy cycles included. That live run
+surfaced and fixed two genuine, structural bugs neither visible from
+schema inspection alone -- a path-parameter/response-attribute name
+collision, and a hard `terraform-plugin-go` library constraint
+(`tftypes.Object`'s `OptionalAttributes` cannot survive a real msgpack
+round trip) -- see `internal/dynserver/build.go` and
+`internal/schema/translate.go`'s own doc comments for the full, real
+findings. See `internal/smithy`'s own doc comments and
 `internal/smithy/wireexec`/`internal/smithy/server` for the real wire
 protocol and tfplugin-server implementations.
 
@@ -247,6 +255,18 @@ credential_source = "profile"
 This now serves real CRUD requests (Checkpoint 2) -- prints real
 discovery/naming results to stderr, then actually reads/creates/updates/
 destroys against real AWS via the resolved real wire protocol.
+
+## Conformance
+
+The `ubiquex` monorepo's own `conformance/` package (UBI-50/UBI-58) can run
+its full four-probe adversarial suite against this binary directly --
+`conformance/dynamic_provider_live_test.go`, requiring a local
+`ubx-provider-dynamic` checkout (`UBX_PROVIDER_DYNAMIC_REPO`, defaulting to
+a sibling directory) and real credentials for whichever target provider
+(`GITHUB_TOKEN` with `delete_repo` scope for the destroy-honesty probe;
+real AWS credentials for `aws_sqs_queue`). See that file's own doc comment
+for the full real design, and the `ubiquex` monorepo's own STATE.md for
+real findings from the first live run.
 
 ## Testing
 

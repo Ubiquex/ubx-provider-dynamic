@@ -108,7 +108,7 @@ func (s *Server) finalizeAfterWrite(ctx context.Context, rt *ResourceType, respB
 		return tftypes.Value{}, diags, nil
 	}
 
-	finalParams, err := extractStringAttrs(merged, rt.PathParams)
+	finalParams, err := extractStringAttrs(merged, rt.PathParams, rt.PathParamAttr)
 	if err != nil {
 		return tftypes.Value{}, diagError("resolve final read after async completion", err.Error()), nil
 	}
