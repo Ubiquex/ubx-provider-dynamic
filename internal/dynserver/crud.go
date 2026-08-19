@@ -7,30 +7,43 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 )
 
-// extractStringAttrs reads a fixed set of attribute names out of an object
-// Value as strings -- what BuildPath needs for its own params map. Every
-// name here is guaranteed present (ensurePathParamsPresent added any that
-// weren't already real schema attributes), but a real API response can
-// still legitimately leave one null before the first successful create --
-// callers surface that as a real error, not a zero-value placeholder that
-// would silently build a wrong URL.
-func extractStringAttrs(v tftypes.Value, names []string) (map[string]string, error) {
+// extractStringAttrs reads templateParams (real URL template parameter
+// names, ResourceType.PathParams/CreatePathParams' own entries) out of an
+// object Value as strings -- what restexec.BuildPath needs for its own
+// params map, keyed by the LITERAL "{name}" segment BuildPath will search
+// for, never by the schema attribute name when the two differ. attrFor
+// resolves which schema attribute actually holds each template parameter's
+// value -- nil, or a template param absent from it, means "same name"
+// (the overwhelming common case); a present entry means
+// ensurePathParamsPresent had to rename the real schema attribute to avoid
+// a genuine collision with a differently-typed response attribute of the
+// same name (build.go's own doc comment on ResourceType.PathParamAttr).
+// Every resolved attribute name is guaranteed present in the schema
+// (ensurePathParamsPresent added any that weren't already there), but a
+// real API response can still legitimately leave one null before the
+// first successful create -- callers surface that as a real error, not a
+// zero-value placeholder that would silently build a wrong URL.
+func extractStringAttrs(v tftypes.Value, templateParams []string, attrFor map[string]string) (map[string]string, error) {
 	var m map[string]tftypes.Value
 	if err := v.As(&m); err != nil {
 		return nil, fmt.Errorf("dynserver: value is not an object: %w", err)
 	}
 
-	out := make(map[string]string, len(names))
-	for _, name := range names {
-		attr, ok := m[name]
+	out := make(map[string]string, len(templateParams))
+	for _, tp := range templateParams {
+		attrName := tp
+		if renamed, ok := attrFor[tp]; ok {
+			attrName = renamed
+		}
+		attr, ok := m[attrName]
 		if !ok {
-			return nil, fmt.Errorf("dynserver: object has no attribute %q", name)
+			return nil, fmt.Errorf("dynserver: object has no attribute %q", attrName)
 		}
 		s, err := attrToString(attr)
 		if err != nil {
-			return nil, fmt.Errorf("dynserver: attribute %q: %w", name, err)
+			return nil, fmt.Errorf("dynserver: attribute %q: %w", attrName, err)
 		}
-		out[name] = s
+		out[tp] = s
 	}
 	return out, nil
 }
@@ -57,6 +70,24 @@ func attrToString(v tftypes.Value) (string, error) {
 		return f.Text('f', -1), nil
 	}
 	return "", fmt.Errorf("attribute type %s cannot be used as a path parameter (only string/number)", v.Type())
+}
+
+// resolveAttrNames converts templateParams (real URL template parameter
+// names) into the real schema attribute names requestBody's own exclude
+// list and carryForwardFields both need -- identical resolution to
+// extractStringAttrs' own attrFor parameter, kept as a separate, smaller
+// helper since these two callers only need the resolved NAMES, never the
+// state VALUES extractStringAttrs also extracts.
+func resolveAttrNames(templateParams []string, attrFor map[string]string) []string {
+	out := make([]string, len(templateParams))
+	for i, tp := range templateParams {
+		if renamed, ok := attrFor[tp]; ok {
+			out[i] = renamed
+		} else {
+			out[i] = tp
+		}
+	}
+	return out
 }
 
 // mergeCarryForward replaces every name in carryForward on top of fresh's

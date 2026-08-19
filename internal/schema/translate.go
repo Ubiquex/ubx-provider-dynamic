@@ -443,16 +443,33 @@ func (t *Translator) buildAllOf(s *openapi3.Schema, path string) tftypes.Type {
 // wherever an object shape appears somewhere other than an attribute's own
 // direct NestedType slot (inside a Map's element type, a List buried inside
 // another List, a merged oneOf/anyOf/allOf branch).
+//
+// Real, confirmed finding, UBI-158 Phase 5 (the conformance gate): NEVER
+// set tftypes.Object's own OptionalAttributes here, even though every
+// non-Required field genuinely could carry one -- confirmed live against
+// GitHub's own real github_full_repository (an object nested inside this
+// type's own real "license"/"permissions"/"owner"-shaped fields) that
+// terraform-plugin-go's own tftypes.Object.UsableAs panics UNCONDITIONALLY
+// ("Objects with OptionalAttributes cannot be used.") the moment
+// OptionalAttributes is non-empty -- confirmed directly against that
+// library's own real source (tftypes/object.go), not assumed from
+// behavior alone. This is a real, hard, load-bearing library constraint,
+// not a version-specific bug to work around differently: state values
+// (every ReadResource/ApplyResourceChange response this provider ever
+// decodes) always flow through msgpack, which hits this exact panic path;
+// OptionalAttributes is only ever safe for a resource's OWN top-level
+// Block object (a completely separate code path,
+// tfprotov6.SchemaBlock.ValueType(), never objectValueType). Every
+// attribute in the returned Object is therefore always present, possibly
+// null -- exactly what wire.FromJSON's own Object case already produces
+// for a missing field (tftypes.NewValue(attrType, nil)), so this loses no
+// real capability for how this translator's output actually gets used.
 func objectValueType(attrs []*tfprotov6.SchemaAttribute) tftypes.Type {
 	fields := make(map[string]tftypes.Type, len(attrs))
-	optional := map[string]struct{}{}
 	for _, a := range attrs {
 		fields[a.Name] = a.ValueType()
-		if !a.Required {
-			optional[a.Name] = struct{}{}
-		}
 	}
-	return tftypes.Object{AttributeTypes: fields, OptionalAttributes: optional}
+	return tftypes.Object{AttributeTypes: fields}
 }
 
 func isObjectType(s *openapi3.Schema) bool {

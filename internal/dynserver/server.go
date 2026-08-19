@@ -221,7 +221,7 @@ func (s *Server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 		return &tfprotov6.ReadResourceResponse{Diagnostics: diagError("decode current state", err.Error())}, nil
 	}
 
-	params, err := extractStringAttrs(current, rt.PathParams)
+	params, err := extractStringAttrs(current, rt.PathParams, rt.PathParamAttr)
 	if err != nil {
 		return &tfprotov6.ReadResourceResponse{Diagnostics: diagError("read resource", err.Error())}, nil
 	}
@@ -343,7 +343,7 @@ func (s *Server) applyCreate(ctx context.Context, rt *ResourceType, req *tfproto
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("decode planned state", err.Error())}, nil
 	}
 
-	params, err := extractStringAttrs(planned, rt.CreatePathParams)
+	params, err := extractStringAttrs(planned, rt.CreatePathParams, rt.CreatePathParamAttr)
 	if err != nil {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("create resource", fmt.Sprintf("resolving %s: %s", rt.CreatePath, err.Error()))}, nil
 	}
@@ -352,7 +352,7 @@ func (s *Server) applyCreate(ctx context.Context, rt *ResourceType, req *tfproto
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("build create request", err.Error())}, nil
 	}
 
-	body, err := requestBody(planned, rt.CreatePathParams)
+	body, err := requestBody(planned, resolveAttrNames(rt.CreatePathParams, rt.CreatePathParamAttr))
 	if err != nil {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("encode create request body", err.Error())}, nil
 	}
@@ -419,7 +419,7 @@ func (s *Server) applyUpdate(ctx context.Context, rt *ResourceType, req *tfproto
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("decode planned state", err.Error())}, nil
 	}
 
-	params, err := extractStringAttrs(planned, rt.PathParams)
+	params, err := extractStringAttrs(planned, rt.PathParams, rt.PathParamAttr)
 	if err != nil {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("update resource", err.Error())}, nil
 	}
@@ -428,7 +428,7 @@ func (s *Server) applyUpdate(ctx context.Context, rt *ResourceType, req *tfproto
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("build update request", err.Error())}, nil
 	}
 
-	body, err := requestBody(planned, rt.PathParams)
+	body, err := requestBody(planned, resolveAttrNames(rt.PathParams, rt.PathParamAttr))
 	if err != nil {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("encode update request body", err.Error())}, nil
 	}
@@ -493,7 +493,7 @@ func (s *Server) applyDestroy(ctx context.Context, rt *ResourceType, req *tfprot
 	if err != nil {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("decode prior state", err.Error())}, nil
 	}
-	params, err := extractStringAttrs(prior, rt.PathParams)
+	params, err := extractStringAttrs(prior, rt.PathParams, rt.PathParamAttr)
 	if err != nil {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("destroy resource", err.Error())}, nil
 	}
@@ -610,8 +610,16 @@ func carryForwardFields(rt *ResourceType) []string {
 			}
 		}
 	}
-	add(rt.PathParams)
-	add(rt.CreatePathParams)
+	// resolveAttrNames, not the raw literal template names: a renamed
+	// path-only attribute (e.g. "owner_path", when the URL template's own
+	// "owner" collided with a real, differently-typed response attribute
+	// of the same name -- see ResourceType.PathParamAttr's own doc
+	// comment) is the one that never appears in any real API response and
+	// needs carrying forward; the ORIGINAL "owner" is real response data,
+	// already legitimately (re)populated by every fresh read, and carrying
+	// IT forward instead would be both wrong and pointless.
+	add(resolveAttrNames(rt.PathParams, rt.PathParamAttr))
+	add(resolveAttrNames(rt.CreatePathParams, rt.CreatePathParamAttr))
 	add(rt.Drift.Ignore)
 	return out
 }

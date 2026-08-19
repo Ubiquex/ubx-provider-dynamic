@@ -97,6 +97,42 @@ func validateSpec(t *testing.T, providerName, url string, wantAtLeastOneOf []str
 	}
 
 	dumpNotesSample(t, providerName, notes, 25)
+
+	// UBI-158 Phase 5 (the conformance gate) real regression check: every
+	// resource's own PathParams/CreatePathParams must RESOLVE (via
+	// PathParamAttr/CreatePathParamAttr -- identity for the common case,
+	// a real rename when ensurePathParamsPresent found a genuine name
+	// collision) to a real STRING or NUMBER attribute -- confirmed live
+	// this session that github_full_repository's own "owner" path segment
+	// silently collided with its own, differently-typed (Object) response
+	// attribute of the same name before that fix, breaking every real
+	// ReadResource/ApplyResourceChange call for the type outright
+	// (extractStringAttrs' own real "cannot be used as a path parameter"
+	// error). This exercises every discovered resource from this spec,
+	// not just github_full_repository, since the same name-collision
+	// shape can happen to any real API this engine points at.
+	for _, name := range names {
+		rt := resources[name]
+		byName := map[string]bool{}
+		for _, a := range rt.Schema.Block.Attributes {
+			if a.Type != nil && (a.Type.Is(tftypes.String) || a.Type.Is(tftypes.Number)) {
+				byName[a.Name] = true
+			}
+		}
+		check := func(templateParams []string, attrFor map[string]string) {
+			for _, p := range templateParams {
+				attrName := p
+				if renamed, ok := attrFor[p]; ok {
+					attrName = renamed
+				}
+				if !byName[attrName] {
+					t.Errorf("%s: resource %s: path parameter %q (resolved to attribute %q) is not a real string/number attribute in the translated schema -- a real ReadResource/ApplyResourceChange call would fail to build its own request", providerName, name, p, attrName)
+				}
+			}
+		}
+		check(rt.PathParams, rt.PathParamAttr)
+		check(rt.CreatePathParams, rt.CreatePathParamAttr)
+	}
 }
 
 func dumpNotesSample(t *testing.T, providerName string, notes []string, max int) {
