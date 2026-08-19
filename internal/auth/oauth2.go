@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
@@ -36,8 +37,36 @@ type oauth2ClientCredentialsParams struct {
 	Scopes          []string `json:"scopes"`
 }
 
+// oauth2ClientCredentialsAuth defers real credential RESOLUTION
+// (reading client_id_env/client_secret_env, building the real
+// TokenSource) to the first real Apply call, via once -- never at
+// Build time. Real, structural finding, checkpoint 9: Build() runs
+// unconditionally for every declared [dynamic_providers.<name>.auth]
+// table the moment this binary starts, INCLUDING a real, honest
+// schema-only launch (GetProviderSchema, never Configure) -- confirmed
+// live against Azure's own real central-config entry, which failed to
+// even START SERVING (a real "plugin exited before completing
+// handshake") on a machine with no AZURE_CLIENT_ID/AZURE_CLIENT_SECRET
+// set, despite GetProviderSchema itself never needing a credential at
+// all. api_key_header (github/datadog's own real config) never had
+// this problem -- its own Apply already re-reads its env var fresh on
+// every call, never validating presence until a real request is
+// actually being signed. This type now matches that same real,
+// generic discipline: structural config correctness (token_url/
+// client_id_env/client_secret_env non-empty -- a real config mistake,
+// legitimate to fail fast on) stays eager in Build; the real,
+// resolvable-or-not CREDENTIAL itself is deferred to Apply, exactly
+// once (sync.Once), so a real, successful first exchange still gets
+// the SAME real caching/refresh behavior the original eager-at-Build
+// design was written to preserve (golang.org/x/oauth2's own
+// TokenSource, built once, reused for every subsequent call) -- only
+// the TIMING of that one real build moved, not its own real semantics.
 type oauth2ClientCredentialsAuth struct {
-	source oauth2.TokenSource
+	params oauth2ClientCredentialsParams
+
+	once    sync.Once
+	source  oauth2.TokenSource
+	initErr error
 }
 
 func buildOAuth2ClientCredentials(params map[string]any) (restexec.Authenticator, error) {
@@ -54,32 +83,33 @@ func buildOAuth2ClientCredentials(params map[string]any) (restexec.Authenticator
 	if p.ClientSecretEnv == "" {
 		return nil, fmt.Errorf("oauth2_client_credentials: client_secret_env is required -- literal credential values are never accepted in config")
 	}
-
-	clientID, err := envValue(p.ClientIDEnv)
-	if err != nil {
-		return nil, fmt.Errorf("oauth2_client_credentials: client_id: %w", err)
-	}
-	clientSecret, err := envValue(p.ClientSecretEnv)
-	if err != nil {
-		return nil, fmt.Errorf("oauth2_client_credentials: client_secret: %w", err)
-	}
-
-	cfg := &clientcredentials.Config{
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		TokenURL:     p.TokenURL,
-		Scopes:       p.Scopes,
-	}
-	// Unlike api_key_header's per-request env read, client ID/secret are
-	// resolved once here, at Build time -- real OAuth2 client credentials
-	// don't rotate the way a bare API key might, and TokenSource's own
-	// real job (automatic access-token refresh against real elapsed time,
-	// using these same client credentials) is what actually needs to stay
-	// "live" across calls, not the credentials feeding it.
-	return &oauth2ClientCredentialsAuth{source: cfg.TokenSource(context.Background())}, nil
+	return &oauth2ClientCredentialsAuth{params: p}, nil
 }
 
 func (a *oauth2ClientCredentialsAuth) Apply(req *http.Request) error {
+	a.once.Do(func() {
+		clientID, err := envValue(a.params.ClientIDEnv)
+		if err != nil {
+			a.initErr = fmt.Errorf("oauth2_client_credentials: client_id: %w", err)
+			return
+		}
+		clientSecret, err := envValue(a.params.ClientSecretEnv)
+		if err != nil {
+			a.initErr = fmt.Errorf("oauth2_client_credentials: client_secret: %w", err)
+			return
+		}
+		cfg := &clientcredentials.Config{
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			TokenURL:     a.params.TokenURL,
+			Scopes:       a.params.Scopes,
+		}
+		a.source = cfg.TokenSource(context.Background())
+	})
+	if a.initErr != nil {
+		return a.initErr
+	}
+
 	tok, err := a.source.Token()
 	if err != nil {
 		return fmt.Errorf("oauth2_client_credentials: fetch token: %w", err)

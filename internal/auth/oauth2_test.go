@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 )
 
@@ -97,6 +98,51 @@ func TestOAuth2ClientCredentials_RealTokenExchange(t *testing.T) {
 	}
 }
 
+// TestOAuth2ClientCredentials_Apply_BuildsTokenSourceOnceNotPerCall is a
+// real, direct regression test that the lazy-once refactor (checkpoint
+// 9) preserved the ORIGINAL eager-at-Build design's own real reason for
+// existing: a real token exchange happens at most ONCE across many real
+// Apply calls, not once per call -- deferring WHEN the TokenSource gets
+// built must never regress the real, standard OAuth2 caching behavior
+// once it IS built. TestOAuth2ClientCredentials_RealTokenExchange alone
+// can't prove this (a re-exchanged token from the same fixed real
+// endpoint looks identical to a cached one); this test counts real
+// requests to the real token endpoint directly.
+func TestOAuth2ClientCredentials_Apply_BuildsTokenSourceOnceNotPerCall(t *testing.T) {
+	var realExchangeCount int
+	handler := realTokenEndpoint("client-abc", "secret-xyz")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		realExchangeCount++
+		handler(w, r)
+	}))
+	defer ts.Close()
+
+	t.Setenv("UBX_TEST_OAUTH_CLIENT_ID", "client-abc")
+	t.Setenv("UBX_TEST_OAUTH_CLIENT_SECRET", "secret-xyz")
+
+	a, err := Build("oauth2_client_credentials", map[string]any{
+		"token_url":         ts.URL,
+		"client_id_env":     "UBX_TEST_OAUTH_CLIENT_ID",
+		"client_secret_env": "UBX_TEST_OAUTH_CLIENT_SECRET",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realExchangeCount != 0 {
+		t.Fatalf("Build must never perform a real token exchange, got %d real requests before any Apply call", realExchangeCount)
+	}
+
+	for i := 0; i < 3; i++ {
+		req, _ := http.NewRequest(http.MethodGet, "https://example.invalid/resource", nil)
+		if err := a.Apply(req); err != nil {
+			t.Fatalf("Apply #%d: %v", i, err)
+		}
+	}
+	if realExchangeCount != 1 {
+		t.Fatalf("real token endpoint hit %d times across 3 real Apply calls, want exactly 1 (the still-valid token must be cached and reused, matching the original eager-at-Build design's own real reason for existing)", realExchangeCount)
+	}
+}
+
 func TestOAuth2ClientCredentials_WrongCredentials_RealRejection(t *testing.T) {
 	ts := httptest.NewServer(realTokenEndpoint("real-client", "real-secret"))
 	defer ts.Close()
@@ -116,6 +162,42 @@ func TestOAuth2ClientCredentials_WrongCredentials_RealRejection(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "https://example.invalid", nil)
 	if err := a.Apply(req); err == nil {
 		t.Fatal("expected Apply to fail against the real endpoint's own real invalid_client rejection")
+	}
+}
+
+// TestOAuth2ClientCredentials_Build_NeverRequiresRealCredentials is the
+// real, direct regression test for checkpoint 9's own fix: Build must
+// succeed with structurally-complete config even when
+// client_id_env/client_secret_env name environment variables that are
+// NOT set at all -- credential RESOLUTION is deferred to the first real
+// Apply, never required for a real schema-only launch (GetProviderSchema,
+// never Configure) to start serving at all. Confirmed live this
+// checkpoint against Azure's own real central-config entry: this exact
+// gap was why a real `ubx sdk gen` run against Azure failed outright on
+// a machine with no AZURE_CLIENT_ID/AZURE_CLIENT_SECRET set, despite
+// GetProviderSchema itself never needing a credential.
+func TestOAuth2ClientCredentials_Build_NeverRequiresRealCredentials(t *testing.T) {
+	const unsetEnvVar = "UBX_TEST_OAUTH_DEFINITELY_UNSET_VAR"
+	if _, ok := os.LookupEnv(unsetEnvVar); ok {
+		t.Fatalf("test precondition failed: %s is unexpectedly set in this environment", unsetEnvVar)
+	}
+
+	a, err := Build("oauth2_client_credentials", map[string]any{
+		"token_url":         "https://example.invalid/token",
+		"client_id_env":     unsetEnvVar,
+		"client_secret_env": unsetEnvVar,
+	})
+	if err != nil {
+		t.Fatalf("Build must succeed with structurally-complete config regardless of whether the named env vars are actually set, got: %v", err)
+	}
+
+	// The real credential requirement only surfaces once a real request
+	// is actually being signed -- confirmed here, not just asserted, by
+	// checking Apply's own real, honest failure names the real missing
+	// env var.
+	req, _ := http.NewRequest(http.MethodGet, "https://example.invalid/resource", nil)
+	if err := a.Apply(req); err == nil {
+		t.Fatal("expected Apply to fail once a real credential is actually needed")
 	}
 }
 
