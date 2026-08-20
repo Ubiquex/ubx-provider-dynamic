@@ -27,6 +27,7 @@ import (
 	"github.com/ubiquex/ubx-provider-dynamic/internal/smithy"
 	smithyserver "github.com/ubiquex/ubx-provider-dynamic/internal/smithy/server"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/smithy/wireexec"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/snapshot"
 )
 
 // dumpSignalsFlag is a real, plain CLI mode, deliberately NOT part of the
@@ -43,6 +44,24 @@ import (
 // entrypoint into the same schema-loading code.
 var dumpSignalsFlag = flag.Bool("dump-signals", false, "print real per-resource field enum/constraint signal data as JSON to stdout, instead of serving a tfplugin6 provider, and exit")
 
+// generateSnapshotFlag is a real, plain CLI mode mirroring
+// dumpSignalsFlag's own established shape: fetch this [dynamic_providers.
+// <name>] entry's real, live schema_url ONE time, verify it needs no
+// further network access, write a real internal/snapshot.Snapshot to the
+// given path, and exit -- never serves a tfplugin6 provider. Real,
+// explicit scope: only schema_source = "openapi" is wired to this flag
+// today (internal/snapshot's own doc comment has the full real account
+// of why smithy/cloudformation/discovery_docs each need their own,
+// separate Generate function first).
+var generateSnapshotFlag = flag.String("generate-snapshot", "", "generate a real, frozen schema snapshot to this path instead of serving a tfplugin6 provider, and exit (schema_source = \"openapi\" only today)")
+
+// prevSnapshotFlag is generateSnapshotFlag's own real, optional sibling:
+// the PRIOR real snapshot (if any) to diff the freshly-fetched spec
+// against, so the new snapshot's own Version is mechanically derived
+// (internal/snapshot.DiffLevel/NextVersion) rather than left for a human
+// to guess. Omit for a provider's first-ever snapshot.
+var prevSnapshotFlag = flag.String("prev-snapshot", "", "path to the prior real snapshot to diff against when deriving the new one's own version (omit for a first-ever snapshot)")
+
 // nameEnvVar is how a launched process learns which [dynamic_providers.<name>]
 // table in .ubx/config is its own -- see internal/config's own doc comment
 // for why this can't come from the ConfigureProvider RPC. provider.Launch's
@@ -51,6 +70,19 @@ var dumpSignalsFlag = flag.Bool("dump-signals", false, "print real per-resource 
 // this; standalone/validation runs (this ticket's own Phase 1 proof, and
 // any manual invocation) set it directly.
 const nameEnvVar = "UBX_DYNAMIC_PROVIDER_NAME"
+
+// snapshotPathEnvVar, when set, is THE real fix for the problem this
+// whole package exists to solve: a launched process serves a real,
+// already-generated snapshot instead of fetching schema_url live -- zero
+// network calls at schema resolution time. Checked BEFORE .ubx/config is
+// even loaded (unlike every other real schema_source branch below):
+// snapshot-driven serving needs none of that table's own
+// schema_source/schema_url fields, only Auth/BaseURL/Retry/Timeouts,
+// which the snapshot itself already carries (Snapshot's own doc comment
+// covers why). Real, explicit scope, matching internal/snapshot's own:
+// only a schema_source = "openapi"-derived snapshot is servable this way
+// today.
+const snapshotPathEnvVar = "UBX_SNAPSHOT_PATH"
 
 func main() {
 	if err := run(); err != nil {
@@ -67,6 +99,10 @@ func run() error {
 		return fmt.Errorf("%s must be set to the [dynamic_providers.<name>] table this process represents", nameEnvVar)
 	}
 
+	if snapPath := os.Getenv(snapshotPathEnvVar); snapPath != "" {
+		return runServeSnapshot(name, snapPath)
+	}
+
 	dir, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("determine working directory: %w", err)
@@ -75,6 +111,10 @@ func run() error {
 	cfg, err := config.LoadNamed(dir, name)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+
+	if *generateSnapshotFlag != "" {
+		return runGenerateSnapshot(name, cfg, *generateSnapshotFlag, *prevSnapshotFlag)
 	}
 
 	// UBI-158 Phase 4 Checkpoint 2: real per-protocol wire execution
@@ -297,4 +337,89 @@ func run() error {
 	return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
 		return server
 	})
+}
+
+// runServeSnapshot is snapshotPathEnvVar's own real implementation -- the
+// literal fix for the problem this whole package exists to solve. Loads a
+// real, already-generated Snapshot from snapPath (snapshot.Load already
+// runs CheckFormat, so an out-of-range schema_format refuses loudly right
+// here, before any RPC serving begins), re-derives its real resource map
+// via snapshot.LoadOpenAPI (zero network -- the same real translation the
+// live-fetch path runs, just fed frozen RawSpec bytes), and serves it
+// through the IDENTICAL real tf6server.Serve/dynserver.Server code path
+// run()'s own default-openapi branch above uses -- the only real
+// difference is where Auth/BaseURL/Retry/Resources come from (the
+// snapshot's own fields, not a live .ubx/config fetch).
+func runServeSnapshot(name, snapPath string) error {
+	snap, err := snapshot.Load(snapPath)
+	if err != nil {
+		return fmt.Errorf("load snapshot %s: %w", snapPath, err)
+	}
+
+	resources, err := snapshot.LoadOpenAPI(name, snap)
+	if err != nil {
+		return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+	}
+	if len(resources) == 0 {
+		return fmt.Errorf("no CRUD-shaped resources in snapshot %s -- nothing to serve", snapPath)
+	}
+
+	authenticator, err := auth.Build(snap.Auth.Type, snap.Auth.Params)
+	if err != nil {
+		return fmt.Errorf("build authenticator: %w", err)
+	}
+
+	retryPolicy, err := dynserver.ResolveRetryPolicy(snap.Retry)
+	if err != nil {
+		return fmt.Errorf("resolve retry policy: %w", err)
+	}
+	client := restexec.NewClient(snap.BaseURL, authenticator)
+	client.Retry = retryPolicy
+
+	server := &dynserver.Server{
+		ProviderName: name,
+		Resources:    resources,
+		Client:       client,
+	}
+
+	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: serving %q from real snapshot %s (version %s, schema_format %d), zero network at schema resolution time\n",
+		name, snapPath, snap.Version, snap.SchemaFormat)
+
+	return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
+		return server
+	})
+}
+
+// runGenerateSnapshot is generateSnapshotFlag's own real implementation --
+// see its own doc comment for scope (schema_source = "openapi" only
+// today). Loads prevPath (if given) for real, mechanical version
+// derivation, fetches cfg's own real, live schema ONE time, and writes a
+// real, complete Snapshot to outPath.
+func runGenerateSnapshot(name string, cfg config.Provider, outPath, prevPath string) error {
+	if cfg.SchemaSource != config.SchemaSourceOpenAPI {
+		return fmt.Errorf("--generate-snapshot: [dynamic_providers.%s]'s own schema_source %q is not yet supported -- only %q is wired to real snapshot generation today (internal/snapshot's own doc comment has the full real scope statement)",
+			name, cfg.SchemaSource, config.SchemaSourceOpenAPI)
+	}
+
+	var prev *snapshot.Snapshot
+	if prevPath != "" {
+		p, err := snapshot.Load(prevPath)
+		if err != nil {
+			return fmt.Errorf("load --prev-snapshot %s: %w", prevPath, err)
+		}
+		prev = p
+	}
+
+	snap, err := snapshot.GenerateOpenAPI(name, cfg.SchemaURL, cfg, prev)
+	if err != nil {
+		return fmt.Errorf("generate snapshot for %q: %w", name, err)
+	}
+
+	if err := snapshot.Save(outPath, snap); err != nil {
+		return fmt.Errorf("write snapshot to %s: %w", outPath, err)
+	}
+
+	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: wrote real snapshot for %q, version %s, schema_format %d -> %s\n",
+		name, snap.Version, snap.SchemaFormat, outPath)
+	return nil
 }

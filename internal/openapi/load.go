@@ -26,6 +26,11 @@ import (
 // wait.
 var httpClient = &http.Client{Timeout: 60 * time.Second}
 
+// noLocation is Parse's own real placeholder for a genuinely absent
+// document location -- see Parse's own doc comment for why loc=nil can't
+// be passed straight through to kin-openapi's own loader.
+var noLocation = &url.URL{Scheme: "ubx-no-location", Path: "/"}
+
 // versionProbe sniffs which real OpenAPI generation a document declares,
 // without committing to parsing it as either yet -- both "swagger" (2.0) and
 // "openapi" (3.x) are real, required, top-level fields their own respective
@@ -67,36 +72,72 @@ func Load(source string) (*openapi3.T, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load OpenAPI spec from %s: %w", source, err)
 	}
+	doc, err := Parse(raw, location(source))
+	if err != nil {
+		return nil, fmt.Errorf("load OpenAPI spec from %s: %w", source, err)
+	}
+	return doc, nil
+}
 
-	// Real, confirmed regression caught by this session's own live test
-	// suite before it ever reached a caller: Datadog's own real, published
-	// spec is YAML-encoded, not JSON -- oasdiff/yaml (already a real,
-	// vendored transitive dependency of kin-openapi itself, the same
-	// library kin-openapi's own v3 loader uses internally for YAML
-	// support) converts YAML to JSON first; a JSON source round-trips
-	// through this unchanged (JSON is valid YAML 1.2), so this is safe
-	// for every real source this package has ever loaded, not just the
-	// new Swagger 2.0 case.
+// location derives Parse's own loc argument from source (an http(s) URL or
+// a local file path) -- factored out of Load so ParseSnapshot (a real,
+// already-fetched-elsewhere raw document, no live source string to derive
+// a location from) can still supply one when it has a real, remembered
+// origin worth preserving for relative-$ref resolution, or nil when it
+// doesn't.
+func location(source string) *url.URL {
+	if u, err := url.Parse(source); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		return u
+	}
+	if abs, err := filepath.Abs(source); err == nil {
+		return &url.URL{Scheme: "file", Path: abs}
+	}
+	return nil
+}
+
+// Parse is Load's own real parsing half, split out so a real, frozen
+// snapshot (internal/snapshot) can re-run the identical parse logic
+// against already-in-hand bytes, with no network fetch at all -- the
+// exact same real code path Load uses when it does have live network
+// access, never a second, drifting reimplementation. loc is the document's
+// own real origin (Load's own location() helper derives one from a live
+// source string; a snapshot reload passes whatever origin was recorded at
+// snapshot-generation time, or nil for a document with no real relative
+// external $refs to resolve).
+//
+// Real, confirmed regression caught by this session's own live test suite
+// before it ever reached a caller: Datadog's own real, published spec is
+// YAML-encoded, not JSON -- oasdiff/yaml (already a real, vendored
+// transitive dependency of kin-openapi itself, the same library
+// kin-openapi's own v3 loader uses internally for YAML support) converts
+// YAML to JSON first; a JSON source round-trips through this unchanged
+// (JSON is valid YAML 1.2), so this is safe for every real source this
+// package has ever loaded, not just the new Swagger 2.0 case.
+func Parse(raw []byte, loc *url.URL) (*openapi3.T, error) {
+	// Real, found-in-review bug, caught only when internal/snapshot's own
+	// network-free reload path became the first real caller to ever pass
+	// loc=nil (every prior caller derives a real, non-nil location from a
+	// real source string): kin-openapi's own loadFromDataWithPathInternal
+	// dereferences path unconditionally, regardless of whether the
+	// document has any real external ref that would ever need it --
+	// confirmed live, a genuine nil-pointer panic, not a clean error.
+	// noLocation is a real, deliberately unresolvable placeholder (an
+	// invented scheme no real fetcher understands) rather than something
+	// that could ever coincidentally resolve: any real external $ref this
+	// document turns out to have fails loud and immediate against it,
+	// exactly the same real, honest refusal a genuinely nil location was
+	// always meant to produce.
+	if loc == nil {
+		loc = noLocation
+	}
 	jsonRaw, err := yaml.YAMLToJSON(raw)
 	if err != nil {
-		return nil, fmt.Errorf("load OpenAPI spec from %s: not valid JSON or YAML: %w", source, err)
+		return nil, fmt.Errorf("not valid JSON or YAML: %w", err)
 	}
 
 	var probe versionProbe
 	if err := json.Unmarshal(jsonRaw, &probe); err != nil {
-		return nil, fmt.Errorf("load OpenAPI spec from %s: %w", source, err)
-	}
-
-	// location gives both the v2 and v3 paths below the same real
-	// document-path context LoadFromURI/LoadFromFile establish internally,
-	// so a real spec's own relative external $refs resolve correctly --
-	// the version probe above already consumed the fetch, so this reuses
-	// raw rather than fetching source a second time.
-	var location *url.URL
-	if u, err := url.Parse(source); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		location = u
-	} else if abs, err := filepath.Abs(source); err == nil {
-		location = &url.URL{Scheme: "file", Path: abs}
+		return nil, err
 	}
 
 	loader := openapi3.NewLoader()
@@ -105,7 +146,7 @@ func Load(source string) (*openapi3.T, error) {
 	if probe.Swagger != "" {
 		var doc2 openapi2.T
 		if err := json.Unmarshal(jsonRaw, &doc2); err != nil {
-			return nil, fmt.Errorf("parse Swagger %s document from %s: %w", probe.Swagger, source, err)
+			return nil, fmt.Errorf("parse Swagger %s document: %w", probe.Swagger, err)
 		}
 		// ToV3WithLoader, not the plain ToV3 wrapper: ToV3 constructs its
 		// own internal loader with IsExternalRefsAllowed left at its real,
@@ -121,16 +162,16 @@ func Load(source string) (*openapi3.T, error) {
 		// and, from here on, the real document location too) through
 		// lets those real external refs resolve exactly the way the v3
 		// path below already does.
-		doc3, err := openapi2conv.ToV3WithLoader(&doc2, loader, location)
+		doc3, err := openapi2conv.ToV3WithLoader(&doc2, loader, loc)
 		if err != nil {
-			return nil, fmt.Errorf("convert Swagger %s document from %s to OpenAPI 3: %w", probe.Swagger, source, err)
+			return nil, fmt.Errorf("convert Swagger %s document to OpenAPI 3: %w", probe.Swagger, err)
 		}
 		return doc3, nil
 	}
 
-	doc, err := loader.LoadFromDataWithPath(raw, location)
+	doc, err := loader.LoadFromDataWithPath(raw, loc)
 	if err != nil {
-		return nil, fmt.Errorf("parse OpenAPI %s document from %s: %w", probe.OpenAPI, source, err)
+		return nil, fmt.Errorf("parse OpenAPI %s document: %w", probe.OpenAPI, err)
 	}
 	return doc, nil
 }
