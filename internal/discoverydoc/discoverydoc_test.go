@@ -217,23 +217,34 @@ func TestDiscover_CamelCaseResourceKey_SnakeCased(t *testing.T) {
 	}
 }
 
-// TestSingularize_RealEsPlurals is the real, found-in-review fix: the
-// original `strings.TrimSuffix(s, "s")` mishandled every real "-es"
-// English plural, confirmed live against the real, current compute/v1
-// Discovery Document -- "addresses"/"policies"/"proxies" all produced
-// a genuinely misspelled singular ("addresse", "policie", "proxie"),
-// 22 real resources affected before this fix.
+// TestSingularize_RealEsPlurals is the real, found-in-review fix,
+// TWICE over. Round 1: the original `strings.TrimSuffix(s, "s")`
+// mishandled every real "-es" English plural, confirmed live against
+// the real, current compute/v1 Discovery Document --
+// "addresses"/"policies"/"proxies" all produced a genuinely misspelled
+// singular ("addresse", "policie", "proxie"), 22 real resources
+// affected. Round 2: that first fix over-corrected -- checking the
+// suffix BEFORE stripping "es" wrongly matched real words that
+// already end in "-se" in their own singular form, shipped and
+// caught only by re-reading the real generated page list before
+// reporting done: "licenses" -> "licens" (real, live, briefly
+// shipped). "license"/"house"/"purse" are this test's own real
+// regression guards for that second bug specifically -- never delete
+// them as "redundant" with the -es cases above them.
 func TestSingularize_RealEsPlurals(t *testing.T) {
 	cases := map[string]string{
-		"addresses":       "address",
-		"policies":        "policy",
-		"proxies":         "proxy",
-		"instances":       "instance",
-		"backendBuckets":  "backendBucket",
-		"boxes":           "box",
-		"branches":        "branch",
-		"dishes":          "dish",
-		"dns":             "dn", // real, known limitation: a genuine non-plural ending in "s" -- see doc comment
+		"addresses":      "address",
+		"policies":       "policy",
+		"proxies":        "proxy",
+		"instances":      "instance",
+		"backendBuckets": "backendBucket",
+		"boxes":          "box",
+		"branches":       "branch",
+		"dishes":         "dish",
+		"licenses":       "license",
+		"houses":         "house",
+		"purses":         "purse",
+		"dns":            "dn", // real, known limitation: a genuine non-plural ending in "s" -- see doc comment
 	}
 	for in, want := range cases {
 		if got := singularize(in); got != want {
