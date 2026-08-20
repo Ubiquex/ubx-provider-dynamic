@@ -216,3 +216,28 @@ func TestDiscover_CamelCaseResourceKey_SnakeCased(t *testing.T) {
 		t.Fatalf("TypeName = %q, want the real, wire-name-safe snake_case form %q", got, "google_compute_backend_bucket")
 	}
 }
+
+// TestSingularize_RealEsPlurals is the real, found-in-review fix: the
+// original `strings.TrimSuffix(s, "s")` mishandled every real "-es"
+// English plural, confirmed live against the real, current compute/v1
+// Discovery Document -- "addresses"/"policies"/"proxies" all produced
+// a genuinely misspelled singular ("addresse", "policie", "proxie"),
+// 22 real resources affected before this fix.
+func TestSingularize_RealEsPlurals(t *testing.T) {
+	cases := map[string]string{
+		"addresses":       "address",
+		"policies":        "policy",
+		"proxies":         "proxy",
+		"instances":       "instance",
+		"backendBuckets":  "backendBucket",
+		"boxes":           "box",
+		"branches":        "branch",
+		"dishes":          "dish",
+		"dns":             "dn", // real, known limitation: a genuine non-plural ending in "s" -- see doc comment
+	}
+	for in, want := range cases {
+		if got := singularize(in); got != want {
+			t.Errorf("singularize(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

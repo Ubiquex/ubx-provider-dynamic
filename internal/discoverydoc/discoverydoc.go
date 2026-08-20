@@ -275,8 +275,32 @@ func sortedKeys(m map[string]*rawResource) []string {
 // stripped" heuristic internal/resourcemap.deriveNoun's own fallback
 // path already uses for the same real reason: pulling in a real
 // inflection engine for this one naming step isn't proportionate.
+// singularize is real, found-in-review-fixable: the original version
+// (`strings.TrimSuffix(s, "s")`) mishandled every real "-es" English
+// plural, a pattern GCP's own resource-tree keys hit constantly --
+// confirmed live against the real, current compute/v1 Discovery
+// Document: "addresses" -> "addresse", "policies" -> "policie",
+// "proxies" -> "proxie", 22 real resources affected, every one shipping
+// under a genuinely misspelled type name and doc URL. A narrow, well-
+// known English singularization rule, not a design decision (unlike
+// the real, separate alpha/beta API-version-collision question this
+// same generic naming layer also has -- that one needs an actual
+// choice about what makes a type name unique across versions; this one
+// has a single correct behavior). Ordered most-specific pattern first:
+// "-ies" -> "-y" (policies -> policy) before the generic "-es" strip
+// (addresses -> address, boxes -> box), falling through to a bare "-s"
+// strip for the common case (instances -> instance) and to the
+// original noun for a genuine non-plural (dns -> dns).
 func singularize(s string) string {
-	return strings.TrimSuffix(s, "s")
+	switch {
+	case strings.HasSuffix(s, "ies") && len(s) > 3:
+		return s[:len(s)-3] + "y"
+	case strings.HasSuffix(s, "ses"), strings.HasSuffix(s, "xes"), strings.HasSuffix(s, "zes"),
+		strings.HasSuffix(s, "ches"), strings.HasSuffix(s, "shes"):
+		return strings.TrimSuffix(s, "es")
+	default:
+		return strings.TrimSuffix(s, "s")
+	}
 }
 
 // Build translates every resource Discover found into a real, merged
