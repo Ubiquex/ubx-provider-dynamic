@@ -196,7 +196,10 @@ func Discover(doc *Document, providerName string) ([]Resource, []Note, error) {
 			if get, ok := r.Methods["get"]; ok && get != nil {
 				create, createFound := firstMethod(r.Methods, "create", "insert")
 				if !createFound {
-					notes = append(notes, Note{Path: pathStr, Detail: "no matching create (\"create\" or \"insert\") method -- read-only, modeled as a data source concern, not a resource"})
+					create, createFound = firstPrefixedMethod(r.Methods, "create", "insert")
+				}
+				if !createFound {
+					notes = append(notes, Note{Path: pathStr, Detail: "no matching create (\"create\"/\"insert\", or a \"create\"/\"insert\"-prefixed method key) -- read-only, modeled as a data source concern, not a resource"})
 				} else {
 					// Real, live-confirmed finding: a Discovery Document's
 					// own resource-tree keys are camelCase
@@ -260,6 +263,47 @@ func firstMethod(methods map[string]*rawMethod, names ...string) (*rawMethod, bo
 		}
 	}
 	return nil, false
+}
+
+// firstPrefixedMethod is firstMethod's own real fallback for the resource-
+// suffixed method-name convention some genuine GCP Discovery Documents use
+// instead of a bare "create"/"insert" key -- confirmed live against
+// iam:v2's own real "policies" collection (method key "createPolicy", not
+// "create" -- the collection itself is intentionally generic, serving
+// multiple real policy kinds via a URL "kind" segment, so Google
+// disambiguated the method name rather than the collection name) --
+// firstMethod's own strict exact-key match was silently treating this
+// real, fully CRUD-capable resource as read-only.
+//
+// Prefix-only (not a substring/fuzzy match), and only ever used as a
+// fallback after firstMethod's own exact match has already failed:
+// every real "createXxx"/"insertXxx" method found so far genuinely IS
+// that collection's own create operation, just resource-suffixed for
+// clarity, matching the same discipline internal/resourcemap's own doc
+// comment holds itself to for OpenAPI (narrow, live-confirmed
+// heuristics only, never a broad verb guess). Deliberately does NOT
+// also match a differently-named verb like "register"
+// (domains:v1's own real "registrations" resource uses this instead --
+// a genuinely different action, not this same naming convention) --
+// folding an unrelated verb in here would risk treating some other
+// real side-effecting action as an ordinary create; left as a real,
+// separate, unresolved case, not silently swept into this fix.
+// Deterministic when more than one candidate matches: picks the
+// lexicographically first method key.
+func firstPrefixedMethod(methods map[string]*rawMethod, prefixes ...string) (*rawMethod, bool) {
+	var bestKey string
+	var best *rawMethod
+	for k, m := range methods {
+		if m == nil {
+			continue
+		}
+		for _, p := range prefixes {
+			if k != p && strings.HasPrefix(k, p) && (bestKey == "" || k < bestKey) {
+				bestKey, best = k, m
+			}
+		}
+	}
+	return best, best != nil
 }
 
 func sortedKeys(m map[string]*rawResource) []string {

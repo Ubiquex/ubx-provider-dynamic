@@ -66,6 +66,97 @@ func TestDiscover_RealPubSubShape(t *testing.T) {
 	}
 }
 
+// TestDiscover_PrefixedCreateMethod_RealIamV2PoliciesShape mirrors the
+// real structural shape confirmed live against Google Cloud IAM's own
+// real, published v2 discovery document
+// (https://iam.googleapis.com/$discovery/rest?version=v2): the real
+// "policies" collection is fully CRUD-capable but names its own create
+// method "createPolicy" rather than the bare "create" firstMethod alone
+// requires -- found while investigating why the founder's own "129 real
+// GCP gap" figure included 6 resources this collection alone already
+// covers. Before this fix, Discover silently treated this as a read-only
+// node; this test locks in the corrected behavior.
+func TestDiscover_PrefixedCreateMethod_RealIamV2PoliciesShape(t *testing.T) {
+	doc := &Document{
+		Name: "iampolicies",
+		Schemas: map[string]*rawSchema{
+			"GoogleIamV2Policy": {
+				Type: "object",
+				Properties: map[string]*rawSchema{
+					"name": {Type: "string", Description: "The resource name of the policy."},
+				},
+			},
+		},
+		Resources: map[string]*rawResource{
+			"policies": {
+				Methods: map[string]*rawMethod{
+					"createPolicy": {HTTPMethod: "POST", FlatPath: "v2/{policyParent}", Request: &rawRef{Ref: "GoogleIamV2Policy"}, Response: &rawRef{Ref: "GoogleIamV2Policy"}},
+					"get":          {HTTPMethod: "GET", FlatPath: "v2/{policyName}", Response: &rawRef{Ref: "GoogleIamV2Policy"}},
+					"update":       {HTTPMethod: "PUT", FlatPath: "v2/{policyName}", Request: &rawRef{Ref: "GoogleIamV2Policy"}, Response: &rawRef{Ref: "GoogleIamV2Policy"}},
+					"delete":       {HTTPMethod: "DELETE", FlatPath: "v2/{policyName}"},
+					"listPolicies": {HTTPMethod: "GET", FlatPath: "v2/{policyParent}"},
+				},
+			},
+		},
+	}
+	resources, _, err := Discover(doc, "google")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("expected exactly one resource (createPolicy should now match as a create fallback), got %d", len(resources))
+	}
+	r := resources[0]
+	if r.TypeName != "google_iampolicies_policy" {
+		t.Fatalf("expected google_iampolicies_policy, got %q", r.TypeName)
+	}
+	if r.CreateMethod != "POST" || r.CreatePath != "v2/{policyParent}" {
+		t.Fatalf("unexpected create: %s %s", r.CreateMethod, r.CreatePath)
+	}
+	if r.UpdateMethod != "PUT" {
+		t.Fatalf("expected PUT update, got %q", r.UpdateMethod)
+	}
+}
+
+// TestDiscover_UnrelatedVerb_NotMatchedAsCreate confirms the fix stays
+// narrow: a real, differently-named create-equivalent verb ("register",
+// domains:v1's own real "registrations" resource) must NOT be picked up
+// by firstPrefixedMethod's own prefix match -- that's a genuinely
+// different action, not the same "createXxx"/"insertXxx" naming
+// convention, and this package correctly still reports it read-only/
+// skipped rather than guessing.
+func TestDiscover_UnrelatedVerb_NotMatchedAsCreate(t *testing.T) {
+	doc := &Document{
+		Name: "domains",
+		Resources: map[string]*rawResource{
+			"registrations": {
+				Methods: map[string]*rawMethod{
+					"register": {HTTPMethod: "POST", FlatPath: "v1/{parent}/registrations:register", Response: &rawRef{Ref: "Registration"}},
+					"get":      {HTTPMethod: "GET", FlatPath: "v1/{name}", Response: &rawRef{Ref: "Registration"}},
+					"patch":    {HTTPMethod: "PATCH", FlatPath: "v1/{name}", Response: &rawRef{Ref: "Registration"}},
+					"delete":   {HTTPMethod: "DELETE", FlatPath: "v1/{name}"},
+				},
+			},
+		},
+	}
+	resources, notes, err := Discover(doc, "google")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 0 {
+		t.Fatalf("expected zero resources (\"register\" must not be treated as a create fallback), got %+v", resources)
+	}
+	found := false
+	for _, n := range notes {
+		if n.Path == "registrations" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a note explaining registrations was skipped, got %+v", notes)
+	}
+}
+
 func TestDiscover_ReadOnlyNode_SkippedWithNote(t *testing.T) {
 	doc := &Document{
 		Name: "example",
