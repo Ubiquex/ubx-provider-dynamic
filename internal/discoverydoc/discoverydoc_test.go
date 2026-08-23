@@ -308,6 +308,48 @@ func TestDiscover_CamelCaseResourceKey_SnakeCased(t *testing.T) {
 	}
 }
 
+// TestDiscover_CamelCaseDocName_SnakeCased is UBI-180's own real
+// regression test: a Discovery Document's own top-level "name" field
+// (doc.Name, Google's own live, API-owner-chosen string) went straight
+// into the typeName unnormalized, unlike the resource-tree key just
+// above -- confirmed live against the real, configured
+// google_siteverification family, whose own real doc.Name is
+// "siteVerification" (mixed case), producing the raw typeName
+// "google_siteverification_siteVerification_web_resource" and failing
+// every per-language template's own real wire-name guard outright, the
+// identical failure mode TestDiscover_CamelCaseResourceKey_SnakeCased
+// already covers for the resource-tree key, just never exercised for
+// doc.Name until a real provider's own live discovery document actually
+// carried a mixed-case one.
+func TestDiscover_CamelCaseDocName_SnakeCased(t *testing.T) {
+	doc := &Document{
+		Name: "siteVerification",
+		Schemas: map[string]*rawSchema{
+			"SiteVerificationWebResourceResource": {Type: "object", Properties: map[string]*rawSchema{
+				"id": {Type: "string"},
+			}},
+		},
+		Resources: map[string]*rawResource{
+			"webResource": {
+				Methods: map[string]*rawMethod{
+					"get":    {HTTPMethod: "GET", FlatPath: "v1/webResource/{id}", Response: &rawRef{Ref: "SiteVerificationWebResourceResource"}},
+					"insert": {HTTPMethod: "POST", FlatPath: "v1/webResource", Request: &rawRef{Ref: "SiteVerificationWebResourceResource"}},
+				},
+			},
+		},
+	}
+	resources, _, err := Discover(doc, "google_siteverification")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("expected exactly one resource, got %d: %+v", len(resources), resources)
+	}
+	if got := resources[0].TypeName; got != "google_siteverification_site_verification_web_resource" {
+		t.Fatalf("TypeName = %q, want the real, wire-name-safe snake_case form %q", got, "google_siteverification_site_verification_web_resource")
+	}
+}
+
 // TestSingularize_RealEsPlurals is the real, found-in-review fix,
 // TWICE over. Round 1: the original `strings.TrimSuffix(s, "s")`
 // mishandled every real "-es" English plural, confirmed live against

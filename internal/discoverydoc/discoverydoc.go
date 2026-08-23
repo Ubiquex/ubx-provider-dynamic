@@ -215,7 +215,34 @@ func Discover(doc *Document, providerName string) ([]Resource, []Note, error) {
 					// property name, reused here for the resource noun
 					// itself, not invented separately.
 					noun := singularize(uschema.ToSnakeCase(name))
-					typeName := providerName + "_" + doc.Name + "_" + noun
+					// UBI-180: doc.Name -- the Discovery Document's own
+					// top-level API name field -- gets the identical
+					// ToSnakeCase treatment as the resource noun above,
+					// for the identical real reason: it is Google's own,
+					// live, API-owner-chosen string, not a value this
+					// package controls, and every other real Discovery
+					// Document's own doc.Name has been lowercase so far
+					// (the sibling check in sdk/codegen/templates/{go,py,
+					// ts}'s own splitWireName -- lowercase ascii + digit +
+					// underscore only, no best-effort coercion, by this
+					// whole codebase's own standing design choice,
+					// docs/sdk.md row 5 -- had never actually been
+					// exercised by a real mixed-case one until
+					// siteVerification's own real, live doc.Name broke
+					// it). Normalizing here, at the one real place a
+					// Discovery Document's own name enters a typeName,
+					// keeps every downstream consumer (generated Go/TS/
+					// Python identifiers, this project's own docs site)
+					// working from the same real, lowercase, snake_case
+					// convention every other configured provider already
+					// produces -- not a silent transform: the resulting
+					// typeName is a real, deliberate, load-bearing part
+					// of the wire contract users write against, so this
+					// is the one, single place it happens, not a per-
+					// language escape hatch three separate codegen
+					// templates would each need to reimplement identically
+					// (and could silently drift on).
+					typeName := providerName + "_" + uschema.ToSnakeCase(doc.Name) + "_" + noun
 					if seenTypeNames[typeName] {
 						notes = append(notes, Note{Path: pathStr, Detail: fmt.Sprintf("resource type name %q already claimed by another resource path -- skipped rather than disambiguated", typeName)})
 					} else {
