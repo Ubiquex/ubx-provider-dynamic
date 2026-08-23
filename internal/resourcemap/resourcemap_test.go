@@ -1,6 +1,7 @@
 package resourcemap
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -217,21 +218,21 @@ func TestFindCreate_PrefersPOSTOverPUTWhenBothMatch(t *testing.T) {
 
 func TestSplitQualifiedRefName_RealKubernetesShapes(t *testing.T) {
 	cases := []struct {
-		ref, wantService, wantNoun string
+		ref, wantService, wantVersion, wantNoun string
 	}{
-		{"io.k8s.api.apps.v1.Deployment", "apps", "Deployment"},
-		{"io.k8s.api.core.v1.Pod", "core", "Pod"},
-		{"io.k8s.api.admissionregistration.v1alpha1.MutatingAdmissionPolicy", "admissionregistration", "MutatingAdmissionPolicy"},
-		{"io.k8s.apiextensions-apiserver.pkg.apis.apiextensions.v1.CustomResourceDefinition", "apiextensions", "CustomResourceDefinition"},
+		{"io.k8s.api.apps.v1.Deployment", "apps", "v1", "Deployment"},
+		{"io.k8s.api.core.v1.Pod", "core", "v1", "Pod"},
+		{"io.k8s.api.admissionregistration.v1alpha1.MutatingAdmissionPolicy", "admissionregistration", "v1alpha1", "MutatingAdmissionPolicy"},
+		{"io.k8s.apiextensions-apiserver.pkg.apis.apiextensions.v1.CustomResourceDefinition", "apiextensions", "v1", "CustomResourceDefinition"},
 	}
 	for _, c := range cases {
-		service, noun, ok := splitQualifiedRefName(c.ref)
+		service, version, noun, ok := splitQualifiedRefName(c.ref)
 		if !ok {
 			t.Errorf("splitQualifiedRefName(%q): ok = false, want true", c.ref)
 			continue
 		}
-		if service != c.wantService || noun != c.wantNoun {
-			t.Errorf("splitQualifiedRefName(%q) = (%q, %q), want (%q, %q)", c.ref, service, noun, c.wantService, c.wantNoun)
+		if service != c.wantService || version != c.wantVersion || noun != c.wantNoun {
+			t.Errorf("splitQualifiedRefName(%q) = (%q, %q, %q), want (%q, %q, %q)", c.ref, service, version, noun, c.wantService, c.wantVersion, c.wantNoun)
 		}
 	}
 }
@@ -242,8 +243,72 @@ func TestSplitQualifiedRefName_RealKubernetesShapes(t *testing.T) {
 // unchanged single-noun fallback applies, not a false-positive split.
 func TestSplitQualifiedRefName_NonQualifiedNamesUnaffected(t *testing.T) {
 	for _, ref := range []string{"full-repository", "gist-simple", "Widget", "a.b"} {
-		if _, _, ok := splitQualifiedRefName(ref); ok {
+		if _, _, _, ok := splitQualifiedRefName(ref); ok {
 			t.Errorf("splitQualifiedRefName(%q): ok = true, want false (no real version-shaped segment present)", ref)
 		}
 	}
+}
+
+// TestDiscover_VersionCollisionRecoveredNotDropped is UBI-176's own real
+// regression test: a stable v1 and a beta v1beta1 sibling of the same real
+// Kind (identical response schema shape, e.g. Kubernetes'
+// io.k8s.api.apps.v1.Deployment / io.k8s.api.apps.v1beta1.Deployment) used
+// to collide on an identical, version-stripped typeName -- seenTypeNames'
+// own collision guard then silently kept whichever sorted first by
+// ReadPath and dropped the other, no matter which version was actually
+// current. Both must now survive: the path-sort winner keeps its own
+// plain, unversioned name unchanged (a real, deliberate backward-
+// compatibility constraint -- no already-published typeName may move),
+// the loser gets a version-qualified name instead of being dropped.
+func TestDiscover_VersionCollisionRecoveredNotDropped(t *testing.T) {
+	schemaRefFor := func(refName string) *openapi3.SchemaRef {
+		return openapi3.NewSchemaRef("#/components/schemas/"+refName, openapi3.NewObjectSchema())
+	}
+
+	stableSchemaRef := schemaRefFor("io.k8s.api.apps.v1.Deployment")
+	betaSchemaRef := schemaRefFor("io.k8s.api.apps.v1beta1.Deployment")
+
+	stableRead := &openapi3.Operation{OperationID: "apps-v1/read", Responses: responses200(stableSchemaRef)}
+	stableCreate := &openapi3.Operation{OperationID: "apps-v1/create", Responses: responses201(stableSchemaRef)}
+	betaRead := &openapi3.Operation{OperationID: "apps-v1beta1/read", Responses: responses200(betaSchemaRef)}
+	betaCreate := &openapi3.Operation{OperationID: "apps-v1beta1/create", Responses: responses201(betaSchemaRef)}
+
+	doc := &openapi3.T{OpenAPI: "3.0.3", Info: &openapi3.Info{Title: "t", Version: "1"}}
+	doc.Paths = openapi3.NewPaths(
+		openapi3.WithPath("/apis/apps/v1/deployments/{name}", &openapi3.PathItem{Get: stableRead}),
+		openapi3.WithPath("/apis/apps/v1/deployments", &openapi3.PathItem{Post: stableCreate}),
+		openapi3.WithPath("/apis/apps/v1beta1/deployments/{name}", &openapi3.PathItem{Get: betaRead}),
+		openapi3.WithPath("/apis/apps/v1beta1/deployments", &openapi3.PathItem{Post: betaCreate}),
+	)
+
+	resources, notes, err := Discover(doc, "kubernetes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range notes {
+		if strings.Contains(n.Detail, "skipped rather than disambiguated") {
+			t.Errorf("expected no drop notes, got: %s: %s", n.Path, n.Detail)
+		}
+	}
+	if len(resources) != 2 {
+		t.Fatalf("expected both the v1 and v1beta1 Deployment to survive, got %d: %+v", len(resources), resources)
+	}
+	byType := map[string]Resource{}
+	for _, r := range resources {
+		byType[r.TypeName] = r
+	}
+	if _, ok := byType["kubernetes_apps_deployment"]; !ok {
+		t.Errorf("expected the path-sort winner to keep the plain, unversioned name kubernetes_apps_deployment, got types: %v", keysOf(byType))
+	}
+	if _, ok := byType["kubernetes_apps_v1beta1_deployment"]; !ok {
+		t.Errorf("expected the recovered sibling to get the version-qualified name kubernetes_apps_v1beta1_deployment, got types: %v", keysOf(byType))
+	}
+}
+
+func keysOf(m map[string]Resource) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

@@ -133,7 +133,7 @@ func Discover(doc *openapi3.T, providerName string) ([]Resource, []Note, error) 
 			continue
 		}
 
-		service, noun, nounNote := deriveNoun(refName, rc.path)
+		service, version, noun, nounNote := deriveNoun(refName, rc.path)
 		if nounNote != "" {
 			notes = append(notes, Note{Path: rc.path, Detail: nounNote})
 		}
@@ -150,12 +150,37 @@ func Discover(doc *openapi3.T, providerName string) ([]Resource, []Note, error) 
 			// in sorted path order, so the shorter/more canonical path
 			// (a real, deterministic, if approximate, proxy for "the
 			// actual resource, not a sub-view of it") always wins the
-			// name and the later one is skipped with a Note, the same
-			// "skip with a documented reason" discipline every other gap
-			// in this package uses rather than a hard failure that would
-			// block every OTHER resource in the same document too.
-			notes = append(notes, Note{Path: rc.path, Detail: fmt.Sprintf("resource type name %q already claimed by %q (same response schema, different path) -- skipped rather than disambiguated", typeName, existingPath)})
-			continue
+			// name -- the later one used to be skipped outright; now, if
+			// it carries a real API version token (version != "", set only
+			// via splitQualifiedRefName's own structural match), it gets a
+			// second chance under a version-qualified typeName instead of
+			// being dropped (UBI-176: 21 real Kubernetes resources -- an
+			// alpha/beta/older-major sibling of an already-claimed stable
+			// type -- were silently lost this way; see
+			// splitQualifiedRefName's own doc comment for the live count
+			// and the real autoscaling/v2-loses-to-v1 case that isn't even
+			// an alpha/beta split). The FIRST-CLAIMED type keeps its own
+			// plain, unversioned name unchanged -- no existing typeName,
+			// URL, or generated binding identifier for it moves -- only the
+			// newly-recovered sibling's own name changes shape.
+			recovered := false
+			if version != "" {
+				versionedTypeName := providerName + "_" + version + "_" + noun
+				if service != "" {
+					versionedTypeName = providerName + "_" + service + "_" + version + "_" + noun
+				}
+				if _, versionedDup := seenTypeNames[versionedTypeName]; !versionedDup {
+					typeName = versionedTypeName
+					recovered = true
+				} else {
+					notes = append(notes, Note{Path: rc.path, Detail: fmt.Sprintf("resource type name %q already claimed by %q (same response schema, different path); version-qualified name %q ALSO already claimed -- skipped rather than disambiguated further", typeName, existingPath, versionedTypeName)})
+					continue
+				}
+			}
+			if !recovered {
+				notes = append(notes, Note{Path: rc.path, Detail: fmt.Sprintf("resource type name %q already claimed by %q (same response schema, different path) -- skipped rather than disambiguated", typeName, existingPath)})
+				continue
+			}
 		}
 		seenTypeNames[typeName] = rc.path
 
@@ -395,24 +420,25 @@ func refString(ref string) string {
 	return ""
 }
 
-// deriveNoun picks the resource-type service (optional) and noun: the
-// response component schema's own name when one exists (the strong, real
-// signal), snake_cased -- further split into (service, noun) when that
-// name itself carries a real, structural service/group qualifier (see
+// deriveNoun picks the resource-type service (optional), noun, and API
+// version (optional -- see splitQualifiedRefName): the response component
+// schema's own name when one exists (the strong, real signal), snake_cased
+// -- further split into (service, version, noun) when that name itself
+// carries a real, structural service/group qualifier (see
 // splitQualifiedRefName) -- falling back to the read path's own last
 // non-parameter segment, naively singularized (trailing "s" stripped, real
 // English-plural-only heuristic -- documented as approximate, not a real
 // inflection engine, since pulling one in for this fallback path alone
 // isn't proportionate to how rarely real specs leave a response schema
-// unnamed) when no response schema name exists at all. service is always
-// "" in the fallback case -- a bare path segment carries no real service
-// signal to extract.
-func deriveNoun(refName, readPath string) (service, noun string, note string) {
+// unnamed) when no response schema name exists at all. service and version
+// are always "" in the fallback case -- a bare path segment carries no
+// real service/version signal to extract.
+func deriveNoun(refName, readPath string) (service, version, noun string, note string) {
 	if refName != "" {
-		if svc, n, ok := splitQualifiedRefName(refName); ok {
-			return toSnakeCase(svc), toSnakeCase(n), ""
+		if svc, v, n, ok := splitQualifiedRefName(refName); ok {
+			return toSnakeCase(svc), v, toSnakeCase(n), ""
 		}
-		return "", toSnakeCase(refName), ""
+		return "", "", toSnakeCase(refName), ""
 	}
 	segs := strings.Split(strings.TrimSuffix(readPath, "/"), "/")
 	var last string
@@ -426,7 +452,7 @@ func deriveNoun(refName, readPath string) (service, noun string, note string) {
 		last = "resource"
 	}
 	singular := strings.TrimSuffix(last, "s")
-	return "", toSnakeCase(singular), fmt.Sprintf("response schema has no component name (inline schema) -- resource noun %q derived from the read path itself instead, a weaker heuristic than the usual response-schema-name match", singular)
+	return "", "", toSnakeCase(singular), fmt.Sprintf("response schema has no component name (inline schema) -- resource noun %q derived from the read path itself instead, a weaker heuristic than the usual response-schema-name match", singular)
 }
 
 // apiVersionPattern matches a real API version token -- "v1", "v1beta1",
@@ -452,16 +478,33 @@ var apiVersionPattern = regexp.MustCompile(`^v[0-9]+((alpha|beta)[0-9]+)?$`)
 // identical treatment; a spec whose ref names don't match it (GitHub's/
 // Datadog's own flatter, single-concept names, e.g. "full-repository") falls
 // through to deriveNoun's own existing, unchanged single-noun behavior.
-func splitQualifiedRefName(refName string) (service, noun string, ok bool) {
+//
+// version is returned alongside service/noun (not discarded) so a caller
+// can disambiguate two resources that share both -- the real, live-found
+// case (UBI-176) this same version token used to be dropped for entirely:
+// "io.k8s.api.apps.v1.Deployment" and a hypothetical
+// "io.k8s.api.apps.v1beta1.Deployment" both produce service="apps",
+// noun="Deployment" and, pre-fix, an IDENTICAL typeName -- Discover's own
+// seenTypeNames collision guard then silently kept only whichever sorted
+// first by ReadPath and dropped the other outright, no matter which
+// version was actually the real, current stable one (confirmed live: 21
+// real Kubernetes resources -- alpha/beta siblings of an already-covered
+// stable type, PLUS one real case, autoscaling/v2 HorizontalPodAutoscaler,
+// where the OLDER v1 sorted first and silently ate v2's own name purely by
+// string comparison, not because v1 is actually the current API). Already
+// returned as a valid typeName segment (apiVersionPattern guarantees a
+// clean lowercase "v[0-9]+(alpha|beta[0-9]+)?" shape) -- no further
+// snake_case pass needed the way service/noun get one.
+func splitQualifiedRefName(refName string) (service, version, noun string, ok bool) {
 	segs := strings.Split(refName, ".")
 	if len(segs) < 3 {
-		return "", "", false
+		return "", "", "", false
 	}
-	version := segs[len(segs)-2]
+	version = segs[len(segs)-2]
 	if !apiVersionPattern.MatchString(version) {
-		return "", "", false
+		return "", "", "", false
 	}
-	return segs[len(segs)-3], segs[len(segs)-1], true
+	return segs[len(segs)-3], version, segs[len(segs)-1], true
 }
 
 func toSnakeCase(s string) string {
