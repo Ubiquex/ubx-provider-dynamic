@@ -128,6 +128,36 @@ type Provider struct {
 	// present fields).
 	TargetPrefix string `toml:"target_prefix"`
 
+	// WireName is an optional override for the string baked into every
+	// resource type name this entry produces (resourcemap.Discover's own
+	// providerName parameter, combineTypeName's first argument -- see
+	// that function's own doc comment). Absent, the table's own key
+	// (Name, == UBX_DYNAMIC_PROVIDER_NAME) is used, unchanged from every
+	// prior phase.
+	//
+	// Real, confirmed need this field exists for (UBI-175, ubiquex's own
+	// sdk/providers/.ubx/config, Datadog v1+v2 coverage-gap closure): a
+	// second, distinct upstream spec for a provider ubx already has an
+	// entry for (Datadog's OpenAPI v2 schema, alongside the existing v1
+	// entry) must be its own [dynamic_providers.<name>] table -- TOML
+	// requires a unique key, and "datadog" is already taken -- but its
+	// real resources belong under the SAME public wire prefix as v1's
+	// own ("datadog_incident", not "datadog_v2_incident": the API
+	// version is an upstream implementation detail, never meant to leak
+	// into a name a user writes in their own stack config). Before this
+	// field existed, the table's own key was the ONLY input to wire
+	// naming, so the two concerns -- "which TOML table is this" and
+	// "what does every one of this table's resources get called" --
+	// could never be set independently. Set wire_name = "datadog" on
+	// the v2 entry (keyed dynamic_providers.datadog_v2) to get v1-shaped
+	// names from both; ubiquex's own [dynamic_provider_groups.<name>]
+	// mechanism (cli/sdk.go, a separate, later merge step) is still
+	// responsible for resolving the handful of names both entries
+	// produce identically -- this field only ever controls what name
+	// a SINGLE entry's own resources get, never collision resolution
+	// across entries.
+	WireName string `toml:"wire_name"`
+
 	// Retry/Timeouts/Resources are UBI-158 Phase 3's own execution-
 	// semantics config -- see execution.go's own doc comment. All
 	// optional: an absent [retry]/[timeouts] table, or an absent

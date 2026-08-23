@@ -113,6 +113,17 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
+	// wireName is what gets baked into every resource type name this
+	// process produces -- config.Provider.WireName's own doc comment has
+	// the full real reason this can differ from name (the table's own
+	// key, used for --only targeting and process identity below,
+	// unchanged). Defaults to name, matching every prior phase's
+	// behavior for the common case where no entry needs the two decoupled.
+	wireName := name
+	if cfg.WireName != "" {
+		wireName = cfg.WireName
+	}
+
 	if *generateSnapshotFlag != "" {
 		return runGenerateSnapshot(name, cfg, *generateSnapshotFlag, *prevSnapshotFlag)
 	}
@@ -132,7 +143,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("find Smithy service: %w", err)
 		}
-		built, notes, err := smithy.Build(smithyDoc, name, smithy.DefaultKnownNames())
+		built, notes, err := smithy.Build(smithyDoc, wireName, smithy.DefaultKnownNames())
 		if err != nil {
 			return fmt.Errorf("build Smithy resource schemas: %w", err)
 		}
@@ -297,7 +308,7 @@ func run() error {
 		return fmt.Errorf("load OpenAPI spec: %w", err)
 	}
 
-	resources, notes, err := dynserver.Build(doc, name, cfg)
+	resources, notes, err := dynserver.Build(doc, wireName, cfg)
 	if err != nil {
 		return fmt.Errorf("build resource schemas: %w", err)
 	}
