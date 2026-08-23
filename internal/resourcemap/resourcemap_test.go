@@ -305,6 +305,75 @@ func TestDiscover_VersionCollisionRecoveredNotDropped(t *testing.T) {
 	}
 }
 
+// TestDiscover_HigherMajorVersionWinsThePlainNameOverPathSortOrder is
+// UBI-176's own real, live-found refinement: ReadPath's own lexicographic
+// sort order is NOT the same thing as real API version priority --
+// "v1" < "v2" as strings, so a naive path-sort-wins rule would let an
+// OLDER, superseded major version (autoscaling/v1) keep the plain name
+// over the real, current, preferred one (autoscaling/v2), even though
+// neither is a prerelease. Confirmed live against the real
+// autoscaling/v2 vs v1 HorizontalPodAutoscaler case (v2 replaces v1's
+// own single CPU-utilization target with a real multi-metric array) and
+// the real per-API-group "preferredVersion" signal Kubernetes itself
+// publishes (api/discovery/apis__autoscaling.json, same repo, same
+// release tag as the OpenAPI spec, confirming v2) -- this package
+// computes the identical, real, standard version-priority order
+// locally (versionPriority) rather than requiring a second live fetch.
+func TestDiscover_HigherMajorVersionWinsThePlainNameOverPathSortOrder(t *testing.T) {
+	schemaRefFor := func(refName string) *openapi3.SchemaRef {
+		return openapi3.NewSchemaRef("#/components/schemas/"+refName, openapi3.NewObjectSchema())
+	}
+	v1Ref := schemaRefFor("io.k8s.api.autoscaling.v1.HorizontalPodAutoscaler")
+	v2Ref := schemaRefFor("io.k8s.api.autoscaling.v2.HorizontalPodAutoscaler")
+
+	v1Read := &openapi3.Operation{OperationID: "hpa-v1/read", Responses: responses200(v1Ref)}
+	v1Create := &openapi3.Operation{OperationID: "hpa-v1/create", Responses: responses201(v1Ref)}
+	v2Read := &openapi3.Operation{OperationID: "hpa-v2/read", Responses: responses200(v2Ref)}
+	v2Create := &openapi3.Operation{OperationID: "hpa-v2/create", Responses: responses201(v2Ref)}
+
+	doc := &openapi3.T{OpenAPI: "3.0.3", Info: &openapi3.Info{Title: "t", Version: "1"}}
+	// v1's own paths are declared FIRST and sort lexicographically ahead
+	// of v2's -- exactly the real shape that used to make v1 win purely
+	// by path order, the bug this test locks in the fix for.
+	doc.Paths = openapi3.NewPaths(
+		openapi3.WithPath("/apis/autoscaling/v1/namespaces/{namespace}/horizontalpodautoscalers/{name}", &openapi3.PathItem{Get: v1Read}),
+		openapi3.WithPath("/apis/autoscaling/v1/namespaces/{namespace}/horizontalpodautoscalers", &openapi3.PathItem{Post: v1Create}),
+		openapi3.WithPath("/apis/autoscaling/v2/namespaces/{namespace}/horizontalpodautoscalers/{name}", &openapi3.PathItem{Get: v2Read}),
+		openapi3.WithPath("/apis/autoscaling/v2/namespaces/{namespace}/horizontalpodautoscalers", &openapi3.PathItem{Post: v2Create}),
+	)
+
+	resources, _, err := Discover(doc, "kubernetes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byType := map[string]Resource{}
+	for _, r := range resources {
+		byType[r.TypeName] = r
+	}
+	if r, ok := byType["kubernetes_autoscaling_horizontal_pod_autoscaler"]; !ok {
+		t.Fatalf("expected the plain, unversioned name to exist, got types: %v", keysOf(byType))
+	} else if !strings.Contains(r.ReadPath, "/v2/") {
+		t.Errorf("expected the plain name to belong to v2 (the real, current, preferred version), got ReadPath %q", r.ReadPath)
+	}
+	if _, ok := byType["kubernetes_autoscaling_v1_horizontal_pod_autoscaler"]; !ok {
+		t.Errorf("expected the recovered older-major sibling to get the version-qualified name kubernetes_autoscaling_v1_horizontal_pod_autoscaler, got types: %v", keysOf(byType))
+	}
+}
+
+func TestVersionPriority_RealKubernetesOrdering(t *testing.T) {
+	// Each row must outrank every row after it -- the real, standard
+	// Kubernetes API version-priority order: GA beats any prerelease
+	// regardless of number, beta beats alpha, higher number wins within
+	// a tier.
+	inOrder := []string{"v10", "v2", "v1", "v11beta2", "v10beta3", "v3beta1", "v12alpha1", "v11alpha2", "v1alpha1"}
+	for i := 0; i < len(inOrder)-1; i++ {
+		hi, lo := versionPriority(inOrder[i]), versionPriority(inOrder[i+1])
+		if !hi.higherThan(lo) {
+			t.Errorf("expected versionPriority(%q) to outrank versionPriority(%q), got %+v vs %+v", inOrder[i], inOrder[i+1], hi, lo)
+		}
+	}
+}
+
 func keysOf(m map[string]Resource) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

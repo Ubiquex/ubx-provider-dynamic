@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -117,9 +118,14 @@ func Discover(doc *openapi3.T, providerName string) ([]Resource, []Note, error) 
 
 	var notes []Note
 	var resources []Resource
-	seenTypeNames := map[string]string{} // TypeName -> ReadPath, for collision detection
 
+	// Phase 1: resolve every real read candidate into a base typeName,
+	// independent of any collision it might turn out to share with a
+	// sibling -- genuine skips (no response schema, no matching create)
+	// are recorded as Notes here and go no further, unchanged from
+	// before this was split into two phases.
 	readCandidates := filterReadCandidates(ops)
+	var cands []candidate
 	for _, rc := range readCandidates {
 		refName, respSchema := ResponseSchema(rc.sub)
 		if respSchema == nil {
@@ -137,77 +143,118 @@ func Discover(doc *openapi3.T, providerName string) ([]Resource, []Note, error) 
 		if nounNote != "" {
 			notes = append(notes, Note{Path: rc.path, Detail: nounNote})
 		}
-		typeName := providerName + "_" + noun
+		baseTypeName := providerName + "_" + noun
 		if service != "" {
-			typeName = providerName + "_" + service + "_" + noun
+			baseTypeName = providerName + "_" + service + "_" + noun
 		}
-		if existingPath, dup := seenTypeNames[typeName]; dup {
-			// Real, confirmed against GitHub's own spec: two distinct
-			// item paths can share one response schema on purpose --
-			// /gists/{gist_id} (a gist) and /gists/{gist_id}/{sha} (one
-			// specific historical revision of that same gist) both
-			// return gist-simple. Not an error: readCandidates is walked
-			// in sorted path order, so the shorter/more canonical path
-			// (a real, deterministic, if approximate, proxy for "the
-			// actual resource, not a sub-view of it") always wins the
-			// name -- the later one used to be skipped outright; now, if
-			// it carries a real API version token (version != "", set only
-			// via splitQualifiedRefName's own structural match), it gets a
-			// second chance under a version-qualified typeName instead of
-			// being dropped (UBI-176: 21 real Kubernetes resources -- an
-			// alpha/beta/older-major sibling of an already-claimed stable
-			// type -- were silently lost this way; see
-			// splitQualifiedRefName's own doc comment for the live count
-			// and the real autoscaling/v2-loses-to-v1 case that isn't even
-			// an alpha/beta split). The FIRST-CLAIMED type keeps its own
-			// plain, unversioned name unchanged -- no existing typeName,
-			// URL, or generated binding identifier for it moves -- only the
-			// newly-recovered sibling's own name changes shape.
-			recovered := false
-			if version != "" {
-				versionedTypeName := providerName + "_" + version + "_" + noun
-				if service != "" {
-					versionedTypeName = providerName + "_" + service + "_" + version + "_" + noun
+		cands = append(cands, candidate{
+			rc: rc, refName: refName, create: create, createOp: createOp,
+			service: service, version: version, noun: noun,
+			baseTypeName: baseTypeName,
+		})
+	}
+
+	// Phase 2: within each group of candidates sharing a base typeName,
+	// pick the real winner -- the real, standard Kubernetes API
+	// version-priority order (see versionPriority's own doc comment)
+	// when every member carries a real version token, falling back to
+	// original ReadPath order (the exact pre-existing tie-break) when it
+	// doesn't. The winner keeps the plain, unversioned typeName; every
+	// other member gets a version-qualified fallback name instead of
+	// being dropped, when it has a real version token to qualify with
+	// (UBI-176: 21 real Kubernetes resources -- an alpha/beta/older-
+	// major sibling of an already-claimed stable type -- were silently
+	// lost this way before; see versionPriority's own doc comment for
+	// why "older-major" is real too, not just alpha/beta).
+	byBase := map[string][]int{} // baseTypeName -> indices into cands
+	for i, c := range cands {
+		byBase[c.baseTypeName] = append(byBase[c.baseTypeName], i)
+	}
+
+	finalTypeName := make([]string, len(cands))
+	seenTypeNames := map[string]string{} // TypeName -> ReadPath, for the defensive re-collision check below
+
+	bases := make([]string, 0, len(byBase))
+	for base := range byBase {
+		bases = append(bases, base)
+	}
+	sort.Strings(bases) // deterministic iteration order, output is re-sorted by TypeName below regardless
+
+	for _, base := range bases {
+		idxs := byBase[base]
+		sort.SliceStable(idxs, func(a, b int) bool {
+			ca, cb := cands[idxs[a]], cands[idxs[b]]
+			if ca.version != "" && cb.version != "" {
+				pa, pb := versionPriority(ca.version), versionPriority(cb.version)
+				if pa != pb {
+					return pa.higherThan(pb)
 				}
-				if _, versionedDup := seenTypeNames[versionedTypeName]; !versionedDup {
-					typeName = versionedTypeName
-					recovered = true
-				} else {
-					notes = append(notes, Note{Path: rc.path, Detail: fmt.Sprintf("resource type name %q already claimed by %q (same response schema, different path); version-qualified name %q ALSO already claimed -- skipped rather than disambiguated further", typeName, existingPath, versionedTypeName)})
-					continue
-				}
+			} else if (ca.version != "") != (cb.version != "") {
+				// Mixed real-version/no-version collision in the same
+				// group is not a real shape this package's own real,
+				// live-checked providers ever produce (confirmed:
+				// Kubernetes' own qualified ref names always carry a
+				// version; GitHub's/Datadog's own flat ref names never
+				// do) -- if it ever did, preferring the versioned one is
+				// the safer default (it can be recovered under a
+				// versioned name if it loses; an unversioned candidate
+				// has no such fallback).
+				return ca.version != ""
 			}
-			if !recovered {
-				notes = append(notes, Note{Path: rc.path, Detail: fmt.Sprintf("resource type name %q already claimed by %q (same response schema, different path) -- skipped rather than disambiguated", typeName, existingPath)})
+			return idxs[a] < idxs[b] // original ReadPath order, the exact pre-existing tie-break
+		})
+
+		winner := cands[idxs[0]]
+		finalTypeName[idxs[0]] = winner.baseTypeName
+		seenTypeNames[winner.baseTypeName] = winner.rc.path
+
+		for _, i := range idxs[1:] {
+			c := cands[i]
+			if c.version == "" {
+				notes = append(notes, Note{Path: c.rc.path, Detail: fmt.Sprintf("resource type name %q already claimed by %q (same response schema, different path) -- skipped rather than disambiguated", base, winner.rc.path)})
 				continue
 			}
+			versionedTypeName := providerName + "_" + c.version + "_" + c.noun
+			if c.service != "" {
+				versionedTypeName = providerName + "_" + c.service + "_" + c.version + "_" + c.noun
+			}
+			if existingPath, dup := seenTypeNames[versionedTypeName]; dup {
+				notes = append(notes, Note{Path: c.rc.path, Detail: fmt.Sprintf("resource type name %q already claimed by %q (same response schema, different path); version-qualified name %q ALSO already claimed by %q -- skipped rather than disambiguated further", base, winner.rc.path, versionedTypeName, existingPath)})
+				continue
+			}
+			finalTypeName[i] = versionedTypeName
+			seenTypeNames[versionedTypeName] = c.rc.path
 		}
-		seenTypeNames[typeName] = rc.path
+	}
 
+	for i, c := range cands {
+		if finalTypeName[i] == "" {
+			continue // lost the collision, already noted above
+		}
 		res := Resource{
-			TypeName:              typeName,
-			ReadPath:              rc.path,
-			ReadOperation:         rc.sub,
-			CreatePath:            createOp.path,
-			CreateMethod:          createOp.method,
-			CreateOperation:       create,
-			PathParams:            pathParams(rc.path),
-			CreatePathParams:      pathParams(createOp.path),
-			ResponseSchemaRefName: refName,
+			TypeName:              finalTypeName[i],
+			ReadPath:              c.rc.path,
+			ReadOperation:         c.rc.sub,
+			CreatePath:            c.createOp.path,
+			CreateMethod:          c.createOp.method,
+			CreateOperation:       c.create,
+			PathParams:            pathParams(c.rc.path),
+			CreatePathParams:      pathParams(c.createOp.path),
+			ResponseSchemaRefName: c.refName,
 		}
 
-		if u := findSibling(ops, rc.path, "PATCH"); u != nil {
+		if u := findSibling(ops, c.rc.path, "PATCH"); u != nil {
 			res.UpdateMethod, res.UpdateOperation = "PATCH", u
-		} else if u := findSibling(ops, rc.path, "PUT"); u != nil {
+		} else if u := findSibling(ops, c.rc.path, "PUT"); u != nil {
 			res.UpdateMethod, res.UpdateOperation = "PUT", u
 		} else {
-			notes = append(notes, Note{Path: rc.path, Detail: "no PATCH or PUT on this item path -- modeled as create/delete-only, no in-place update"})
+			notes = append(notes, Note{Path: c.rc.path, Detail: "no PATCH or PUT on this item path -- modeled as create/delete-only, no in-place update"})
 		}
 
-		if d := findSibling(ops, rc.path, "DELETE"); d != nil {
+		if d := findSibling(ops, c.rc.path, "DELETE"); d != nil {
 			res.DeleteOperation = d
 		} else {
-			notes = append(notes, Note{Path: rc.path, Detail: "no DELETE on this item path -- modeled without a real destroy operation"})
+			notes = append(notes, Note{Path: c.rc.path, Detail: "no DELETE on this item path -- modeled without a real destroy operation"})
 		}
 
 		resources = append(resources, res)
@@ -215,6 +262,21 @@ func Discover(doc *openapi3.T, providerName string) ([]Resource, []Note, error) 
 
 	sort.Slice(resources, func(i, j int) bool { return resources[i].TypeName < resources[j].TypeName })
 	return resources, notes, nil
+}
+
+// candidate is one real read candidate that cleared Phase 1 (has a
+// response schema and a matching create) -- everything Phase 2 needs to
+// resolve a same-base-typeName collision without re-deriving anything.
+// Its own position in the cands slice (built in the same, already
+// ReadPath-sorted order readCandidates has) IS the original ReadPath
+// order tie-break -- no separate index field needed.
+type candidate struct {
+	rc                     op
+	refName                string
+	create                 *openapi3.Operation
+	createOp               *op
+	service, version, noun string
+	baseTypeName           string
 }
 
 // filterReadCandidates returns every GET operation whose path ends in a
@@ -460,6 +522,67 @@ func deriveNoun(refName, readPath string) (service, version, noun string, note s
 // uses to recognize a dotted, package-qualified response schema name's own
 // real structure, rather than guessing from segment count alone.
 var apiVersionPattern = regexp.MustCompile(`^v[0-9]+((alpha|beta)[0-9]+)?$`)
+
+// versionPriorityPattern is apiVersionPattern's own numeric-capturing
+// twin, used only by versionPriority (apiVersionPattern itself stays a
+// pure validity check, unchanged, since every other caller only needs a
+// yes/no answer).
+var versionPriorityPattern = regexp.MustCompile(`^v([0-9]+)(?:(alpha|beta)([0-9]+))?$`)
+
+// vPriority orders real Kubernetes-style version tokens so a HIGHER
+// value is a MORE preferred version -- tier first (GA beats any
+// prerelease, beta beats alpha), then major version number, then
+// prerelease number.
+type vPriority struct {
+	tier, major, pre int
+}
+
+func (p vPriority) higherThan(other vPriority) bool {
+	if p.tier != other.tier {
+		return p.tier > other.tier
+	}
+	if p.major != other.major {
+		return p.major > other.major
+	}
+	return p.pre > other.pre
+}
+
+// versionPriority parses a real, already apiVersionPattern-validated
+// Kubernetes-style version token into vPriority -- the identical, real,
+// standard algorithm kube-apiserver's own version-priority ordering
+// uses (k8s.io/apimachinery's CompareKubeAwareVersionStrings): a GA
+// version ("vN") always outranks ANY prerelease regardless of number,
+// beta always outranks alpha, and within the same tier a higher
+// major/prerelease number wins. Confirmed live against the real,
+// checked-in per-API-group discovery snapshots Kubernetes itself
+// publishes alongside its own OpenAPI spec (same repo, same release
+// tag, api/discovery/apis__<group>.json's own "preferredVersion" field,
+// not baked into swagger.json itself) -- this function's own output
+// matches that real signal exactly for every currently-real collision
+// this package resolves (autoscaling/v2 over v1, coordination/v1beta1
+// over v1alpha2, scheduling/v1beta1 over v1alpha3), computed locally
+// from the version string alone rather than requiring a second, live
+// network fetch this package's own architecture doesn't otherwise need
+// (Discover takes an already-parsed document, no I/O of its own).
+// A malformed token (should never happen -- every caller already
+// checked apiVersionPattern first) sorts as the lowest possible
+// priority rather than panicking.
+func versionPriority(v string) vPriority {
+	m := versionPriorityPattern.FindStringSubmatch(v)
+	if m == nil {
+		return vPriority{tier: -1}
+	}
+	major, _ := strconv.Atoi(m[1])
+	if m[2] == "" {
+		return vPriority{tier: 2, major: major} // GA
+	}
+	pre, _ := strconv.Atoi(m[3])
+	tier := 0 // alpha
+	if m[2] == "beta" {
+		tier = 1
+	}
+	return vPriority{tier: tier, major: major, pre: pre}
+}
 
 // splitQualifiedRefName recognizes a real, structural naming convention
 // some OpenAPI-sourced APIs use for their own response component schema
