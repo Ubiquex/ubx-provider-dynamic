@@ -44,7 +44,7 @@ func buildPubSubShapedDoc() *Document {
 
 func TestDiscover_RealPubSubShape(t *testing.T) {
 	doc := buildPubSubShapedDoc()
-	resources, notes, err := Discover(doc, "google")
+	resources, notes, err := Discover(doc, "google", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +63,42 @@ func TestDiscover_RealPubSubShape(t *testing.T) {
 	}
 	if !r.HasDelete {
 		t.Fatal("expected a delete method")
+	}
+}
+
+// TestDiscover_VersionQualifier_ThreadsIntoTypeName_ZeroChangeWhenEmpty
+// locks in the real fix for a real, live bug: Google keeps a Discovery
+// Document's own top-level "name" field IDENTICAL across release
+// channels (compute's v1 and beta documents both report name="compute"),
+// so a stable and a beta/alpha entry configured for the same API produce
+// byte-identical typeNames for every resource the two channels share.
+// versionQualifier, threaded through from config.Provider.VersionQualifier,
+// is the fix -- empty (every one of the 162 already-configured GCP
+// entries) produces the exact same typeName as before this parameter
+// existed; a real value (a new secondary-channel entry) inserts it
+// between the API name and the noun, so the two channels' otherwise-
+// identical typeNames no longer collide.
+func TestDiscover_VersionQualifier_ThreadsIntoTypeName_ZeroChangeWhenEmpty(t *testing.T) {
+	doc := buildPubSubShapedDoc()
+
+	stable, _, err := Discover(doc, "google", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stable) != 1 || stable[0].TypeName != "google_pubsub_topic" {
+		t.Fatalf("empty versionQualifier must produce the exact pre-existing typeName, got %+v", stable)
+	}
+
+	beta, _, err := Discover(doc, "google", "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(beta) != 1 || beta[0].TypeName != "google_pubsub_beta_topic" {
+		t.Fatalf("non-empty versionQualifier must thread between the API name and the noun, got %+v", beta)
+	}
+
+	if stable[0].TypeName == beta[0].TypeName {
+		t.Fatal("stable and beta typeNames must not collide -- this is the exact real bug this parameter fixes")
 	}
 }
 
@@ -99,7 +135,7 @@ func TestDiscover_PrefixedCreateMethod_RealIamV2PoliciesShape(t *testing.T) {
 			},
 		},
 	}
-	resources, _, err := Discover(doc, "google")
+	resources, _, err := Discover(doc, "google", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +175,7 @@ func TestDiscover_UnrelatedVerb_NotMatchedAsCreate(t *testing.T) {
 			},
 		},
 	}
-	resources, notes, err := Discover(doc, "google")
+	resources, notes, err := Discover(doc, "google", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +204,7 @@ func TestDiscover_ReadOnlyNode_SkippedWithNote(t *testing.T) {
 			},
 		},
 	}
-	resources, notes, err := Discover(doc, "example")
+	resources, notes, err := Discover(doc, "example", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +224,7 @@ func TestDiscover_ReadOnlyNode_SkippedWithNote(t *testing.T) {
 
 func TestBuild_TranslatesRealShape_ReadOnlyMergesToOptionalComputed_EnumCarried(t *testing.T) {
 	doc := buildPubSubShapedDoc()
-	built, notes, err := Build(doc, "google")
+	built, notes, err := Build(doc, "google", "")
 	if err != nil {
 		t.Fatalf("Build: %v (notes: %+v)", err, notes)
 	}
@@ -296,7 +332,7 @@ func TestDiscover_CamelCaseResourceKey_SnakeCased(t *testing.T) {
 			},
 		},
 	}
-	resources, _, err := Discover(doc, "google")
+	resources, _, err := Discover(doc, "google", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +374,7 @@ func TestDiscover_CamelCaseDocName_SnakeCased(t *testing.T) {
 			},
 		},
 	}
-	resources, _, err := Discover(doc, "google_siteverification")
+	resources, _, err := Discover(doc, "google_siteverification", "")
 	if err != nil {
 		t.Fatal(err)
 	}

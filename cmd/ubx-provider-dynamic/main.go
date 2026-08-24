@@ -223,7 +223,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("load discovery document: %w", err)
 		}
-		built, notes, err := discoverydoc.Build(ddoc, name)
+		built, notes, err := discoverydoc.Build(ddoc, name, cfg.VersionQualifier)
 		if err != nil {
 			return fmt.Errorf("build resource schemas: %w", err)
 		}

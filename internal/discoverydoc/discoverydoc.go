@@ -181,7 +181,39 @@ type Note struct {
 // real, read-only data-source concern, recorded as a Note and skipped,
 // the identical "skip, don't fail" discipline resourcemap's own Discover
 // already uses.
-func Discover(doc *Document, providerName string) ([]Resource, []Note, error) {
+//
+// versionQualifier is config.Provider.VersionQualifier passed straight
+// through (see that field's own doc comment) -- when non-empty, it is
+// threaded into every typeName this call produces, between the API name
+// and the noun. Real, found-live bug this parameter fixes: Google keeps
+// a Discovery Document's own top-level "name" field IDENTICAL across
+// release channels (compute's v1 and beta documents both report
+// name="compute"; only the document's own separate "version" field
+// differs), so configuring both a stable and a beta/alpha entry for the
+// same API produces byte-identical typeNames for every resource the two
+// channels share -- google_compute_instance from v1 AND from beta alike
+// -- and the seenTypeNames guard below silently keeps only whichever one
+// this function's own single call processes, with no cross-call
+// awareness that the other channel's entry claimed the same name first.
+// Exactly the shape UBI-176 already found and fixed for Kubernetes
+// (internal/resourcemap.go's own versionPriority/version-qualified-name
+// logic, for a different real cause -- OpenAPI ref names carrying a real
+// version token this package's own Discovery Document input never has).
+//
+// Deliberately a config-declared, per-entry override (mirroring
+// config.Provider.WireName's own established shape) rather than derived
+// from doc.Version automatically: a real GCP API's own configured
+// baseline is not reliably "v1" (12 of this corpus's 162 configured
+// GCP APIs use v2/v3/v1b3 as their own GA channel, confirmed live via
+// the real discovery directory), so there is no single literal string
+// this package could safely treat as "the unversioned case" without
+// risking a silent, corpus-wide rename the day a non-"v1"-baselined API
+// ever grows a same-named secondary channel. A config-declared flag,
+// set only on the entries that are deliberately being added as a
+// secondary channel, has no such risk: every one of the 162 already-
+// configured entries leaves this unset, producing byte-identical output
+// to before this parameter existed -- verified directly, not assumed.
+func Discover(doc *Document, providerName string, versionQualifier string) ([]Resource, []Note, error) {
 	var resources []Resource
 	var notes []Note
 	seenTypeNames := map[string]bool{}
@@ -242,7 +274,11 @@ func Discover(doc *Document, providerName string) ([]Resource, []Note, error) {
 					// language escape hatch three separate codegen
 					// templates would each need to reimplement identically
 					// (and could silently drift on).
-					typeName := providerName + "_" + uschema.ToSnakeCase(doc.Name) + "_" + noun
+					typeName := providerName + "_" + uschema.ToSnakeCase(doc.Name)
+					if versionQualifier != "" {
+						typeName += "_" + versionQualifier
+					}
+					typeName += "_" + noun
 					if seenTypeNames[typeName] {
 						notes = append(notes, Note{Path: pathStr, Detail: fmt.Sprintf("resource type name %q already claimed by another resource path -- skipped rather than disambiguated", typeName)})
 					} else {
@@ -402,8 +438,8 @@ func singularize(s string) string {
 // flatPath/httpMethod), ready for a future, separate checkpoint to
 // consume, but nothing in THIS package calls restexec or wires a
 // dynserver.Server today.
-func Build(doc *Document, providerName string) (map[string]*BuiltResource, []Note, error) {
-	resources, notes, err := Discover(doc, providerName)
+func Build(doc *Document, providerName string, versionQualifier string) (map[string]*BuiltResource, []Note, error) {
+	resources, notes, err := Discover(doc, providerName, versionQualifier)
 	if err != nil {
 		return nil, notes, err
 	}
