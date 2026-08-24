@@ -33,6 +33,44 @@ base_url = "https://api.github.com"
 	}
 }
 
+func TestLoadNamed_WireNameOverride(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[dynamic_providers.datadog_v2]
+schema_source = "openapi"
+schema_url = "https://example.invalid/openapi.json"
+base_url = "https://api.datadoghq.com"
+wire_name = "datadog"
+`)
+	p, err := LoadNamed(dir, "datadog_v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Name != "datadog_v2" {
+		t.Errorf("expected table key Name to stay %q, got %q", "datadog_v2", p.Name)
+	}
+	if p.WireName != "datadog" {
+		t.Errorf("expected WireName override %q, got %q", "datadog", p.WireName)
+	}
+}
+
+func TestLoadNamed_WireNameAbsent_IsEmptyNotName(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[dynamic_providers.github]
+schema_source = "openapi"
+schema_url = "https://example.invalid/openapi.json"
+base_url = "https://api.github.com"
+`)
+	p, err := LoadNamed(dir, "github")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.WireName != "" {
+		t.Errorf("expected empty WireName when unset (caller falls back to Name), got %q", p.WireName)
+	}
+}
+
 func TestLoadNamed_WalksUpward(t *testing.T) {
 	root := t.TempDir()
 	writeConfig(t, root, `
