@@ -158,6 +158,29 @@ type Provider struct {
 	// across entries.
 	WireName string `toml:"wire_name"`
 
+	// VersionQualifier is discoverydoc.Discover's own versionQualifier
+	// parameter, passed straight through (see that parameter's own doc
+	// comment for the real bug it fixes -- GCP beta/alpha coverage,
+	// keeping compute's own beta channel from silently colliding with
+	// its already-configured v1 entry under an identical typeName).
+	// Only meaningful for schema_source = "discovery_docs"; unused,
+	// silently, by every other schema source, the same "absent means
+	// today's exact behavior" default WireName above already
+	// establishes. Absent on every one of this corpus's 162 already-
+	// configured GCP entries -- set only on a NEW secondary-channel
+	// entry (e.g. version_qualifier = "beta" on a
+	// [dynamic_providers.google_compute_beta] table), never on the
+	// entry that owns the plain, unversioned name.
+	//
+	// Deliberately config-declared, not derived from the fetched
+	// document's own "version" field: a real GCP API's own configured
+	// baseline is not reliably "v1" (12 of 162 configured GCP entries
+	// use v2/v3/v1b3 as their own GA channel), so there is no single
+	// literal string this package could safely treat as "the
+	// unversioned case" without risking a corpus-wide rename the day a
+	// non-"v1"-baselined API grows a same-named secondary channel.
+	VersionQualifier string `toml:"version_qualifier"`
+
 	// Retry/Timeouts/Resources are UBI-158 Phase 3's own execution-
 	// semantics config -- see execution.go's own doc comment. All
 	// optional: an absent [retry]/[timeouts] table, or an absent
