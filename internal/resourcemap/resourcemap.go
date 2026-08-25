@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/typename"
 )
 
 // Resource is one discovered CRUD-shaped resource type.
@@ -143,7 +144,7 @@ func Discover(doc *openapi3.T, providerName string) ([]Resource, []Note, error) 
 		if nounNote != "" {
 			notes = append(notes, Note{Path: rc.path, Detail: nounNote})
 		}
-		baseTypeName := combineTypeName(providerName, service, noun)
+		baseTypeName := typename.Combine(providerName, service, noun)
 		cands = append(cands, candidate{
 			rc: rc, refName: refName, create: create, createOp: createOp,
 			service: service, version: version, noun: noun,
@@ -477,58 +478,6 @@ func refString(ref string) string {
 		return strings.TrimPrefix(ref, prefix)
 	}
 	return ""
-}
-
-// combineTypeName joins providerName with service (optional) and noun
-// into the final real typeName, trimming a real, live-found overlap
-// first: whenever providerName's own trailing token(s) already equal
-// the leading token(s) of what would otherwise be appended, that
-// repeat is dropped rather than concatenated -- a real, common REST
-// pattern where the "primary" resource under a sub-domain is named
-// after the sub-domain itself (confirmed live against Azure ARM specs:
-// the response schema for the config entry azure_hdinsight_cluster is
-// itself literally named "Cluster", so the naive
-// providerName+"_"+noun join produced azure_hdinsight_cluster_cluster
-// instead of the real, correct azure_hdinsight_cluster; DevTestLabs'
-// own "DtlEnvironment" schema under the dtl sub-domain is the same
-// pattern one token over -- azure_devtestlabs_dtl_dtl_environment
-// instead of azure_devtestlabs_dtl_environment).
-//
-// Only a real, exact token-run overlap is trimmed -- a provider whose
-// own noun happens to merely start with a similar-looking but
-// DIFFERENT word is untouched; this is intentionally the same
-// discipline splitQualifiedRefName/apiVersionPattern already apply
-// elsewhere in this file (a real structural signal, never a fuzzy
-// guess). When the overlap consumes the tail entirely (both the
-// Cluster/Workspace-style full-word case above), the real typeName is
-// providerName alone, no trailing separator.
-func combineTypeName(providerName, service, noun string) string {
-	var tail []string
-	if service != "" {
-		tail = append(tail, strings.Split(service, "_")...)
-	}
-	tail = append(tail, strings.Split(noun, "_")...)
-
-	providerTokens := strings.Split(providerName, "_")
-	overlap := 0
-	for k := 1; k <= len(providerTokens) && k <= len(tail); k++ {
-		matches := true
-		for i := 0; i < k; i++ {
-			if providerTokens[len(providerTokens)-k+i] != tail[i] {
-				matches = false
-				break
-			}
-		}
-		if matches {
-			overlap = k
-		}
-	}
-	tail = tail[overlap:]
-
-	if len(tail) == 0 {
-		return providerName
-	}
-	return providerName + "_" + strings.Join(tail, "_")
 }
 
 // deriveNoun picks the resource-type service (optional), noun, and API
