@@ -199,7 +199,7 @@ func Build(files map[string]*ResourceSchema, known smithy.KnownNames) (map[strin
 		objType := attrsObjectType(attrs)
 		wireNames := buildWireNames(rs.Properties, rs.Definitions, map[string]bool{})
 
-		ns, resourceType := splitTypeName(typeName)
+		ns, resourceType := SplitTypeName(typeName)
 		resolvedName, strategy := Resolve(ns, resourceType, known)
 		if _, collision := out[resolvedName]; collision {
 			notes = append(notes, Note{TypeName: typeName, Detail: fmt.Sprintf("resource type name %q already claimed by another CFN type -- skipped rather than disambiguated", resolvedName)})
@@ -234,13 +234,17 @@ func Build(files map[string]*ResourceSchema, known smithy.KnownNames) (map[strin
 	return out, notes, nil
 }
 
-// splitTypeName splits a real "AWS::<Namespace>::<Type>" into its real
+// SplitTypeName splits a real "AWS::<Namespace>::<Type>" into its real
 // namespace and type segments -- every real file this package has ever
 // parsed (the live registry, confirmed during the coverage investigation:
 // 1,705/1,706 real files) has exactly two "::" separators; the one real
 // exception (Alexa::ASK::Skill) is not an AWS:: type at all and is
 // filtered by the caller (fetch.go) before this function ever sees it.
-func splitTypeName(typeName string) (namespace, resourceType string) {
+// Exported (UBI-98): main.go's own --dump-namespaces uses this directly
+// on BuiltResource.TypeName to get the real, authoritative namespace a
+// CFN-sourced resource's own SDK package identity should use, instead
+// of sdk/codegen/ir's own mechanical flat-name split.
+func SplitTypeName(typeName string) (namespace, resourceType string) {
 	parts := strings.Split(typeName, "::")
 	if len(parts) != 3 {
 		return "", typeName
