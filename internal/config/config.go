@@ -181,6 +181,54 @@ type Provider struct {
 	// non-"v1"-baselined API grows a same-named secondary channel.
 	VersionQualifier string `toml:"version_qualifier"`
 
+	// DataSources is UBI-186's own real schema-serving switch: when true,
+	// this entry serves DATA SOURCES instead of resources -- built from
+	// DiscoverDataSources' own candidates (smithy.BuildDataSources),
+	// never smithy.Build's own resource-CRUD discovery. Only meaningful
+	// for schema_source = "smithy" today (the only source with a real
+	// candidate-discovery mechanism built yet); silently unused by every
+	// other schema source, the same "absent means today's exact
+	// behavior" default every other optional field here already
+	// establishes.
+	//
+	// A data-source-mode entry needs no real wire execution at all --
+	// GetProviderSchema is the only RPC `ubx sdk gen` ever calls, and a
+	// data source's own live read (when one is genuinely needed, e.g.
+	// resolver-time in ubx core) is served through the identical
+	// ReadResource RPC a resource already uses, not a separate
+	// ReadDataSource call -- so target_prefix/auth are never required
+	// here even for a Smithy-sourced entry whose protocol would
+	// otherwise demand them for real resource execution.
+	DataSources bool `toml:"data_sources"`
+
+	// DataSourceNamespace is an optional override for the namespace
+	// segment a data-source-mode entry's own wire type derives from
+	// (dataSourceWireType's own doc comment, internal/smithy/
+	// builddatasource.go) -- absent means "use the candidate's own real,
+	// discovered Namespace unchanged," the overwhelming common case.
+	//
+	// Real, live-confirmed need this exists for (this session's own
+	// full 429-service AWS sweep): a handful of real, permanently
+	// distinct AWS services genuinely share the identical real Smithy
+	// EndpointPrefix/ArnNamespace by design -- OpenSearch's own real
+	// namespace is "es", the same one Elasticsearch Service (its real
+	// predecessor) already uses; EventBridge's is "events", shared with
+	// CloudWatch Events (its own real prior name); similarly Neptune/
+	// DocumentDB both share "rds" with RDS itself. This is not a
+	// derivation bug -- CFN resources never hit it because a CFN
+	// resource's own type key already encodes its distinct CFN
+	// namespace (AWS::OpenSearchService::Domain vs.
+	// AWS::Elasticsearch::Domain), but Smithy's coarser, billing-shaped
+	// namespace concept genuinely conflates them for two SEPARATE real
+	// services' own data-source candidates, a real, confirmed 89-wire-
+	// type collision found live via mergeDynamicProviderGroupMembers'
+	// own fail-loud check (cli/sdk.go, ubiquex) refusing to silently
+	// pick a winner. Set only on the entries in each colliding real pair
+	// whose own service slug should win the disambiguation (e.g.
+	// "opensearch" instead of the shared "es") -- the OTHER member of
+	// the pair is left unset, keeping its own plain, correct namespace.
+	DataSourceNamespace string `toml:"data_source_namespace"`
+
 	// Retry/Timeouts/Resources are UBI-158 Phase 3's own execution-
 	// semantics config -- see execution.go's own doc comment. All
 	// optional: an absent [retry]/[timeouts] table, or an absent
