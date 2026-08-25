@@ -49,6 +49,7 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 
+	"github.com/ubiquex/ubx-provider-dynamic/internal/fetchcache"
 	uschema "github.com/ubiquex/ubx-provider-dynamic/internal/schema"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/typename"
 )
@@ -59,7 +60,13 @@ import (
 // document, batchPath/icons/auth/..., is genuinely irrelevant to schema
 // translation).
 type Document struct {
-	Name             string                  `json:"name"`
+	Name string `json:"name"`
+	// Revision is Google's own real per-document content-version stamp
+	// (a YYYYMMDD-shaped string, confirmed live) -- read only as evidence
+	// that two fetches genuinely differ (fetchcache's own doc comment has
+	// the full, live-confirmed finding this documents), never itself fed
+	// into a typeName or any other hashed value.
+	Revision         string                  `json:"revision"`
 	DiscoveryVersion string                  `json:"discoveryVersion"`
 	BaseURL          string                  `json:"baseUrl"`
 	RootURL          string                  `json:"rootUrl"`
@@ -115,7 +122,29 @@ type rawSchema struct {
 // http(s) URL -- every real, published Google API discovery document is
 // served this way; a bare file path is not a real usage shape for this
 // source, unlike openapi.Load's own local-file convenience).
+//
+// The actual HTTP round trip goes through fetchcache.Get, not directly
+// -- see that package's own doc comment for the real, live-confirmed
+// finding it exists to work around (Google's own live discovery
+// endpoints do not reliably return the same content twice in a row).
+// Disabled by default: with UBX_PROVIDER_DYNAMIC_FETCH_CACHE unset,
+// this is exactly the plain fetch it always was.
 func Load(source string) (*Document, error) {
+	body, err := fetchcache.Get(source, fetchDiscoveryDocument)
+	if err != nil {
+		return nil, err
+	}
+	var doc Document
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, fmt.Errorf("parse discovery document %q: %w", source, err)
+	}
+	if doc.Resources == nil {
+		return nil, fmt.Errorf("discovery document %q: no top-level \"resources\" -- not a real Discovery Document, or an API with nothing CRUD-shaped to offer", source)
+	}
+	return &doc, nil
+}
+
+func fetchDiscoveryDocument(source string) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodGet, source, nil)
 	if err != nil {
 		return nil, fmt.Errorf("discovery document %q: %w", source, err)
@@ -132,14 +161,7 @@ func Load(source string) (*Document, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read discovery document %q: %w", source, err)
 	}
-	var doc Document
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return nil, fmt.Errorf("parse discovery document %q: %w", source, err)
-	}
-	if doc.Resources == nil {
-		return nil, fmt.Errorf("discovery document %q: no top-level \"resources\" -- not a real Discovery Document, or an API with nothing CRUD-shaped to offer", source)
-	}
-	return &doc, nil
+	return body, nil
 }
 
 // Resource is one real, CRUD-shaped resource this package discovered --
