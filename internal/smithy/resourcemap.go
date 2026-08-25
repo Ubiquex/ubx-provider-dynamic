@@ -48,9 +48,47 @@ type ResourceNote struct {
 // per-resource model treats as a single resource) -- is a genuine, if
 // narrower, AWS-wide verb, not invented for this one service.
 var createVerbs = []string{"Create", "Run"}
-var readVerbs = []string{"Get", "Describe"}
+
+// readVerbs originally covered only "Get"/"Describe" (UBI-158 Phase 4).
+// UBI-186 added "List": real, live evidence against all 430 of AWS's own
+// published Smithy service models (github.com/aws/api-models-aws, fetched
+// and parsed whole this session) shows "List" is not a marginal addition
+// -- it roughly doubles the real data-source candidate pool (2,420 to
+// 5,001 raw candidates before filtering) and is the verb AWS's own real
+// list-this-account's-X convention (ListBuckets, ListFunctions,
+// ListQueues) always uses, never Get/Describe.
+//
+// readVerbs itself now includes List, but Discover's own two resource-
+// pairing call sites do NOT pass it directly -- they use
+// bestMatchExistingResource (below), which tries Get/Describe first and
+// only falls back to List if neither matches. Checked live, not assumed:
+// passing plain readVerbs into bestMatch here changed 34 of 1,420 real
+// pre-existing resource read pairings across all 430 models, including a
+// genuine correctness regression -- S3's own Bucket resource silently
+// repointed from GetBucketAcl to ListBuckets, purely because "Buckets"
+// (7 chars) is shorter than "BucketAcl" (9 chars) and bestMatch's own
+// prefix-bucket tiebreak picks the shortest name, with no query-semantics
+// awareness at all. ListBuckets can't even be scoped to one bucket, so
+// that pairing is actively wrong, not just different. List's real job is
+// widening the UNCLAIMED-operation surface for data-source discovery
+// (below), not competing with Get/Describe for existing resource pairing.
+var readVerbs = []string{"Get", "Describe", "List"}
 var updateVerbs = []string{"Update", "Modify", "Put", "Set"}
 var deleteVerbs = []string{"Delete"}
+
+// bestMatchExistingResource is Discover's own resource-pairing entry
+// point: try Get/Describe first (byte-for-byte the pre-UBI-186 behavior,
+// verified live against all 430 real models to change zero existing
+// pairings), and only fall back to including List if neither found a
+// match -- so List can still pair a resource that has no Get/Describe
+// read op at all (a real, if rare, shape), without ever outranking an
+// existing Get/Describe match.
+func bestMatchExistingResource(candidates []string, noun string) (string, bool) {
+	if name, ok := bestMatch(candidates, []string{"Get", "Describe"}, noun); ok {
+		return name, true
+	}
+	return bestMatch(candidates, []string{"List"}, noun)
+}
 
 // Discover groups svc's own real operations into CRUD resources by their
 // shared verb-prefixed naming convention -- see the package doc comment.
@@ -94,7 +132,7 @@ func Discover(doc *Model, svc *Service) ([]Resource, []ResourceNote, error) {
 		noun := rawNoun
 		if strings.HasSuffix(noun, "s") {
 			if singular := strings.TrimSuffix(noun, "s"); !claimed[singular] {
-				if _, ok := bestMatch(opNames, readVerbs, singular); ok {
+				if _, ok := bestMatchExistingResource(opNames, singular); ok {
 					noun = singular
 				}
 			}
@@ -102,7 +140,7 @@ func Discover(doc *Model, svc *Service) ([]Resource, []ResourceNote, error) {
 		if claimed[noun] {
 			continue
 		}
-		readName, readOK := bestMatch(opNames, readVerbs, noun)
+		readName, readOK := bestMatchExistingResource(opNames, noun)
 		if !readOK {
 			notes = append(notes, ResourceNote{OperationID: opByName[name], Detail: "no matching Get/Describe-shaped read operation found for noun " + noun + " -- read-only or create-only surface, not modeled as a resource"})
 			continue
