@@ -67,6 +67,33 @@ func TestBestMatch_FallsBackToAttributesSuffix(t *testing.T) {
 	}
 }
 
+// TestBestMatchExistingResource_PrefersGetDescribeOverList is UBI-186's
+// own regression test for the real bug found live against all 430 real
+// AWS Smithy models before this fix existed: S3's own Bucket resource
+// silently repointing from GetBucketAcl to ListBuckets the moment "List"
+// entered readVerbs, purely because "Buckets" outscores "BucketAcl" on
+// bestMatch's own shortest-name tiebreak within the same prefix bucket --
+// a real correctness regression (ListBuckets can't even be scoped to one
+// bucket), not just a different, equally-valid pairing.
+func TestBestMatchExistingResource_PrefersGetDescribeOverList(t *testing.T) {
+	got, ok := bestMatchExistingResource([]string{"GetBucketAcl", "ListBuckets"}, "Bucket")
+	if !ok || got != "GetBucketAcl" {
+		t.Fatalf("expected GetBucketAcl to win over the shorter ListBuckets, got %q (ok=%v)", got, ok)
+	}
+}
+
+// TestBestMatchExistingResource_FallsBackToListWhenNoGetDescribe covers
+// the real, if rarer, opposite shape: a resource with no Get/Describe
+// read op at all, where List genuinely is the only real read-shaped
+// operation available and should still be usable, just never preferred
+// over an existing Get/Describe match.
+func TestBestMatchExistingResource_FallsBackToListWhenNoGetDescribe(t *testing.T) {
+	got, ok := bestMatchExistingResource([]string{"ListWidgets", "CreateWidget"}, "Widget")
+	if !ok || got != "ListWidgets" {
+		t.Fatalf("expected ListWidgets fallback, got %q (ok=%v)", got, ok)
+	}
+}
+
 func TestDiscover_NoCreateOperations(t *testing.T) {
 	m := &Model{Shapes: map[string]Shape{
 		"x#Svc": {
