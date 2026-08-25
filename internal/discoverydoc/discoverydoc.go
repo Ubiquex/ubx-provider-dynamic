@@ -50,6 +50,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 
 	uschema "github.com/ubiquex/ubx-provider-dynamic/internal/schema"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/typename"
 )
 
 // Document is one real, parsed Discovery Document -- the fields this
@@ -274,11 +275,27 @@ func Discover(doc *Document, providerName string, versionQualifier string) ([]Re
 					// language escape hatch three separate codegen
 					// templates would each need to reimplement identically
 					// (and could silently drift on).
-					typeName := providerName + "_" + uschema.ToSnakeCase(doc.Name)
+					// UBI-185: providerName's own trailing token(s) can
+					// already equal doc.Name's -- a real, live-found case
+					// (google_billingbudgets combined with a doc.Name
+					// that is ITSELF "billingbudgets" produced
+					// google_billingbudgets_billingbudgets_budget instead
+					// of the real, correct google_billingbudgets_budget,
+					// confirmed systematic across every non-Compute GCP
+					// family, not a one-off) -- the exact same overlap
+					// class internal/resourcemap's own Discover() already
+					// found and fixed for Azure/Kubernetes/GitHub/Datadog
+					// (typename.Combine), just never applied here because
+					// this is a structurally separate code path (Discovery
+					// Documents, not OpenAPI/Swagger) with its own,
+					// independent, blind concatenation. Sharing the one
+					// real implementation, not porting a second copy, is
+					// exactly why the bug survived the first fix at all.
+					service := uschema.ToSnakeCase(doc.Name)
 					if versionQualifier != "" {
-						typeName += "_" + versionQualifier
+						service += "_" + versionQualifier
 					}
-					typeName += "_" + noun
+					typeName := typename.Combine(providerName, service, noun)
 					if seenTypeNames[typeName] {
 						notes = append(notes, Note{Path: pathStr, Detail: fmt.Sprintf("resource type name %q already claimed by another resource path -- skipped rather than disambiguated", typeName)})
 					} else {
