@@ -52,8 +52,16 @@ import (
 type Server struct {
 	ProviderName string
 	Resources    map[string]*smithy.BuiltResource
-	Model        *smithy.Model
-	Wire         *wireexec.Client
+	// DataSources is UBI-186's own real data-source-serving field --
+	// populated only by a [dynamic_providers.<name>] entry with
+	// data_sources = true (main.go's own dispatch), always nil/empty
+	// for an ordinary resource-serving entry (Resources above,
+	// unaffected). A real entry sets exactly one of Resources/
+	// DataSources, never both -- see main.go's own doc comment for why
+	// a single entry stays single-purpose.
+	DataSources map[string]*smithy.BuiltDataSource
+	Model       *smithy.Model
+	Wire        *wireexec.Client
 }
 
 var plannedPrivateMarker = []byte("ubx-provider-dynamic-smithy-planned")
@@ -98,7 +106,18 @@ func (s *Server) GetMetadata(context.Context, *tfprotov6.GetMetadataRequest) (*t
 	for _, name := range names {
 		meta = append(meta, tfprotov6.ResourceMetadata{TypeName: name})
 	}
-	return &tfprotov6.GetMetadataResponse{Resources: meta}, nil
+
+	dsNames := make([]string, 0, len(s.DataSources))
+	for name := range s.DataSources {
+		dsNames = append(dsNames, name)
+	}
+	sort.Strings(dsNames)
+	dsMeta := make([]tfprotov6.DataSourceMetadata, 0, len(dsNames))
+	for _, name := range dsNames {
+		dsMeta = append(dsMeta, tfprotov6.DataSourceMetadata{TypeName: name})
+	}
+
+	return &tfprotov6.GetMetadataResponse{Resources: meta, DataSources: dsMeta}, nil
 }
 
 func (s *Server) GetProviderSchema(context.Context, *tfprotov6.GetProviderSchemaRequest) (*tfprotov6.GetProviderSchemaResponse, error) {
@@ -106,9 +125,14 @@ func (s *Server) GetProviderSchema(context.Context, *tfprotov6.GetProviderSchema
 	for name, rt := range s.Resources {
 		resourceSchemas[name] = rt.Schema
 	}
+	dataSourceSchemas := make(map[string]*tfprotov6.Schema, len(s.DataSources))
+	for name, ds := range s.DataSources {
+		dataSourceSchemas[name] = ds.Schema
+	}
 	return &tfprotov6.GetProviderSchemaResponse{
-		Provider:        &tfprotov6.Schema{Version: 1, Block: &tfprotov6.SchemaBlock{}},
-		ResourceSchemas: resourceSchemas,
+		Provider:          &tfprotov6.Schema{Version: 1, Block: &tfprotov6.SchemaBlock{}},
+		ResourceSchemas:   resourceSchemas,
+		DataSourceSchemas: dataSourceSchemas,
 	}, nil
 }
 
@@ -406,8 +430,16 @@ func (s *Server) ValidateDataResourceConfig(context.Context, *tfprotov6.Validate
 	return &tfprotov6.ValidateDataResourceConfigResponse{Diagnostics: diagError("not supported", "this provider defines no data sources")}, nil
 }
 
+// ReadDataSource is deliberately never real, even once s.DataSources is
+// populated: a real, live data-source read goes through the identical
+// ReadResource RPC below, keyed by the data source's own WireType, not
+// this RPC -- confirmed directly against ubx core's own
+// core/scan.go/core/resolver's own real read path, which never calls
+// ReadDataSource on any provider. This stub stays a real, honest refusal
+// rather than dead code implementing a Terraform RPC nothing in this
+// pipeline ever invokes.
 func (s *Server) ReadDataSource(context.Context, *tfprotov6.ReadDataSourceRequest) (*tfprotov6.ReadDataSourceResponse, error) {
-	return &tfprotov6.ReadDataSourceResponse{Diagnostics: diagError("not supported", "this provider defines no data sources")}, nil
+	return &tfprotov6.ReadDataSourceResponse{Diagnostics: diagError("not supported", "data source reads go through ReadResource, keyed by WireType, not this RPC")}, nil
 }
 
 func (s *Server) CallFunction(context.Context, *tfprotov6.CallFunctionRequest) (*tfprotov6.CallFunctionResponse, error) {

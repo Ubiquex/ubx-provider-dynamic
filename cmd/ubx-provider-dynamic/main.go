@@ -23,6 +23,7 @@ import (
 	"github.com/ubiquex/ubx-provider-dynamic/internal/discoverydoc"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/dynserver"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/openapi"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/resourcemap"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/restexec"
 	uschema "github.com/ubiquex/ubx-provider-dynamic/internal/schema"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/smithy"
@@ -168,6 +169,76 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("find Smithy service: %w", err)
 		}
+
+		// UBI-186's own real "later step" -- see smithy.BuildDataSources'
+		// own doc comment -- a data-source-mode entry never falls through
+		// to the resource path below: it's schema-only (GetProviderSchema
+		// is the only real RPC `ubx sdk gen` calls), needs no real wire
+		// execution/auth/target_prefix at all, and returns before any of
+		// that gets built.
+		if cfg.DataSources {
+			builtDS, dsNotes, err := smithy.BuildDataSources(smithyDoc, wireName, svc, cfg.DataSourceNamespace)
+			if err != nil {
+				return fmt.Errorf("build Smithy data source schemas: %w", err)
+			}
+			for _, n := range dsNotes {
+				fmt.Fprintln(os.Stderr, "ubx-provider-dynamic:", n)
+			}
+			// Real, deliberate divergence from the resource branch's own
+			// identical-shaped check just below (len(built) == 0 is a
+			// hard error there): zero real, unclaimed read-shaped
+			// operations is a normal, expected outcome for plenty of
+			// real, small AWS services -- every one of their own real
+			// Get/Describe/List operations already claimed as some
+			// resource's own ReadOperationID, nothing left over -- not a
+			// sign anything is wrong the way zero CRUD-shaped resources
+			// at all would be. Found live, not assumed: this session's
+			// own real, full 430-service group sweep hard-failed on the
+			// very first small service that legitimately had none
+			// (account), aborting the ENTIRE group launch
+			// (mergeDynamicProviderGroupMembers' own fail-loud-on-one-
+			// member-error behavior, ubiquex's cli/sdk.go) before this
+			// fix. Serves an empty DataSources map instead -- a real,
+			// honest "this service has none," not a launch failure.
+			if len(builtDS) == 0 {
+				fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [smithy] no real, unclaimed read-shaped operations discovered in %s -- serving zero data sources, not an error\n", cfg.SchemaURL)
+			} else {
+				fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [smithy] discovered %d data source(s) from %s (protocol: %s)\n", len(builtDS), cfg.SchemaURL, svc.Protocol)
+			}
+
+			if *dumpSignalsFlag {
+				fmt.Fprintln(os.Stderr, "ubx-provider-dynamic: --dump-signals: not yet implemented for schema_source = \"smithy\" data sources -- emitting an empty, real result, not an error")
+				return json.NewEncoder(os.Stdout).Encode(map[string]map[string]*uschema.FieldSignal{})
+			}
+
+			if *dumpNamespacesFlag {
+				// BuiltDataSource.RealNamespace, not the raw
+				// DataSourceCandidate.Namespace -- real, live-found bug
+				// (this session's own full 429-service AWS sweep) fixed
+				// here: reporting the raw, un-sanitized value let a real
+				// hyphen+dot-carrying namespace (a2i-runtime.sagemaker)
+				// flow straight into an invalid generated Go package
+				// name. RealNamespace is the exact same sanitized string
+				// already folded into each entry's own WireType, so
+				// ir.ServiceAndLocalNameForType's own token-match logic
+				// (ubiquex) actually finds it.
+				out := make(map[string]string, len(builtDS))
+				for wireType, ds := range builtDS {
+					out[wireType] = ds.RealNamespace
+				}
+				return json.NewEncoder(os.Stdout).Encode(out)
+			}
+
+			server := &smithyserver.Server{
+				ProviderName: name,
+				DataSources:  builtDS,
+				Model:        smithyDoc,
+			}
+			return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
+				return server
+			})
+		}
+
 		built, notes, err := smithy.Build(smithyDoc, wireName, smithy.DefaultKnownNames())
 		if err != nil {
 			return fmt.Errorf("build Smithy resource schemas: %w", err)
@@ -265,6 +336,77 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("load discovery document: %w", err)
 		}
+
+		// UBI-186's own real "later step" for discoverydoc -- see
+		// discoverydoc.BuildDataSources' own doc comment. Mirrors the
+		// Smithy data-source branch above: schema-only, no real wire
+		// execution needed at all, returns before any of that gets
+		// built.
+		if cfg.DataSources {
+			// wireName, not bare name -- real, live-found bug this
+			// session: the resource branch below uses bare name because
+			// every existing real [dynamic_providers.google_<api>]
+			// entry's own table key already IS its real, correct
+			// provider identity (no separate data-source-mode sibling
+			// entry existed to need a distinct key from). A
+			// data-source-mode entry needs a TOML key DISTINCT from its
+			// own resource-mode sibling (TOML tables require unique
+			// keys) -- using that distinct key as providerName directly
+			// leaks it into the wire type's own second token
+			// (ir.ServiceAndLocalNameForType's own mechanical fallback
+			// split reads tokens[1] as "service" positionally, with no
+			// awareness of what the token actually means), corrupting
+			// every data source's own derived service/local split. Real,
+			// live-verified against accesscontextmanager: a
+			// "google_data_accesscontextmanager" table key produced
+			// wire type "google_data_accesscontextmanager_operation",
+			// mis-splitting as service="data" instead of the real,
+			// intended "accesscontextmanager". wireName lets the config
+			// set wire_name = "google_accesscontextmanager" (the real,
+			// correct identity, matching the resource sibling's own
+			// table key exactly) independently of whatever distinct key
+			// TOML uniqueness requires.
+			builtDS, dsNotes, err := discoverydoc.BuildDataSources(ddoc, wireName, cfg.VersionQualifier)
+			if err != nil {
+				return fmt.Errorf("build discovery-doc data source schemas: %w", err)
+			}
+			for _, n := range dsNotes {
+				fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [discoverydoc] %s: %s\n", n.Path, n.Detail)
+			}
+			if len(builtDS) == 0 {
+				// Real, expected outcome for plenty of small real APIs
+				// (every GET already claimed by a resource) -- see the
+				// Smithy branch's own identical, real, live-found
+				// finding above; not an error.
+				fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [discoverydoc] no real, unclaimed GET operations discovered in %s -- serving zero data sources, not an error\n", cfg.SchemaURL)
+			} else {
+				fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [discoverydoc] discovered %d data source(s) from %s\n", len(builtDS), cfg.SchemaURL)
+			}
+
+			if *dumpSignalsFlag {
+				fmt.Fprintln(os.Stderr, "ubx-provider-dynamic: --dump-signals: not yet implemented for schema_source = \"discovery_docs\" data sources -- emitting an empty, real result, not an error")
+				return json.NewEncoder(os.Stdout).Encode(map[string]map[string]*uschema.FieldSignal{})
+			}
+			if *dumpNamespacesFlag {
+				// Identical real reason the resource branch below
+				// returns empty here: every discoverydoc-sourced wire
+				// type (data source or resource alike) already carries
+				// its own real service identity directly in the wire
+				// type itself (typename.Combine) -- nothing for this
+				// override to add.
+				return json.NewEncoder(os.Stdout).Encode(map[string]string{})
+			}
+
+			dsResources := make(map[string]*dynserver.ResourceType, len(builtDS))
+			for typeName, ds := range builtDS {
+				dsResources[typeName] = &dynserver.ResourceType{Schema: ds.Schema}
+			}
+			server := &dynserver.Server{ProviderName: name, DataSources: dsResources}
+			return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
+				return server
+			})
+		}
+
 		built, notes, err := discoverydoc.Build(ddoc, name, cfg.VersionQualifier)
 		if err != nil {
 			return fmt.Errorf("build resource schemas: %w", err)
@@ -378,6 +520,46 @@ func run() error {
 	doc, err := openapi.Load(cfg.SchemaURL)
 	if err != nil {
 		return fmt.Errorf("load OpenAPI spec: %w", err)
+	}
+
+	// UBI-186's own real "later step" for the openapi source (Kubernetes/
+	// GitHub/Datadog) -- see resourcemap.BuildDataSources' own doc
+	// comment. Mirrors the Smithy/discoverydoc data-source branches
+	// above: schema-only, no real wire execution needed, returns before
+	// any of that gets built. wireName (not bare name), matching the
+	// resource branch's own dynserver.Build(doc, wireName, cfg) call
+	// just below -- see the discoverydoc branch's own doc comment for
+	// the real, live-found bug using bare name here would reproduce.
+	if cfg.DataSources {
+		builtDS, dsNotes, err := resourcemap.BuildDataSources(doc, wireName)
+		if err != nil {
+			return fmt.Errorf("build data source schemas: %w", err)
+		}
+		for _, n := range dsNotes {
+			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [openapi] %s: %s\n", n.Path, n.Detail)
+		}
+		if len(builtDS) == 0 {
+			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [openapi] no real, unclaimed GET operations discovered in %s -- serving zero data sources, not an error\n", cfg.SchemaURL)
+		} else {
+			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [openapi] discovered %d data source(s) from %s\n", len(builtDS), cfg.SchemaURL)
+		}
+
+		if *dumpSignalsFlag {
+			fmt.Fprintln(os.Stderr, "ubx-provider-dynamic: --dump-signals: not yet implemented for schema_source = \"openapi\" data sources -- emitting an empty, real result, not an error")
+			return json.NewEncoder(os.Stdout).Encode(map[string]map[string]*uschema.FieldSignal{})
+		}
+		if *dumpNamespacesFlag {
+			return json.NewEncoder(os.Stdout).Encode(map[string]string{})
+		}
+
+		dsResources := make(map[string]*dynserver.ResourceType, len(builtDS))
+		for typeName, ds := range builtDS {
+			dsResources[typeName] = &dynserver.ResourceType{Schema: ds.Schema}
+		}
+		server := &dynserver.Server{ProviderName: name, DataSources: dsResources}
+		return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
+			return server
+		})
 	}
 
 	resources, notes, err := dynserver.Build(doc, wireName, cfg)

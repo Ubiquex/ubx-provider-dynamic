@@ -57,6 +57,52 @@ func (c *Converter) note(shapeID, format string, args ...any) {
 // never calls Convert on it at all (fillEnum reads the trait directly).
 const unitShapeID = "smithy.api#Unit"
 
+// preludeSimpleShapes maps every one of Smithy's own built-in "prelude"
+// simple-type shape IDs (the smithy.api namespace's own real, always-
+// implicitly-available primitives -- a member can target
+// "smithy.api#String" directly without any service model ever declaring
+// it, exactly like unitShapeID above already handles Unit specifically)
+// to the same shape.Type string switched on below. Real, live-found gap
+// (UBI-186): resource translation (build.go's own Build) never actually
+// exercised this -- every real AWS resource's own create/read shape this
+// package has translated so far happened to reference only service-local
+// wrapped string/integer/etc. shapes, never a bare prelude primitive
+// directly -- but real data-source discovery (builddatasource.go) hits
+// it immediately and often: a real, live full-corpus AWS Smithy sweep
+// this session failed on the very first service (accessanalyzer)
+// with "unresolved shape reference \"smithy.api#String\"" before this
+// fix, confirming this is a genuine, previously-latent gap, not a
+// hypothetical. c.doc.Shapes never actually contains these -- a real
+// service model has no reason to redeclare its own copy of a prelude
+// shape it can already reference directly -- so this table is consulted
+// only as a fallback, after a real doc.Shapes lookup fails, never
+// shadowing a genuine service-declared shape of the same name (which
+// could not exist anyway: Smithy's own namespacing keeps "smithy.api#X"
+// permanently reserved from every service's own "com.amazonaws.<svc>#X"
+// namespace).
+var preludeSimpleShapes = map[string]string{
+	"smithy.api#Blob":             "blob",
+	"smithy.api#Boolean":          "boolean",
+	"smithy.api#PrimitiveBoolean": "boolean",
+	"smithy.api#String":           "string",
+	"smithy.api#Timestamp":        "timestamp",
+	"smithy.api#Byte":             "byte",
+	"smithy.api#PrimitiveByte":    "byte",
+	"smithy.api#Short":            "short",
+	"smithy.api#PrimitiveShort":   "short",
+	"smithy.api#Integer":          "integer",
+	"smithy.api#PrimitiveInteger": "integer",
+	"smithy.api#Long":             "long",
+	"smithy.api#PrimitiveLong":    "long",
+	"smithy.api#Float":            "float",
+	"smithy.api#PrimitiveFloat":   "float",
+	"smithy.api#Double":           "double",
+	"smithy.api#PrimitiveDouble":  "double",
+	"smithy.api#BigInteger":       "bigInteger",
+	"smithy.api#BigDecimal":       "bigDecimal",
+	"smithy.api#Document":         "document",
+}
+
 // Convert resolves shapeID into an *openapi3.Schema, recursing into
 // referenced shapes as needed.
 func (c *Converter) Convert(shapeID string) (*openapi3.Schema, error) {
@@ -68,7 +114,11 @@ func (c *Converter) Convert(shapeID string) (*openapi3.Schema, error) {
 	}
 	shape, ok := c.doc.Shapes[shapeID]
 	if !ok {
-		return nil, fmt.Errorf("unresolved shape reference %q", shapeID)
+		if kind, isPrelude := preludeSimpleShapes[shapeID]; isPrelude {
+			shape = Shape{Type: kind}
+		} else {
+			return nil, fmt.Errorf("unresolved shape reference %q", shapeID)
+		}
 	}
 
 	s := &openapi3.Schema{}
