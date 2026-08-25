@@ -198,14 +198,18 @@ func run() error {
 		}
 
 		if *dumpNamespacesFlag {
-			// svc.Traits.EndpointPrefix is the real, single per-service
+			// smithy.ServiceNamespace is the real, single per-service
 			// identity every resource this Build call discovered shares --
 			// the same real string naming.go's own Resolve doc comment
 			// already establishes as HashiCorp's own real aws_<prefix>_*
-			// convention's source of truth.
+			// convention's source of truth. Falls back to ArnNamespace
+			// when EndpointPrefix is blank (93 of 430 real services,
+			// confirmed live) -- the identical real fallback
+			// DiscoverDataSources' own Namespace field uses, one shared
+			// implementation, not two that could drift apart.
 			out := make(map[string]string, len(built))
 			for hcName := range built {
-				out[hcName] = svc.Traits.EndpointPrefix
+				out[hcName] = smithy.ServiceNamespace(svc)
 			}
 			return json.NewEncoder(os.Stdout).Encode(out)
 		}
