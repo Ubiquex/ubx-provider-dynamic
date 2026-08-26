@@ -25,7 +25,7 @@ import (
 //
 // oldSchemas is nil for a provider's first-ever snapshot (prev == nil);
 // NextVersion's own doc comment covers why that case always yields
-// "0.1.0" regardless of level, so the level computed in that branch is
+// "1.0.0" regardless of level, so the level computed in that branch is
 // never actually load-bearing -- kept as an explicit, mirrored branch
 // (not relying on DiffLevel(nil, newSchemas) happening to behave) to
 // match GenerateOpenAPI's own original, already-proven structure exactly.

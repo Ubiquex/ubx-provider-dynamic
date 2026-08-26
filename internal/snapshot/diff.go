@@ -265,15 +265,25 @@ var semverPattern = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)$`)
 // string, this package's own real, closed semver shape -- no
 // prerelease/build-metadata suffix support, since a provider snapshot's
 // own version has no real use for either) and returns the real, next
-// version. current="" (no prior snapshot at all) always returns
-// "0.1.0" regardless of level -- a real, deliberate choice: a
-// first-ever snapshot is real, new, unreleased content, not yet a 1.0
-// promise of stability, and DiffLevel itself can never return Major for
-// a nil old (see its own doc comment), so callers don't need to special-
-// case level here too.
+// version. current="" (no prior snapshot at all) always returns "1.0.0"
+// regardless of level -- DiffLevel itself can never return Major for a
+// nil old (see its own doc comment), so callers don't need to
+// special-case level here too.
+//
+// UBI-182 correction: this used to return "0.1.0" for a first-ever
+// snapshot, reasoned as "real, new, unreleased content, not yet a 1.0
+// promise of stability." That reasoning is sound for a LIBRARY, where
+// 0.x genuinely signals "the API may still change out from under you."
+// It does not fit here: a schema snapshot is a frozen copy of a
+// vendor's own API surface, and its version communicates what changed
+// in THAT surface (DiffLevel's own real diff), not how mature this
+// artifact is. There is no pre-1.0 phase for a thing that is already
+// complete the moment it's first published -- matching this org's own
+// real, already-established convention for every ubx-sdk-* repo's own
+// first real publish (1.0.0, never 0.x).
 func NextVersion(current string, level ChangeLevel) (string, error) {
 	if current == "" {
-		return "0.1.0", nil
+		return "1.0.0", nil
 	}
 	m := semverPattern.FindStringSubmatch(current)
 	if m == nil {
