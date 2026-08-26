@@ -70,22 +70,41 @@ var dumpSignalsFlag = flag.Bool("dump-signals", false, "print real per-resource 
 // out-of-scope source.
 var dumpNamespacesFlag = flag.Bool("dump-namespaces", false, "print real per-resource-type service-identity data (CloudFormation's own namespace field, Smithy's own endpointPrefix trait) as JSON to stdout, instead of serving a tfplugin6 provider, and exit")
 
-// generateSnapshotFlag is a real, plain CLI mode mirroring
-// dumpSignalsFlag's own established shape: fetch this [dynamic_providers.
-// <name>] entry's real, live schema_url ONE time, verify it needs no
-// further network access, write a real internal/snapshot.Snapshot to the
-// given path, and exit -- never serves a tfplugin6 provider. UBI-182:
-// wired to all four real schema sources (was openapi only) --
-// runGenerateSnapshot's own switch dispatches to the source-appropriate
-// Generate<Source>.
-var generateSnapshotFlag = flag.String("generate-snapshot", "", "generate a real, frozen schema snapshot to this path instead of serving a tfplugin6 provider, and exit")
+// generateSnapshotGroupFlag is a real, plain CLI mode mirroring
+// dumpSignalsFlag's own established shape: fetch every real
+// [dynamic_providers.<name>] member group-members names, ONE real time
+// each, verify each needs no further network access, and write ONE real,
+// frozen, whole-group internal/snapshot.Snapshot (its own Members map,
+// UBI-182's container format) to the given path -- never serves a
+// tfplugin6 provider. UBI-182: replaces the old single-member
+// --generate-snapshot entirely -- a provider's real published identity
+// (ubiquex's own [dynamic_provider_groups.<x>]'s repo_name) is a GROUP,
+// almost never one table, confirmed directly against the live config
+// before this change (see internal/snapshot's own package doc comment).
+var generateSnapshotGroupFlag = flag.String("generate-snapshot-group", "", "generate a real, frozen GROUP schema snapshot to this DIRECTORY (manifest.json plus one members/<name>.json per real member -- SaveSplit) instead of serving a tfplugin6 provider, and exit -- requires --group-repo-name and --group-members")
 
-// prevSnapshotFlag is generateSnapshotFlag's own real, optional sibling:
-// the PRIOR real snapshot (if any) to diff the freshly-fetched spec
-// against, so the new snapshot's own Version is mechanically derived
-// (internal/snapshot.DiffLevel/NextVersion) rather than left for a human
-// to guess. Omit for a provider's first-ever snapshot.
-var prevSnapshotFlag = flag.String("prev-snapshot", "", "path to the prior real snapshot to diff against when deriving the new one's own version (omit for a first-ever snapshot)")
+// groupRepoNameFlag is generateSnapshotGroupFlag's own required sibling:
+// the group's own real published identity (ubiquex's own
+// [dynamic_provider_groups.<x>]'s own repo_name, e.g. "kubernetes",
+// "aws") -- becomes the written Snapshot's own Provider field, matching
+// the real github.com/ubiquex/ubx-schema-<Provider> repo this snapshot
+// IS.
+var groupRepoNameFlag = flag.String("group-repo-name", "", "the group's own real published identity (e.g. \"kubernetes\") -- required with --generate-snapshot-group")
+
+// groupMembersFlag is generateSnapshotGroupFlag's own other required
+// sibling: a comma-separated list of real [dynamic_providers.<name>]
+// table names this group bundles (e.g. "kubernetes,kubernetes_ds") --
+// each name is looked up in THIS process's own .ubx/config (config.Load,
+// not LoadNamed -- every named member needs its own real table, not just
+// one active name).
+var groupMembersFlag = flag.String("group-members", "", "comma-separated [dynamic_providers.<name>] table names this group bundles -- required with --generate-snapshot-group")
+
+// prevSnapshotFlag is generateSnapshotGroupFlag's own real, optional
+// sibling: the PRIOR real group container (if any) to diff the freshly-
+// fetched members against, so the new group's own Version is
+// mechanically derived (internal/snapshot.AssembleGroup) rather than
+// left for a human to guess. Omit for a group's first-ever snapshot.
+var prevSnapshotFlag = flag.String("prev-snapshot", "", "DIRECTORY of the prior real GROUP snapshot (manifest.json plus members/) to diff against when deriving the new one's own version (omit for a group's first-ever snapshot)")
 
 // nameEnvVar is how a launched process learns which [dynamic_providers.<name>]
 // table in .ubx/config is its own -- see internal/config's own doc comment
@@ -118,6 +137,14 @@ func main() {
 
 func run() error {
 	flag.Parse()
+
+	// Group generation is checked BEFORE the single-name requirement
+	// below: it bundles MULTIPLE real [dynamic_providers.<name>] tables
+	// into one group container, so it has no single active
+	// UBX_DYNAMIC_PROVIDER_NAME to require at all.
+	if *generateSnapshotGroupFlag != "" {
+		return runGenerateSnapshotGroup(*generateSnapshotGroupFlag, *groupRepoNameFlag, *groupMembersFlag, *prevSnapshotFlag)
+	}
 
 	name := os.Getenv(nameEnvVar)
 	if name == "" {
@@ -163,10 +190,6 @@ func run() error {
 	wireName := name
 	if cfg.WireName != "" {
 		wireName = cfg.WireName
-	}
-
-	if *generateSnapshotFlag != "" {
-		return runGenerateSnapshot(name, cfg, *generateSnapshotFlag, *prevSnapshotFlag)
 	}
 
 	// UBI-158 Phase 4 Checkpoint 2: real per-protocol wire execution
@@ -631,188 +654,243 @@ func run() error {
 
 // runServeSnapshot is snapshotPathEnvVar's own real implementation -- the
 // literal fix for the problem this whole package exists to solve. Loads
-// a real, already-generated Snapshot from snapPath (snapshot.Load
+// a real, already-generated GROUP Snapshot from snapPath (snapshot.Load
 // already runs CheckFormat, so an out-of-range schema_format refuses
-// loudly right here, before any RPC serving begins), re-derives its real
-// resource map via the source-appropriate Load<Source> (zero network --
-// the same real translation the live-fetch path runs, just fed frozen
-// RawSpec bytes), and serves it through the IDENTICAL real server
-// construction run()'s own matching live-fetch branch uses for that
-// source -- UBI-182 generalized this from openapi-only to all four,
-// since each source's own real execution model genuinely differs
-// (dynserver.Server for openapi/discoverydoc, cfnserver.Server for
-// cloudformation, smithyserver.Server for smithy -- confirmed by reading
-// each live-fetch branch's own server construction, not assumed
+// loudly right here, before any RPC serving begins), picks THIS
+// process's own real member back out of the container by name (the
+// SAME name every launch already receives via UBX_DYNAMIC_PROVIDER_NAME
+// -- Snapshot.Member's own doc comment), re-derives that member's real
+// resource-or-data-source map via the source-and-mode-appropriate
+// Load<Source>Member (zero network -- the same real translation the
+// live-fetch path runs, just fed frozen RawSpec bytes), and serves it
+// through the IDENTICAL real server construction run()'s own matching
+// live-fetch branch uses for that source+mode combination (confirmed by
+// reading each live-fetch branch's own server construction, not assumed
 // uniform). The only real difference from each source's own live-fetch
-// branch is where Auth/BaseURL/Retry/Resources/WireName/TargetPrefix
-// come from (the snapshot's own fields, not a live .ubx/config fetch).
+// branch is where Auth/BaseURL/Retry/WireName/TargetPrefix come from
+// (the member's own fields, not a live .ubx/config fetch).
 func runServeSnapshot(name, snapPath string) error {
-	snap, err := snapshot.Load(snapPath)
+	snap, err := snapshot.LoadSplit(snapPath)
 	if err != nil {
 		return fmt.Errorf("load snapshot %s: %w", snapPath, err)
 	}
+	member, err := snap.Member(name)
+	if err != nil {
+		return fmt.Errorf("snapshot %s: %w", snapPath, err)
+	}
 
-	authenticator, err := auth.Build(snap.Auth.Type, snap.Auth.Params)
+	authenticator, err := auth.Build(member.Auth.Type, member.Auth.Params)
 	if err != nil {
 		return fmt.Errorf("build authenticator: %w", err)
 	}
-	retryPolicy, err := dynserver.ResolveRetryPolicy(snap.Retry)
+	retryPolicy, err := dynserver.ResolveRetryPolicy(member.Retry)
 	if err != nil {
 		return fmt.Errorf("resolve retry policy: %w", err)
 	}
-	restClient := restexec.NewClient(snap.BaseURL, authenticator)
+	restClient := restexec.NewClient(member.BaseURL, authenticator)
 	restClient.Retry = retryPolicy
 
 	var server tfprotov6.ProviderServer
-	switch snap.SchemaSource {
+	switch member.SchemaSource {
 	case snapshot.SchemaSourceOpenAPI:
-		resources, err := snapshot.LoadOpenAPI(name, snap)
+		resources, dataSources, err := snapshot.LoadOpenAPIMember(name, member)
 		if err != nil {
-			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
 		}
-		if len(resources) == 0 {
-			return fmt.Errorf("no CRUD-shaped resources in snapshot %s -- nothing to serve", snapPath)
+		switch member.Mode {
+		case snapshot.ModeResource:
+			if len(resources) == 0 {
+				return fmt.Errorf("no CRUD-shaped resources for member %q in snapshot %s -- nothing to serve", name, snapPath)
+			}
+			server = &dynserver.Server{ProviderName: name, Resources: resources, Client: restClient}
+		case snapshot.ModeDataSource:
+			// Schema-only, matching run()'s own real openapi
+			// data-source live-fetch branch exactly -- no Client at
+			// all, GetProviderSchema is the only real RPC this ever
+			// answers.
+			server = &dynserver.Server{ProviderName: name, DataSources: dataSourcesToResourceTypes(dataSources)}
 		}
-		server = &dynserver.Server{ProviderName: name, Resources: resources, Client: restClient}
 
 	case snapshot.SchemaSourceDiscoveryDoc:
-		// Schema-layer only, matching run()'s own real discoverydoc
-		// live-fetch branch exactly (that branch's own doc comment:
-		// dynserver.Server is reused UNCHANGED for GetProviderSchema,
-		// since that RPC reads only ResourceType.Schema -- real REST
-		// wire execution against a live GCP endpoint is a separate,
-		// deliberately-unattempted future checkpoint, not something
-		// this snapshot path invents beyond what the live path already
-		// does).
-		built, err := snapshot.LoadDiscoveryDoc(snap)
+		// Schema-layer only for BOTH modes, matching run()'s own real
+		// discoverydoc live-fetch branches exactly (that branch's own
+		// doc comment: dynserver.Server is reused UNCHANGED for
+		// GetProviderSchema, since that RPC reads only
+		// ResourceType.Schema -- real REST wire execution against a
+		// live GCP endpoint is a separate, deliberately-unattempted
+		// future checkpoint).
+		resources, dataSources, err := snapshot.LoadDiscoveryDocMember(name, member)
 		if err != nil {
-			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
 		}
-		if len(built) == 0 {
-			return fmt.Errorf("no CRUD-shaped resources in snapshot %s -- nothing to serve", snapPath)
+		switch member.Mode {
+		case snapshot.ModeResource:
+			if len(resources) == 0 {
+				return fmt.Errorf("no CRUD-shaped resources for member %q in snapshot %s -- nothing to serve", name, snapPath)
+			}
+			built := make(map[string]*dynserver.ResourceType, len(resources))
+			for typeName, br := range resources {
+				built[typeName] = &dynserver.ResourceType{Schema: br.Schema}
+			}
+			server = &dynserver.Server{ProviderName: name, Resources: built}
+		case snapshot.ModeDataSource:
+			out := make(map[string]*dynserver.ResourceType, len(dataSources))
+			for typeName, ds := range dataSources {
+				out[typeName] = &dynserver.ResourceType{Schema: ds.Schema}
+			}
+			server = &dynserver.Server{ProviderName: name, DataSources: out}
 		}
-		resources := make(map[string]*dynserver.ResourceType, len(built))
-		for typeName, br := range built {
-			resources[typeName] = &dynserver.ResourceType{Schema: br.Schema}
-		}
-		server = &dynserver.Server{ProviderName: name, Resources: resources}
 
 	case snapshot.SchemaSourceCloudFormation:
-		built, err := snapshot.LoadCloudFormation(snap)
+		// LoadCloudFormationMember itself already refuses ModeDataSource
+		// (CloudFormation has no such concept) -- nothing further to
+		// check here, just propagate that fail-loud error.
+		built, err := snapshot.LoadCloudFormationMember(name, member)
 		if err != nil {
-			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
 		}
 		if len(built) == 0 {
-			return fmt.Errorf("no resources in snapshot %s -- nothing to serve", snapPath)
+			return fmt.Errorf("no resources for member %q in snapshot %s -- nothing to serve", name, snapPath)
 		}
 		server = cfnserver.New(name, built, &ccapi.Client{Rest: restClient})
 
 	case snapshot.SchemaSourceSmithy:
+		resources, dataSources, err := snapshot.LoadSmithyMember(name, member)
+		if err != nil {
+			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
+		}
 		var smithyDoc smithy.Model
-		if err := json.Unmarshal(snap.RawSpec, &smithyDoc); err != nil {
-			return fmt.Errorf("parse snapshot's own raw_spec: %w", err)
+		if err := json.Unmarshal(member.RawSpec, &smithyDoc); err != nil {
+			return fmt.Errorf("parse member %q's own raw_spec: %w", name, err)
 		}
-		svc, err := smithy.FindService(&smithyDoc)
-		if err != nil {
-			return fmt.Errorf("find Smithy service in snapshot %s: %w", snapPath, err)
+		switch member.Mode {
+		case snapshot.ModeResource:
+			if len(resources) == 0 {
+				return fmt.Errorf("no CRUD-shaped resources for member %q in snapshot %s -- nothing to serve", name, snapPath)
+			}
+			svc, err := smithy.FindService(&smithyDoc)
+			if err != nil {
+				return fmt.Errorf("find Smithy service for member %q in snapshot %s: %w", name, snapPath, err)
+			}
+			wireClient := &wireexec.Client{Rest: restClient, Model: &smithyDoc, Service: svc, TargetPrefix: member.TargetPrefix}
+			server = &smithyserver.Server{ProviderName: name, Resources: resources, Model: &smithyDoc, Wire: wireClient}
+		case snapshot.ModeDataSource:
+			// Schema-only, matching run()'s own real Smithy
+			// data-source live-fetch branch exactly -- no Wire client
+			// at all.
+			server = &smithyserver.Server{ProviderName: name, DataSources: dataSources, Model: &smithyDoc}
 		}
-		built, err := snapshot.LoadSmithy(snap)
-		if err != nil {
-			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
-		}
-		if len(built) == 0 {
-			return fmt.Errorf("no CRUD-shaped resources in snapshot %s -- nothing to serve", snapPath)
-		}
-		wireClient := &wireexec.Client{Rest: restClient, Model: &smithyDoc, Service: svc, TargetPrefix: snap.TargetPrefix}
-		server = &smithyserver.Server{ProviderName: name, Resources: built, Model: &smithyDoc, Wire: wireClient}
 
 	default:
-		return fmt.Errorf("snapshot %s: schema_source %q is not a real, known schema source", snapPath, snap.SchemaSource)
+		return fmt.Errorf("snapshot %s: member %q's own schema_source %q is not a real, known schema source", snapPath, name, member.SchemaSource)
 	}
 
-	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: serving %q from real snapshot %s (version %s, schema_format %d), zero network at schema resolution time\n",
-		name, snapPath, snap.Version, snap.SchemaFormat)
+	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: serving %q (%s, %s) from real group snapshot %s (group %s, version %s, schema_format %d), zero network at schema resolution time\n",
+		name, member.SchemaSource, member.Mode, snapPath, snap.Provider, snap.Version, snap.SchemaFormat)
 
 	return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
 		return server
 	})
 }
 
+// dataSourcesToResourceTypes adapts resourcemap.BuiltDataSource's own
+// shape into dynserver.Server.DataSources' own map[string]*ResourceType
+// -- the identical real adaptation run()'s own openapi data-source
+// live-fetch branch already does inline, factored out here since
+// runServeSnapshot's own openapi branch needs the same conversion.
+func dataSourcesToResourceTypes(dataSources map[string]*resourcemap.BuiltDataSource) map[string]*dynserver.ResourceType {
+	out := make(map[string]*dynserver.ResourceType, len(dataSources))
+	for typeName, ds := range dataSources {
+		out[typeName] = &dynserver.ResourceType{Schema: ds.Schema}
+	}
+	return out
+}
+
 // runDumpSignalsFromSnapshot is --dump-signals' own real, snapshot-driven
 // counterpart to each live-fetch branch's own identical `if
 // *dumpSignalsFlag` check -- UBI-182's real fix for the gap
-// ubiquex's own cli/dynamicprovider.go named. Mirrors each source's own
-// real, already-established signal availability exactly: openapi and
-// discoverydoc both carry real, per-field signals on their own built
-// resource (rt.Signals/br.Signals, populated by internal/schema's own
-// CollectSignals during Build); cloudformation and smithy both emit a
-// real, honest empty map, matching their own live-fetch branches'
-// already-documented "not yet implemented for this source" answer --
-// this function doesn't invent capability the live path doesn't have,
-// it only makes what already exists reachable from a pinned snapshot.
+// ubiquex's own cli/dynamicprovider.go named. Picks name's own member out
+// of the real group container first (Snapshot.Member), then mirrors that
+// member's own source's real, already-established signal availability
+// exactly: a RESOURCE-mode openapi/discoverydoc member carries real,
+// per-field signals (rt.Signals/br.Signals, populated by internal/schema's
+// own CollectSignals during Build); every data-source-mode member, and
+// every cloudformation/smithy member regardless of mode, emits a real,
+// honest empty map, matching each live-fetch branch's own already-
+// documented "not yet implemented" answer -- this function doesn't
+// invent capability the live path doesn't have, it only makes what
+// already exists reachable from a pinned group snapshot.
 func runDumpSignalsFromSnapshot(name, snapPath string) error {
-	snap, err := snapshot.Load(snapPath)
+	snap, err := snapshot.LoadSplit(snapPath)
 	if err != nil {
 		return fmt.Errorf("load snapshot %s: %w", snapPath, err)
 	}
+	member, err := snap.Member(name)
+	if err != nil {
+		return fmt.Errorf("snapshot %s: %w", snapPath, err)
+	}
 
-	switch snap.SchemaSource {
-	case snapshot.SchemaSourceOpenAPI:
-		resources, err := snapshot.LoadOpenAPI(name, snap)
+	if member.SchemaSource == snapshot.SchemaSourceOpenAPI && member.Mode == snapshot.ModeResource {
+		resources, _, err := snapshot.LoadOpenAPIMember(name, member)
 		if err != nil {
-			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
 		}
 		out := make(map[string]map[string]*uschema.FieldSignal, len(resources))
 		for typeName, rt := range resources {
 			out[typeName] = rt.Signals
 		}
 		return json.NewEncoder(os.Stdout).Encode(out)
+	}
 
-	case snapshot.SchemaSourceDiscoveryDoc:
-		built, err := snapshot.LoadDiscoveryDoc(snap)
+	if member.SchemaSource == snapshot.SchemaSourceDiscoveryDoc && member.Mode == snapshot.ModeResource {
+		resources, _, err := snapshot.LoadDiscoveryDocMember(name, member)
 		if err != nil {
-			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
 		}
-		out := make(map[string]map[string]*uschema.FieldSignal, len(built))
-		for typeName, br := range built {
+		out := make(map[string]map[string]*uschema.FieldSignal, len(resources))
+		for typeName, br := range resources {
 			out[typeName] = br.Signals
 		}
 		return json.NewEncoder(os.Stdout).Encode(out)
-
-	case snapshot.SchemaSourceCloudFormation, snapshot.SchemaSourceSmithy:
-		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: --dump-signals: not yet implemented for schema_source = %q -- emitting an empty, real result, not an error\n", snap.SchemaSource)
-		return json.NewEncoder(os.Stdout).Encode(map[string]map[string]*uschema.FieldSignal{})
-
-	default:
-		return fmt.Errorf("snapshot %s: schema_source %q is not a real, known schema source", snapPath, snap.SchemaSource)
 	}
+
+	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: --dump-signals: not yet implemented for member %q (%s, %s) -- emitting an empty, real result, not an error\n", name, member.SchemaSource, member.Mode)
+	return json.NewEncoder(os.Stdout).Encode(map[string]map[string]*uschema.FieldSignal{})
 }
 
 // runDumpNamespacesFromSnapshot is --dump-namespaces' own real,
 // snapshot-driven counterpart -- same real reasoning as
-// runDumpSignalsFromSnapshot. openapi and discoverydoc both emit a real,
-// honest empty map (their own live-fetch branches' own documented
-// "already correct by construction" finding -- nothing for this
-// override to add). cloudformation and smithy both compute a real
-// namespace per resource, mirroring their own live-fetch branches
-// exactly (cloudformation.SplitTypeName; smithy.ServiceNamespace, which
-// needs the real Smithy service shape -- re-derived here via
-// smithy.FindService against the snapshot's own frozen RawSpec, zero
-// network).
+// runDumpSignalsFromSnapshot, picking name's own member out of the group
+// container first. openapi and discoverydoc both emit a real, honest
+// empty map regardless of mode (their own live-fetch branches' own
+// documented "already correct by construction" finding -- nothing for
+// this override to add). cloudformation and smithy both compute a real
+// namespace per resource for ModeResource (mirroring their own live-fetch
+// branches exactly -- cloudformation.SplitTypeName; smithy.ServiceNamespace,
+// which needs the real Smithy service shape, re-derived here via
+// smithy.FindService against the member's own frozen RawSpec, zero
+// network); smithy's own ModeDataSource variant uses each real
+// BuiltDataSource's own RealNamespace, matching run()'s own identical
+// live-fetch discipline (the real, live-found bug this session's own
+// package doc comment on smithy.BuiltDataSource.RealNamespace explains).
 func runDumpNamespacesFromSnapshot(name, snapPath string) error {
-	snap, err := snapshot.Load(snapPath)
+	snap, err := snapshot.LoadSplit(snapPath)
 	if err != nil {
 		return fmt.Errorf("load snapshot %s: %w", snapPath, err)
 	}
+	member, err := snap.Member(name)
+	if err != nil {
+		return fmt.Errorf("snapshot %s: %w", snapPath, err)
+	}
 
-	switch snap.SchemaSource {
+	switch member.SchemaSource {
 	case snapshot.SchemaSourceOpenAPI, snapshot.SchemaSourceDiscoveryDoc:
 		return json.NewEncoder(os.Stdout).Encode(map[string]string{})
 
 	case snapshot.SchemaSourceCloudFormation:
-		built, err := snapshot.LoadCloudFormation(snap)
+		built, err := snapshot.LoadCloudFormationMember(name, member)
 		if err != nil {
-			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
 		}
 		out := make(map[string]string, len(built))
 		for resourceTypeName, br := range built {
@@ -823,72 +901,125 @@ func runDumpNamespacesFromSnapshot(name, snapPath string) error {
 
 	case snapshot.SchemaSourceSmithy:
 		var smithyDoc smithy.Model
-		if err := json.Unmarshal(snap.RawSpec, &smithyDoc); err != nil {
-			return fmt.Errorf("parse snapshot's own raw_spec: %w", err)
+		if err := json.Unmarshal(member.RawSpec, &smithyDoc); err != nil {
+			return fmt.Errorf("parse member %q's own raw_spec: %w", name, err)
 		}
 		svc, err := smithy.FindService(&smithyDoc)
 		if err != nil {
-			return fmt.Errorf("find Smithy service in snapshot %s: %w", snapPath, err)
+			return fmt.Errorf("find Smithy service for member %q in snapshot %s: %w", name, snapPath, err)
 		}
-		built, err := snapshot.LoadSmithy(snap)
+		resources, dataSources, err := snapshot.LoadSmithyMember(name, member)
 		if err != nil {
-			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
 		}
-		out := make(map[string]string, len(built))
-		for hcName := range built {
+		if member.Mode == snapshot.ModeDataSource {
+			out := make(map[string]string, len(dataSources))
+			for wireType, ds := range dataSources {
+				out[wireType] = ds.RealNamespace
+			}
+			return json.NewEncoder(os.Stdout).Encode(out)
+		}
+		out := make(map[string]string, len(resources))
+		for hcName := range resources {
 			out[hcName] = smithy.ServiceNamespace(svc)
 		}
 		return json.NewEncoder(os.Stdout).Encode(out)
 
 	default:
-		return fmt.Errorf("snapshot %s: schema_source %q is not a real, known schema source", snapPath, snap.SchemaSource)
+		return fmt.Errorf("snapshot %s: member %q's own schema_source %q is not a real, known schema source", snapPath, name, member.SchemaSource)
 	}
 }
 
-// runGenerateSnapshot is generateSnapshotFlag's own real implementation --
-// UBI-182 opened this to all four real schema sources (was openapi
-// only). Loads prevPath (if given) for real, mechanical version
-// derivation, fetches cfg's own real, live schema ONE time via the
-// source-appropriate Generate<Source>, and writes a real, complete
-// Snapshot to outPath.
-func runGenerateSnapshot(name string, cfg config.Provider, outPath, prevPath string) error {
-	wireName := name
-	if cfg.WireName != "" {
-		wireName = cfg.WireName
+// runGenerateSnapshotGroup is generateSnapshotGroupFlag's own real
+// implementation -- UBI-182's group container replacement for the old,
+// single-member --generate-snapshot. Loads THIS process's own real
+// .ubx/config in full (config.Load, every real [dynamic_providers.<name>]
+// table at once -- not LoadNamed's single-active-name lookup, since a
+// group genuinely needs several), generates each real named member ONE
+// real time via the source-and-mode-appropriate Generate<Source>Member,
+// and assembles them into ONE real, versioned group container
+// (AssembleGroup) written to outPath.
+func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath string) error {
+	if repoName == "" {
+		return fmt.Errorf("--generate-snapshot-group requires --group-repo-name")
+	}
+	if membersCSV == "" {
+		return fmt.Errorf("--generate-snapshot-group requires --group-members (comma-separated [dynamic_providers.<name>] table names)")
+	}
+
+	dir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("determine working directory: %w", err)
+	}
+	allProviders, err := config.Load(dir)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
 	}
 
 	var prev *snapshot.Snapshot
 	if prevPath != "" {
-		p, err := snapshot.Load(prevPath)
+		p, err := snapshot.LoadSplit(prevPath)
 		if err != nil {
 			return fmt.Errorf("load --prev-snapshot %s: %w", prevPath, err)
 		}
 		prev = p
 	}
 
-	var snap *snapshot.Snapshot
-	var err error
-	switch cfg.SchemaSource {
-	case config.SchemaSourceOpenAPI:
-		snap, err = snapshot.GenerateOpenAPI(name, cfg.SchemaURL, cfg, prev)
-	case config.SchemaSourceCloudFormation:
-		snap, err = snapshot.GenerateCloudFormation(name, cfg.SchemaURL, cfg, prev)
-	case config.SchemaSourceSmithy:
-		snap, err = snapshot.GenerateSmithy(name, wireName, cfg.SchemaURL, cfg.TargetPrefix, cfg, prev)
-	case config.SchemaSourceDiscoveryDoc:
-		snap, err = snapshot.GenerateDiscoveryDoc(name, cfg.SchemaURL, cfg.VersionQualifier, cfg, prev)
-	default:
-		return fmt.Errorf("--generate-snapshot: [dynamic_providers.%s]'s own schema_source %q is not a real, known schema source", name, cfg.SchemaSource)
-	}
-	if err != nil {
-		return fmt.Errorf("generate snapshot for %q: %w", name, err)
+	rawNames := strings.Split(membersCSV, ",")
+	members := make(map[string]*snapshot.MemberSnapshot, len(rawNames))
+	levels := make(map[string]snapshot.ChangeLevel, len(rawNames))
+	for _, rawName := range rawNames {
+		memberName := strings.TrimSpace(rawName)
+		cfg, ok := allProviders[memberName]
+		if !ok {
+			return fmt.Errorf("--group-members: no [dynamic_providers.%s] table in this process's own .ubx/config", memberName)
+		}
+		mode := snapshot.ModeResource
+		if cfg.DataSources {
+			mode = snapshot.ModeDataSource
+		}
+		wireName := memberName
+		if cfg.WireName != "" {
+			wireName = cfg.WireName
+		}
+		var prevMember *snapshot.MemberSnapshot
+		if prev != nil {
+			prevMember = prev.Members[memberName]
+		}
+
+		var member *snapshot.MemberSnapshot
+		var level snapshot.ChangeLevel
+		var genErr error
+		switch cfg.SchemaSource {
+		case config.SchemaSourceOpenAPI:
+			member, _, level, genErr = snapshot.GenerateOpenAPIMember(memberName, cfg.SchemaURL, mode, cfg, prevMember)
+		case config.SchemaSourceCloudFormation:
+			member, _, level, genErr = snapshot.GenerateCloudFormationMember(memberName, cfg.SchemaURL, mode, cfg, prevMember)
+		case config.SchemaSourceSmithy:
+			member, _, level, genErr = snapshot.GenerateSmithyMember(memberName, wireName, cfg.SchemaURL, cfg.TargetPrefix, mode, cfg.DataSourceNamespace, cfg, prevMember)
+		case config.SchemaSourceDiscoveryDoc:
+			member, _, level, genErr = snapshot.GenerateDiscoveryDocMember(memberName, cfg.SchemaURL, cfg.VersionQualifier, mode, cfg, prevMember)
+		default:
+			genErr = fmt.Errorf("[dynamic_providers.%s]'s own schema_source %q is not a real, known schema source", memberName, cfg.SchemaSource)
+		}
+		if genErr != nil {
+			return fmt.Errorf("generate member %q: %w", memberName, genErr)
+		}
+		members[memberName] = member
+		levels[memberName] = level
+		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: generated member %q (%s, %s), own change level: %s\n", memberName, cfg.SchemaSource, mode, level)
 	}
 
-	if err := snapshot.Save(outPath, snap); err != nil {
+	group, err := snapshot.AssembleGroup(repoName, prev, members, levels)
+	if err != nil {
+		return fmt.Errorf("assemble group %q: %w", repoName, err)
+	}
+
+	if err := snapshot.SaveSplit(outPath, group); err != nil {
 		return fmt.Errorf("write snapshot to %s: %w", outPath, err)
 	}
 
-	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: wrote real snapshot for %q, version %s, schema_format %d -> %s\n",
-		name, snap.Version, snap.SchemaFormat, outPath)
+	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: wrote real group snapshot for %q, version %s, schema_format %d, %d member(s) -> %s\n",
+		repoName, group.Version, group.SchemaFormat, len(group.Members), outPath)
 	return nil
 }

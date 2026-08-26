@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 
 	"github.com/ubiquex/ubx-provider-dynamic/internal/cloudformation"
@@ -11,168 +12,236 @@ import (
 	"github.com/ubiquex/ubx-provider-dynamic/internal/discoverydoc"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/dynserver"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/openapi"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/resourcemap"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/smithy"
 )
 
-// generateFromSchemas is the real, shared core every Generate<Source>
-// below funnels through once its own native fetch+Build has produced the
-// SAME real converged type every source's own Build pipeline already
-// produces -- diffing (DiffLevel), semver derivation (NextVersion), and
-// Snapshot construction are identical regardless of which real format
-// rawSpec came from. See the package doc comment for why this is scoped
-// here (post-translation) rather than forced onto the fetch/Build step,
-// which genuinely differs per source.
-//
-// oldSchemas is nil for a provider's first-ever snapshot (prev == nil);
-// NextVersion's own doc comment covers why that case always yields
-// "1.0.0" regardless of level, so the level computed in that branch is
-// never actually load-bearing -- kept as an explicit, mirrored branch
-// (not relying on DiffLevel(nil, newSchemas) happening to behave) to
-// match GenerateOpenAPI's own original, already-proven structure exactly.
-func generateFromSchemas(providerName string, source SchemaSource, rawSpec json.RawMessage, newSchemas map[string]*tfprotov6.Schema, execCfg config.Provider, prev *Snapshot, oldSchemas map[string]*tfprotov6.Schema) (*Snapshot, error) {
+// AssembleGroup combines already-generated member snapshots into one
+// real, versioned group container. The group's own Version is derived
+// mechanically: the MAX real ChangeLevel found across every member
+// (memberLevels, one entry per member in members -- ModeResource members
+// diff against their own prior translated schema, ModeDataSource members
+// the same, both using the identical real DiffLevel one level down), plus
+// Major, unconditionally, for any member prev.Members had that members
+// does not -- a whole member disappearing is always a real, breaking
+// change to the group's own published surface, regardless of what that
+// member's own content used to look like. prev == nil means the group's
+// own first-ever snapshot (every member is new content, Minor at most,
+// matching NextVersion("", ...)'s own real, existing single-member
+// discipline one level up -- never hand-picked here either).
+func AssembleGroup(repoName string, prev *Snapshot, members map[string]*MemberSnapshot, memberLevels map[string]ChangeLevel) (*Snapshot, error) {
 	var version string
 	var err error
-	if prev != nil {
-		level := DiffLevel(oldSchemas, newSchemas)
-		version, err = NextVersion(prev.Version, level)
-		if err != nil {
-			return nil, fmt.Errorf("derive next version from %s's own prior version %q: %w", providerName, prev.Version, err)
-		}
-	} else {
+	if prev == nil {
 		version, err = NextVersion("", Minor)
 		if err != nil {
 			return nil, err
+		}
+	} else {
+		level := NoChange
+		for _, l := range memberLevels {
+			if l > level {
+				level = l
+			}
+		}
+		for name := range prev.Members {
+			if _, stillPresent := members[name]; !stillPresent {
+				level = Major
+			}
+		}
+		version, err = NextVersion(prev.Version, level)
+		if err != nil {
+			return nil, fmt.Errorf("derive next group version for %q: %w", repoName, err)
 		}
 	}
 
 	return &Snapshot{
 		SchemaFormat: CurrentSchemaFormat,
-		Provider:     providerName,
+		Provider:     repoName,
 		Version:      version,
-		SchemaSource: source,
-		Auth:         execCfg.Auth,
-		BaseURL:      execCfg.BaseURL,
-		Retry:        execCfg.Retry,
-		Timeouts:     execCfg.Timeouts,
-		Resources:    execCfg.Resources,
-		RawSpec:      rawSpec,
+		Members:      members,
 	}, nil
+}
+
+// memberChangeLevel is every Generate<Source>Member's own shared "how
+// much did THIS member change against its own prior real content"
+// helper -- prevMember == nil (a genuinely new member, whether this is
+// the group's first-ever snapshot or a member added to an existing
+// group) always contributes Minor at most, the identical real reasoning
+// DiffLevel's own doc comment already gives for a nil old.
+func memberChangeLevel(prevMember *MemberSnapshot, oldSchemas, newSchemas map[string]*tfprotov6.Schema) ChangeLevel {
+	if prevMember == nil {
+		return Minor
+	}
+	return DiffLevel(oldSchemas, newSchemas)
 }
 
 // ---------------------------------------------------------------------
 // openapi
 // ---------------------------------------------------------------------
 
-// GenerateOpenAPI fetches provider's real, live schema_source = "openapi"
-// spec ONE real time (the one real network call this whole package ever
-// makes), verifies it needs no further network access to re-parse, and
-// returns a real, complete Snapshot -- version mechanically derived
-// against prev (nil for a provider's first-ever snapshot; DiffLevel/
-// NextVersion's own doc comments cover why that case can never come out
-// Major).
+// GenerateOpenAPIMember fetches name's real, live schema_url ONE real
+// time (the one real network call this function makes), verifies it
+// needs no further network access to re-parse, builds it in the real
+// pipeline mode selects (ModeResource: dynserver.Build; ModeDataSource:
+// resourcemap.BuildDataSources -- UBI-186's own real data-source
+// discovery, unchanged, the identical pipeline run()'s own live-fetch
+// branch already uses when cfg.DataSources is true), and returns a real
+// MemberSnapshot plus its own translated schema (for AssembleGroup's own
+// cross-member diff) and real ChangeLevel against prevMember.
 //
 // The real, live verification step matters, not a formality: kin-openapi
 // resolves a real spec's own $refs into its own in-memory Value fields as
 // it parses (openapi.Load, called here with real network access to
 // resolve them), but SchemaRef's own MarshalJSON always re-emits a bare
-// {"$ref": "..."} string whenever Ref is set, NEVER the already-resolved
-// Value alongside it -- confirmed live before this package was written,
-// not assumed. For a spec whose own $refs are entirely internal
-// (#/components/schemas/... -- confirmed live for every real
-// schema_source = "openapi" provider this session has onboarded:
-// Datadog, GitHub, Kubernetes), that's harmless: the ref target lives in
-// the SAME document being snapshotted, so re-parsing needs nothing
-// external. For a spec with real EXTERNAL refs (confirmed live only for
-// Azure's own real, published Swagger 2.0 specs, a genuinely different
-// shape -- "../../common-types/v1/common.json#/definitions/Foo") the
-// marshaled snapshot would still carry that external path, and a later,
-// network-free reload would fail to resolve it. Rather than silently
-// producing a snapshot that looks complete but isn't, this function
+// {"$ref": "..."} string whenever Ref is set, never the already-resolved
+// Value alongside it. For a spec whose own $refs are entirely internal
+// (confirmed live for every real schema_source = "openapi" provider onboarded
+// so far: Datadog, GitHub, Kubernetes) that's harmless. For a spec with
+// real EXTERNAL refs (confirmed live only for Azure's own real Swagger
+// 2.0 specs) the marshaled snapshot would still carry that external
+// path, unresolvable on a later network-free reload -- this function
 // proves the real, marshaled RawSpec re-parses with zero network access
-// (openapi.Parse(raw, nil) -- no location, so a relative external ref
-// fails fast and loud instead of attempting a real fetch) before ever
-// returning a Snapshot, and returns ErrExternalRefsUnsupported,
-// unmistakably, if it doesn't. Real, explicit, named follow-up work, not
-// attempted this session: a real "bundling" pass (rewriting external
-// refs into the document's own Components.Schemas so they become
-// internal) would close this gap for Azure-shaped specs -- see the
-// package's own doc comment for the full real scope statement.
-func GenerateOpenAPI(providerName, schemaURL string, execCfg config.Provider, prev *Snapshot) (*Snapshot, error) {
+// before ever returning, and returns ErrExternalRefsUnsupported,
+// unmistakably, if it doesn't. Real bundling support for external refs
+// remains named, explicit, unstarted follow-up work, not a silent gap.
+func GenerateOpenAPIMember(name, schemaURL string, mode Mode, execCfg config.Provider, prevMember *MemberSnapshot) (*MemberSnapshot, map[string]*tfprotov6.Schema, ChangeLevel, error) {
 	doc, err := openapi.Load(schemaURL)
 	if err != nil {
-		return nil, fmt.Errorf("fetch %s: %w", schemaURL, err)
+		return nil, nil, NoChange, fmt.Errorf("fetch %s: %w", schemaURL, err)
 	}
 
 	rawSpec, err := json.Marshal(doc)
 	if err != nil {
-		return nil, fmt.Errorf("marshal fetched spec: %w", err)
+		return nil, nil, NoChange, fmt.Errorf("marshal fetched spec: %w", err)
 	}
 
 	if _, err := openapi.Parse(rawSpec, nil); err != nil {
-		return nil, fmt.Errorf("%w: %s's own real spec has at least one $ref this snapshot can't yet make network-free (real bundling support for external refs is named, explicit, unstarted follow-up work, not a silent gap): %v",
+		return nil, nil, NoChange, fmt.Errorf("%w: %s's own real spec has at least one $ref this snapshot can't yet make network-free (real bundling support for external refs is named, explicit, unstarted follow-up work, not a silent gap): %v",
 			ErrExternalRefsUnsupported, schemaURL, err)
 	}
 
-	newResources, _, err := dynserver.Build(doc, providerName, execCfg)
+	newSchemas, err := buildOpenAPISchemasForMode(doc, name, mode, execCfg)
 	if err != nil {
-		return nil, fmt.Errorf("build resource schemas: %w", err)
+		return nil, nil, NoChange, err
 	}
-	newSchemas := make(map[string]*tfprotov6.Schema, len(newResources))
-	for typeName, rt := range newResources {
-		newSchemas[typeName] = rt.Schema
+
+	member := &MemberSnapshot{
+		SchemaSource: SchemaSourceOpenAPI,
+		Mode:         mode,
+		Auth:         execCfg.Auth,
+		BaseURL:      execCfg.BaseURL,
+		Retry:        execCfg.Retry,
+		Timeouts:     execCfg.Timeouts,
+		Resources:    execCfg.Resources,
+		RawSpec:      rawSpec,
 	}
 
 	var oldSchemas map[string]*tfprotov6.Schema
-	if prev != nil {
-		oldResources, err := LoadOpenAPI(providerName, prev)
+	if prevMember != nil {
+		oldSchemas, err = LoadOpenAPIMemberSchemas(name, prevMember)
 		if err != nil {
-			return nil, fmt.Errorf("reconstruct prior snapshot's own real schema for diffing: %w", err)
-		}
-		oldSchemas = make(map[string]*tfprotov6.Schema, len(oldResources))
-		for typeName, rt := range oldResources {
-			oldSchemas[typeName] = rt.Schema
+			return nil, nil, NoChange, fmt.Errorf("reconstruct prior member %q's own real schema for diffing: %w", name, err)
 		}
 	}
+	level := memberChangeLevel(prevMember, oldSchemas, newSchemas)
 
-	return generateFromSchemas(providerName, SchemaSourceOpenAPI, rawSpec, newSchemas, execCfg, prev, oldSchemas)
+	return member, newSchemas, level, nil
 }
 
-// LoadOpenAPI is GenerateOpenAPI's own real, network-free counterpart:
-// re-derives snap's own complete, real resource map (schemas, CRUD
-// paths/methods, everything dynserver.Server needs to actually serve
-// real RPCs) purely from RawSpec -- zero network calls, the SAME real
-// translation (openapi.Parse + dynserver.Build) the binary already runs
-// at live-fetch time, just fed frozen bytes instead of a fresh HTTP GET.
-// The one real, deliberate design choice worth naming: this
-// RE-TRANSLATES on every call rather than caching the result inside
-// Snapshot itself, because re-translating is what makes SchemaFormat's
-// own real promise ("the binary's own translation logic can evolve
-// independently of a provider's own frozen spec") actually true -- a
-// newer binary build reading an older snapshot gets that build's own,
-// possibly-improved translation of the SAME real, unchanged spec, not a
-// stale, pre-translated artifact frozen at generation time.
-func LoadOpenAPI(providerName string, snap *Snapshot) (map[string]*dynserver.ResourceType, error) {
-	if snap.SchemaSource != SchemaSourceOpenAPI {
-		return nil, fmt.Errorf("snapshot's own schema_source %q is not openapi", snap.SchemaSource)
+func buildOpenAPISchemasForMode(doc *openapi3.T, name string, mode Mode, execCfg config.Provider) (map[string]*tfprotov6.Schema, error) {
+	switch mode {
+	case ModeResource:
+		built, _, err := dynserver.Build(doc, name, execCfg)
+		if err != nil {
+			return nil, fmt.Errorf("build resource schemas: %w", err)
+		}
+		schemas := make(map[string]*tfprotov6.Schema, len(built))
+		for typeName, rt := range built {
+			schemas[typeName] = rt.Schema
+		}
+		return schemas, nil
+	case ModeDataSource:
+		built, _, err := resourcemap.BuildDataSources(doc, name)
+		if err != nil {
+			return nil, fmt.Errorf("build data source schemas: %w", err)
+		}
+		schemas := make(map[string]*tfprotov6.Schema, len(built))
+		for typeName, ds := range built {
+			schemas[typeName] = ds.Schema
+		}
+		return schemas, nil
+	default:
+		return nil, fmt.Errorf("%w: openapi member %q requested mode %q", ErrUnsupportedMode, name, mode)
 	}
-	doc, err := openapi.Parse(snap.RawSpec, nil)
+}
+
+// LoadOpenAPIMember is GenerateOpenAPIMember's own real, network-free
+// counterpart: re-derives member's own complete, real resource-or-data-
+// source map (mode-aware) purely from RawSpec -- zero network calls, the
+// SAME real translation the binary already runs at live-fetch time, fed
+// frozen bytes instead of a fresh HTTP GET. Deliberately re-translates on
+// every call rather than caching the result inside MemberSnapshot itself
+// -- see the package doc comment's own account of why (SchemaFormat's
+// real promise that a newer binary's own improved translation applies to
+// an old, frozen spec unchanged).
+func LoadOpenAPIMember(name string, member *MemberSnapshot) (resources map[string]*dynserver.ResourceType, dataSources map[string]*resourcemap.BuiltDataSource, err error) {
+	if member.SchemaSource != SchemaSourceOpenAPI {
+		return nil, nil, fmt.Errorf("member %q's own schema_source %q is not openapi", name, member.SchemaSource)
+	}
+	doc, err := openapi.Parse(member.RawSpec, nil)
 	if err != nil {
-		return nil, fmt.Errorf("parse snapshot's own raw_spec: %w", err)
+		return nil, nil, fmt.Errorf("parse member %q's own raw_spec: %w", name, err)
 	}
 	execCfg := config.Provider{
-		BaseURL:  snap.BaseURL,
-		Auth:     snap.Auth,
-		Retry:    snap.Retry,
-		Timeouts: snap.Timeouts,
+		BaseURL:  member.BaseURL,
+		Auth:     member.Auth,
+		Retry:    member.Retry,
+		Timeouts: member.Timeouts,
 	}
-	resources, _, err := dynserver.Build(doc, providerName, execCfg)
-	if err != nil {
-		return nil, fmt.Errorf("rebuild snapshot's own resource schemas: %w", err)
+	switch member.Mode {
+	case ModeResource:
+		resources, _, err = dynserver.Build(doc, name, execCfg)
+		if err != nil {
+			return nil, nil, fmt.Errorf("rebuild member %q's own resource schemas: %w", name, err)
+		}
+	case ModeDataSource:
+		dataSources, _, err = resourcemap.BuildDataSources(doc, name)
+		if err != nil {
+			return nil, nil, fmt.Errorf("rebuild member %q's own data source schemas: %w", name, err)
+		}
+	default:
+		return nil, nil, fmt.Errorf("%w: openapi member %q has mode %q", ErrUnsupportedMode, name, member.Mode)
 	}
-	return resources, nil
+	return resources, dataSources, nil
 }
 
-// ErrExternalRefsUnsupported is GenerateOpenAPI's own real, named
+// LoadOpenAPIMemberSchemas is LoadOpenAPIMember's own thin adapter for
+// AssembleGroup's own diffing needs, which only ever wants the converged
+// map[string]*tfprotov6.Schema regardless of mode -- avoids every real
+// caller of GenerateOpenAPIMember (the diff path specifically) needing to
+// know which of resources/dataSources LoadOpenAPIMember actually
+// populated.
+func LoadOpenAPIMemberSchemas(name string, member *MemberSnapshot) (map[string]*tfprotov6.Schema, error) {
+	resources, dataSources, err := LoadOpenAPIMember(name, member)
+	if err != nil {
+		return nil, err
+	}
+	if member.Mode == ModeDataSource {
+		schemas := make(map[string]*tfprotov6.Schema, len(dataSources))
+		for typeName, ds := range dataSources {
+			schemas[typeName] = ds.Schema
+		}
+		return schemas, nil
+	}
+	schemas := make(map[string]*tfprotov6.Schema, len(resources))
+	for typeName, rt := range resources {
+		schemas[typeName] = rt.Schema
+	}
+	return schemas, nil
+}
+
+// ErrExternalRefsUnsupported is GenerateOpenAPIMember's own real, named
 // sentinel for the one real, explicit scope gap this function refuses to
 // paper over -- see its own doc comment.
 var ErrExternalRefsUnsupported = fmt.Errorf("spec has external $refs this snapshot format can't yet make network-free")
@@ -181,71 +250,90 @@ var ErrExternalRefsUnsupported = fmt.Errorf("spec has external $refs this snapsh
 // cloudformation
 // ---------------------------------------------------------------------
 
-// GenerateCloudFormation mirrors GenerateOpenAPI exactly, for AWS's real
-// CloudFormation resource-provider schema registry. RawSpec here is the
-// whole real map[string]*cloudformation.ResourceSchema the registry zip
-// fetch produces (one file per real "AWS::<Namespace>::<Type>" resource
-// type), not a single document -- confirmed safe to round-trip through
-// plain encoding/json (ResourceSchema carries ordinary JSON tags, none
-// of kin-openapi's SchemaRef marshal-loses-the-resolved-Value behavior
-// GenerateOpenAPI's own reparse check exists to catch), so no
-// ErrExternalRefsUnsupported-style network-free-reparse gate is needed
-// here -- verified by actually generating and reloading a real snapshot
-// (internal/snapshot/generate_test.go), not assumed from the struct
-// tags alone.
-func GenerateCloudFormation(providerName, schemaURL string, execCfg config.Provider, prev *Snapshot) (*Snapshot, error) {
+// GenerateCloudFormationMember mirrors GenerateOpenAPIMember for AWS's
+// real CloudFormation resource-provider schema registry. RawSpec here is
+// the whole real map[string]*cloudformation.ResourceSchema the registry
+// zip fetch produces, not a single document -- confirmed safe to
+// round-trip through plain encoding/json (no kin-openapi-style
+// marshal-loses-the-resolved-Value quirk), so no
+// ErrExternalRefsUnsupported-style reparse gate is needed here.
+//
+// mode must be ModeResource: CloudFormation has no real data-source
+// concept at all (confirmed directly: zero BuildDataSources/DataSource
+// references anywhere in internal/cloudformation) -- ModeDataSource
+// fails loud, immediately, before any network access.
+func GenerateCloudFormationMember(name, schemaURL string, mode Mode, execCfg config.Provider, prevMember *MemberSnapshot) (*MemberSnapshot, map[string]*tfprotov6.Schema, ChangeLevel, error) {
+	if mode != ModeResource {
+		return nil, nil, NoChange, fmt.Errorf("%w: cloudformation member %q requested mode %q -- cloudformation has no data-source concept", ErrUnsupportedMode, name, mode)
+	}
+
 	files, err := cloudformation.Fetch(schemaURL)
 	if err != nil {
-		return nil, fmt.Errorf("fetch %s: %w", schemaURL, err)
+		return nil, nil, NoChange, fmt.Errorf("fetch %s: %w", schemaURL, err)
 	}
 
 	rawSpec, err := json.Marshal(files)
 	if err != nil {
-		return nil, fmt.Errorf("marshal fetched spec: %w", err)
+		return nil, nil, NoChange, fmt.Errorf("marshal fetched spec: %w", err)
 	}
 
 	newBuilt, _, err := cloudformation.Build(files, smithy.DefaultKnownNames())
 	if err != nil {
-		return nil, fmt.Errorf("build resource schemas: %w", err)
+		return nil, nil, NoChange, fmt.Errorf("build resource schemas: %w", err)
 	}
 	newSchemas := make(map[string]*tfprotov6.Schema, len(newBuilt))
 	for typeName, rt := range newBuilt {
 		newSchemas[typeName] = rt.Schema
 	}
 
+	member := &MemberSnapshot{
+		SchemaSource: SchemaSourceCloudFormation,
+		Mode:         ModeResource,
+		Auth:         execCfg.Auth,
+		BaseURL:      execCfg.BaseURL,
+		Retry:        execCfg.Retry,
+		Timeouts:     execCfg.Timeouts,
+		Resources:    execCfg.Resources,
+		RawSpec:      rawSpec,
+	}
+
 	var oldSchemas map[string]*tfprotov6.Schema
-	if prev != nil {
-		oldBuilt, err := LoadCloudFormation(prev)
+	if prevMember != nil {
+		oldBuilt, err := LoadCloudFormationMember(name, prevMember)
 		if err != nil {
-			return nil, fmt.Errorf("reconstruct prior snapshot's own real schema for diffing: %w", err)
+			return nil, nil, NoChange, fmt.Errorf("reconstruct prior member %q's own real schema for diffing: %w", name, err)
 		}
 		oldSchemas = make(map[string]*tfprotov6.Schema, len(oldBuilt))
 		for typeName, rt := range oldBuilt {
 			oldSchemas[typeName] = rt.Schema
 		}
 	}
+	level := memberChangeLevel(prevMember, oldSchemas, newSchemas)
 
-	return generateFromSchemas(providerName, SchemaSourceCloudFormation, rawSpec, newSchemas, execCfg, prev, oldSchemas)
+	return member, newSchemas, level, nil
 }
 
-// LoadCloudFormation is GenerateCloudFormation's own real, network-free
-// counterpart -- same real re-translation discipline LoadOpenAPI already
-// documents (re-runs cloudformation.Build fresh on every call, never a
-// frozen pre-translated artifact). providerName is deliberately not a
-// parameter here: cloudformation.Build takes no providerName at all
-// (confirmed against its real signature) -- each real CFN resource's own
-// type name is already fully qualified ("AWS::<Namespace>::<Type>").
-func LoadCloudFormation(snap *Snapshot) (map[string]*cloudformation.BuiltResource, error) {
-	if snap.SchemaSource != SchemaSourceCloudFormation {
-		return nil, fmt.Errorf("snapshot's own schema_source %q is not cloudformation", snap.SchemaSource)
+// LoadCloudFormationMember is GenerateCloudFormationMember's own real,
+// network-free counterpart. name is deliberately unused for the real
+// build itself (cloudformation.Build takes no providerName -- each real
+// CFN resource's own type name is already fully qualified), kept as a
+// parameter only so this function's own signature matches every other
+// Load<Source>Member's, and so its own error messages can name which
+// member failed.
+func LoadCloudFormationMember(name string, member *MemberSnapshot) (map[string]*cloudformation.BuiltResource, error) {
+	if member.SchemaSource != SchemaSourceCloudFormation {
+		return nil, fmt.Errorf("member %q's own schema_source %q is not cloudformation", name, member.SchemaSource)
+	}
+	if member.Mode != ModeResource {
+		return nil, fmt.Errorf("%w: cloudformation member %q has mode %q -- cloudformation has no data-source concept", ErrUnsupportedMode, name, member.Mode)
 	}
 	var files map[string]*cloudformation.ResourceSchema
-	if err := json.Unmarshal(snap.RawSpec, &files); err != nil {
-		return nil, fmt.Errorf("parse snapshot's own raw_spec: %w", err)
+	if err := json.Unmarshal(member.RawSpec, &files); err != nil {
+		return nil, fmt.Errorf("parse member %q's own raw_spec: %w", name, err)
 	}
 	resources, _, err := cloudformation.Build(files, smithy.DefaultKnownNames())
 	if err != nil {
-		return nil, fmt.Errorf("rebuild snapshot's own resource schemas: %w", err)
+		return nil, fmt.Errorf("rebuild member %q's own resource schemas: %w", name, err)
 	}
 	return resources, nil
 }
@@ -254,160 +342,266 @@ func LoadCloudFormation(snap *Snapshot) (map[string]*cloudformation.BuiltResourc
 // smithy
 // ---------------------------------------------------------------------
 
-// GenerateSmithy mirrors GenerateOpenAPI exactly, for AWS's real Smithy
-// service models (schema_source = "smithy", used today for the ~430
-// per-service AWS data-source entries -- see cmd/ubx-provider-dynamic's
-// own real live-fetch branch). wireName, not providerName, is what gets
-// baked into every generated resource type name (config.Provider.WireName's
-// own doc comment has the full real reason these can differ) -- matches
-// main.go's own real live-fetch call (smithy.Build(doc, wireName, ...)),
-// not the table key alone. Both wireName and targetPrefix are stored
-// onto the returned Snapshot (WireName/TargetPrefix, SchemaFormat 2) --
-// necessary once a pinned [providers.<name>] entry is the only config a
-// caller has: LoadSmithy has no live [dynamic_providers.<name>] table
-// left to read either value from otherwise. No reparse-verification
-// gate: smithy.Model's own real JSON shape has no equivalent to
-// kin-openapi's SchemaRef marshal-loses-the-resolved-Value quirk --
-// verified live, not assumed (internal/snapshot/generate_test.go).
-func GenerateSmithy(providerName, wireName, schemaURL, targetPrefix string, execCfg config.Provider, prev *Snapshot) (*Snapshot, error) {
+// GenerateSmithyMember mirrors GenerateOpenAPIMember for AWS's real
+// Smithy service models. wireName, not name, is what gets baked into
+// every generated resource type name (config.Provider.WireName's own doc
+// comment). ModeDataSource uses smithy.BuildDataSources, the identical
+// pipeline run()'s own live-fetch branch already uses -- namespaceOverride
+// is config.Provider.DataSourceNamespace, plumbed through unchanged, and
+// (like the live path) requires re-deriving the model's own *Service via
+// smithy.FindService before BuildDataSources can run.
+func GenerateSmithyMember(name, wireName, schemaURL, targetPrefix string, mode Mode, namespaceOverride string, execCfg config.Provider, prevMember *MemberSnapshot) (*MemberSnapshot, map[string]*tfprotov6.Schema, ChangeLevel, error) {
 	doc, err := smithy.Load(schemaURL)
 	if err != nil {
-		return nil, fmt.Errorf("fetch %s: %w", schemaURL, err)
+		return nil, nil, NoChange, fmt.Errorf("fetch %s: %w", schemaURL, err)
 	}
 
 	rawSpec, err := json.Marshal(doc)
 	if err != nil {
-		return nil, fmt.Errorf("marshal fetched spec: %w", err)
+		return nil, nil, NoChange, fmt.Errorf("marshal fetched spec: %w", err)
 	}
 
-	newBuilt, _, err := smithy.Build(doc, wireName, smithy.DefaultKnownNames())
+	newSchemas, err := buildSmithySchemasForMode(doc, wireName, mode, namespaceOverride)
 	if err != nil {
-		return nil, fmt.Errorf("build resource schemas: %w", err)
+		return nil, nil, NoChange, err
 	}
-	newSchemas := make(map[string]*tfprotov6.Schema, len(newBuilt))
-	for typeName, rt := range newBuilt {
-		newSchemas[typeName] = rt.Schema
+
+	member := &MemberSnapshot{
+		SchemaSource:        SchemaSourceSmithy,
+		Mode:                mode,
+		Auth:                execCfg.Auth,
+		BaseURL:             execCfg.BaseURL,
+		Retry:               execCfg.Retry,
+		Timeouts:            execCfg.Timeouts,
+		Resources:           execCfg.Resources,
+		WireName:            wireName,
+		TargetPrefix:        targetPrefix,
+		DataSourceNamespace: namespaceOverride,
+		RawSpec:             rawSpec,
 	}
 
 	var oldSchemas map[string]*tfprotov6.Schema
-	if prev != nil {
-		oldBuilt, err := LoadSmithy(prev)
+	if prevMember != nil {
+		oldSchemas, err = LoadSmithyMemberSchemas(name, prevMember)
 		if err != nil {
-			return nil, fmt.Errorf("reconstruct prior snapshot's own real schema for diffing: %w", err)
-		}
-		oldSchemas = make(map[string]*tfprotov6.Schema, len(oldBuilt))
-		for typeName, rt := range oldBuilt {
-			oldSchemas[typeName] = rt.Schema
+			return nil, nil, NoChange, fmt.Errorf("reconstruct prior member %q's own real schema for diffing: %w", name, err)
 		}
 	}
+	level := memberChangeLevel(prevMember, oldSchemas, newSchemas)
 
-	snap, err := generateFromSchemas(providerName, SchemaSourceSmithy, rawSpec, newSchemas, execCfg, prev, oldSchemas)
+	return member, newSchemas, level, nil
+}
+
+func buildSmithySchemasForMode(doc *smithy.Model, wireName string, mode Mode, namespaceOverride string) (map[string]*tfprotov6.Schema, error) {
+	switch mode {
+	case ModeResource:
+		built, _, err := smithy.Build(doc, wireName, smithy.DefaultKnownNames())
+		if err != nil {
+			return nil, fmt.Errorf("build resource schemas: %w", err)
+		}
+		schemas := make(map[string]*tfprotov6.Schema, len(built))
+		for typeName, rt := range built {
+			schemas[typeName] = rt.Schema
+		}
+		return schemas, nil
+	case ModeDataSource:
+		svc, err := smithy.FindService(doc)
+		if err != nil {
+			return nil, fmt.Errorf("find smithy service for data-source discovery: %w", err)
+		}
+		built, _, err := smithy.BuildDataSources(doc, wireName, svc, namespaceOverride)
+		if err != nil {
+			return nil, fmt.Errorf("build data source schemas: %w", err)
+		}
+		schemas := make(map[string]*tfprotov6.Schema, len(built))
+		for typeName, ds := range built {
+			schemas[typeName] = ds.Schema
+		}
+		return schemas, nil
+	default:
+		return nil, fmt.Errorf("%w: smithy member requested mode %q", ErrUnsupportedMode, mode)
+	}
+}
+
+// LoadSmithyMember is GenerateSmithyMember's own real, network-free
+// counterpart. Reads WireName/DataSourceNamespace from member itself
+// (falls back to name when WireName is empty, matching
+// config.Provider.WireName's own "defaults to name" convention).
+func LoadSmithyMember(name string, member *MemberSnapshot) (resources map[string]*smithy.BuiltResource, dataSources map[string]*smithy.BuiltDataSource, err error) {
+	if member.SchemaSource != SchemaSourceSmithy {
+		return nil, nil, fmt.Errorf("member %q's own schema_source %q is not smithy", name, member.SchemaSource)
+	}
+	wireName := member.WireName
+	if wireName == "" {
+		wireName = name
+	}
+	var doc smithy.Model
+	if err := json.Unmarshal(member.RawSpec, &doc); err != nil {
+		return nil, nil, fmt.Errorf("parse member %q's own raw_spec: %w", name, err)
+	}
+	switch member.Mode {
+	case ModeResource:
+		resources, _, err = smithy.Build(&doc, wireName, smithy.DefaultKnownNames())
+		if err != nil {
+			return nil, nil, fmt.Errorf("rebuild member %q's own resource schemas: %w", name, err)
+		}
+	case ModeDataSource:
+		var svc *smithy.Service
+		svc, err = smithy.FindService(&doc)
+		if err != nil {
+			return nil, nil, fmt.Errorf("find smithy service for member %q's own data-source discovery: %w", name, err)
+		}
+		dataSources, _, err = smithy.BuildDataSources(&doc, wireName, svc, member.DataSourceNamespace)
+		if err != nil {
+			return nil, nil, fmt.Errorf("rebuild member %q's own data source schemas: %w", name, err)
+		}
+	default:
+		return nil, nil, fmt.Errorf("%w: smithy member %q has mode %q", ErrUnsupportedMode, name, member.Mode)
+	}
+	return resources, dataSources, nil
+}
+
+// LoadSmithyMemberSchemas mirrors LoadOpenAPIMemberSchemas -- the
+// converged map[string]*tfprotov6.Schema AssembleGroup's own diffing
+// needs, regardless of mode.
+func LoadSmithyMemberSchemas(name string, member *MemberSnapshot) (map[string]*tfprotov6.Schema, error) {
+	resources, dataSources, err := LoadSmithyMember(name, member)
 	if err != nil {
 		return nil, err
 	}
-	snap.WireName = wireName
-	snap.TargetPrefix = targetPrefix
-	return snap, nil
-}
-
-// LoadSmithy is GenerateSmithy's own real, network-free counterpart --
-// same real re-translation discipline LoadOpenAPI already documents.
-// Reads WireName from the snapshot itself (falls back to Provider when
-// empty, matching config.Provider.WireName's own "defaults to name"
-// convention) rather than taking it as a separate parameter -- see the
-// Snapshot struct's own doc comment for why.
-func LoadSmithy(snap *Snapshot) (map[string]*smithy.BuiltResource, error) {
-	if snap.SchemaSource != SchemaSourceSmithy {
-		return nil, fmt.Errorf("snapshot's own schema_source %q is not smithy", snap.SchemaSource)
+	if member.Mode == ModeDataSource {
+		schemas := make(map[string]*tfprotov6.Schema, len(dataSources))
+		for typeName, ds := range dataSources {
+			schemas[typeName] = ds.Schema
+		}
+		return schemas, nil
 	}
-	wireName := snap.WireName
-	if wireName == "" {
-		wireName = snap.Provider
+	schemas := make(map[string]*tfprotov6.Schema, len(resources))
+	for typeName, rt := range resources {
+		schemas[typeName] = rt.Schema
 	}
-	var doc smithy.Model
-	if err := json.Unmarshal(snap.RawSpec, &doc); err != nil {
-		return nil, fmt.Errorf("parse snapshot's own raw_spec: %w", err)
-	}
-	resources, _, err := smithy.Build(&doc, wireName, smithy.DefaultKnownNames())
-	if err != nil {
-		return nil, fmt.Errorf("rebuild snapshot's own resource schemas: %w", err)
-	}
-	return resources, nil
+	return schemas, nil
 }
 
 // ---------------------------------------------------------------------
 // discovery_docs
 // ---------------------------------------------------------------------
 
-// GenerateDiscoveryDoc mirrors GenerateOpenAPI exactly, for GCP's real
+// GenerateDiscoveryDocMember mirrors GenerateOpenAPIMember for GCP's real
 // Discovery Documents. versionQualifier is stored onto the returned
-// Snapshot (VersionQualifier, SchemaFormat 2) -- necessary once a
-// pinned [providers.<name>] entry is the only config a caller has:
-// LoadDiscoveryDoc has no live [dynamic_providers.<name>] table left to
-// read it from otherwise. No reparse-verification gate:
-// discoverydoc.Document's own real JSON shape has no equivalent to
-// kin-openapi's SchemaRef marshal-loses-the-resolved-Value quirk --
-// verified live, not assumed (internal/snapshot/generate_test.go).
-func GenerateDiscoveryDoc(providerName, schemaURL, versionQualifier string, execCfg config.Provider, prev *Snapshot) (*Snapshot, error) {
+// MemberSnapshot -- necessary once a pinned entry is the only config a
+// caller has. ModeDataSource uses discoverydoc.BuildDataSources, the
+// identical pipeline run()'s own live-fetch branch already uses.
+func GenerateDiscoveryDocMember(name, schemaURL, versionQualifier string, mode Mode, execCfg config.Provider, prevMember *MemberSnapshot) (*MemberSnapshot, map[string]*tfprotov6.Schema, ChangeLevel, error) {
 	doc, err := discoverydoc.Load(schemaURL)
 	if err != nil {
-		return nil, fmt.Errorf("fetch %s: %w", schemaURL, err)
+		return nil, nil, NoChange, fmt.Errorf("fetch %s: %w", schemaURL, err)
 	}
 
 	rawSpec, err := json.Marshal(doc)
 	if err != nil {
-		return nil, fmt.Errorf("marshal fetched spec: %w", err)
+		return nil, nil, NoChange, fmt.Errorf("marshal fetched spec: %w", err)
 	}
 
-	newBuilt, _, err := discoverydoc.Build(doc, providerName, versionQualifier)
+	newSchemas, err := buildDiscoveryDocSchemasForMode(doc, name, mode, versionQualifier)
 	if err != nil {
-		return nil, fmt.Errorf("build resource schemas: %w", err)
+		return nil, nil, NoChange, err
 	}
-	newSchemas := make(map[string]*tfprotov6.Schema, len(newBuilt))
-	for typeName, rt := range newBuilt {
-		newSchemas[typeName] = rt.Schema
+
+	member := &MemberSnapshot{
+		SchemaSource:     SchemaSourceDiscoveryDoc,
+		Mode:             mode,
+		Auth:             execCfg.Auth,
+		BaseURL:          execCfg.BaseURL,
+		Retry:            execCfg.Retry,
+		Timeouts:         execCfg.Timeouts,
+		Resources:        execCfg.Resources,
+		VersionQualifier: versionQualifier,
+		RawSpec:          rawSpec,
 	}
 
 	var oldSchemas map[string]*tfprotov6.Schema
-	if prev != nil {
-		oldBuilt, err := LoadDiscoveryDoc(prev)
+	if prevMember != nil {
+		oldSchemas, err = LoadDiscoveryDocMemberSchemas(name, prevMember)
 		if err != nil {
-			return nil, fmt.Errorf("reconstruct prior snapshot's own real schema for diffing: %w", err)
-		}
-		oldSchemas = make(map[string]*tfprotov6.Schema, len(oldBuilt))
-		for typeName, rt := range oldBuilt {
-			oldSchemas[typeName] = rt.Schema
+			return nil, nil, NoChange, fmt.Errorf("reconstruct prior member %q's own real schema for diffing: %w", name, err)
 		}
 	}
+	level := memberChangeLevel(prevMember, oldSchemas, newSchemas)
 
-	snap, err := generateFromSchemas(providerName, SchemaSourceDiscoveryDoc, rawSpec, newSchemas, execCfg, prev, oldSchemas)
+	return member, newSchemas, level, nil
+}
+
+func buildDiscoveryDocSchemasForMode(doc *discoverydoc.Document, name string, mode Mode, versionQualifier string) (map[string]*tfprotov6.Schema, error) {
+	switch mode {
+	case ModeResource:
+		built, _, err := discoverydoc.Build(doc, name, versionQualifier)
+		if err != nil {
+			return nil, fmt.Errorf("build resource schemas: %w", err)
+		}
+		schemas := make(map[string]*tfprotov6.Schema, len(built))
+		for typeName, rt := range built {
+			schemas[typeName] = rt.Schema
+		}
+		return schemas, nil
+	case ModeDataSource:
+		built, _, err := discoverydoc.BuildDataSources(doc, name, versionQualifier)
+		if err != nil {
+			return nil, fmt.Errorf("build data source schemas: %w", err)
+		}
+		schemas := make(map[string]*tfprotov6.Schema, len(built))
+		for typeName, ds := range built {
+			schemas[typeName] = ds.Schema
+		}
+		return schemas, nil
+	default:
+		return nil, fmt.Errorf("%w: discovery_docs member %q requested mode %q", ErrUnsupportedMode, name, mode)
+	}
+}
+
+// LoadDiscoveryDocMember is GenerateDiscoveryDocMember's own real,
+// network-free counterpart. Reads VersionQualifier from member itself.
+func LoadDiscoveryDocMember(name string, member *MemberSnapshot) (resources map[string]*discoverydoc.BuiltResource, dataSources map[string]*discoverydoc.BuiltDataSource, err error) {
+	if member.SchemaSource != SchemaSourceDiscoveryDoc {
+		return nil, nil, fmt.Errorf("member %q's own schema_source %q is not discovery_docs", name, member.SchemaSource)
+	}
+	var doc discoverydoc.Document
+	if err := json.Unmarshal(member.RawSpec, &doc); err != nil {
+		return nil, nil, fmt.Errorf("parse member %q's own raw_spec: %w", name, err)
+	}
+	switch member.Mode {
+	case ModeResource:
+		resources, _, err = discoverydoc.Build(&doc, name, member.VersionQualifier)
+		if err != nil {
+			return nil, nil, fmt.Errorf("rebuild member %q's own resource schemas: %w", name, err)
+		}
+	case ModeDataSource:
+		dataSources, _, err = discoverydoc.BuildDataSources(&doc, name, member.VersionQualifier)
+		if err != nil {
+			return nil, nil, fmt.Errorf("rebuild member %q's own data source schemas: %w", name, err)
+		}
+	default:
+		return nil, nil, fmt.Errorf("%w: discovery_docs member %q has mode %q", ErrUnsupportedMode, name, member.Mode)
+	}
+	return resources, dataSources, nil
+}
+
+// LoadDiscoveryDocMemberSchemas mirrors LoadOpenAPIMemberSchemas.
+func LoadDiscoveryDocMemberSchemas(name string, member *MemberSnapshot) (map[string]*tfprotov6.Schema, error) {
+	resources, dataSources, err := LoadDiscoveryDocMember(name, member)
 	if err != nil {
 		return nil, err
 	}
-	snap.VersionQualifier = versionQualifier
-	return snap, nil
-}
-
-// LoadDiscoveryDoc is GenerateDiscoveryDoc's own real, network-free
-// counterpart -- same real re-translation discipline LoadOpenAPI already
-// documents. Reads VersionQualifier from the snapshot itself rather than
-// taking it as a separate parameter -- see the Snapshot struct's own doc
-// comment for why. Provider (not a separate providerName parameter) is
-// what discoverydoc.Build's own providerName argument needs -- Snapshot.Provider
-// already carries the identical value GenerateDiscoveryDoc was called
-// with, so a second, separate parameter here would only ever be able to
-// disagree with it, never usefully differ.
-func LoadDiscoveryDoc(snap *Snapshot) (map[string]*discoverydoc.BuiltResource, error) {
-	if snap.SchemaSource != SchemaSourceDiscoveryDoc {
-		return nil, fmt.Errorf("snapshot's own schema_source %q is not discovery_docs", snap.SchemaSource)
+	if member.Mode == ModeDataSource {
+		schemas := make(map[string]*tfprotov6.Schema, len(dataSources))
+		for typeName, ds := range dataSources {
+			schemas[typeName] = ds.Schema
+		}
+		return schemas, nil
 	}
-	var doc discoverydoc.Document
-	if err := json.Unmarshal(snap.RawSpec, &doc); err != nil {
-		return nil, fmt.Errorf("parse snapshot's own raw_spec: %w", err)
+	schemas := make(map[string]*tfprotov6.Schema, len(resources))
+	for typeName, rt := range resources {
+		schemas[typeName] = rt.Schema
 	}
-	resources, _, err := discoverydoc.Build(&doc, snap.Provider, snap.VersionQualifier)
-	if err != nil {
-		return nil, fmt.Errorf("rebuild snapshot's own resource schemas: %w", err)
-	}
-	return resources, nil
+	return schemas, nil
 }

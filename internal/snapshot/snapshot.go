@@ -8,80 +8,103 @@
 //
 // A Snapshot is a real, frozen file: fetch a provider's real spec once,
 // verify it needs no further network access to re-parse (real, checked,
-// not assumed -- see GenerateOpenAPI's own doc comment), and write
+// not assumed -- see GenerateOpenAPIMember's own doc comment), and write
 // everything the binary needs to serve it again with zero network calls.
+//
+// UBI-182, group container (SchemaFormat 3): a Snapshot is no longer one
+// flat spec. A provider's real published identity (repo_name in
+// ubiquex's own [dynamic_provider_groups.<x>], e.g. "kubernetes",
+// "datadog", "aws") is almost never one [dynamic_providers.<name>] table
+// -- it's a GROUP of them (Kubernetes alone is two: the resource-mode
+// "kubernetes" table and the data-source-mode "kubernetes_ds" table,
+// both fetched from the identical schema_url but built through genuinely
+// different pipelines). AWS's own real group mixes TWO schema sources
+// entirely (one CloudFormation resource entry, 429 Smithy data-source
+// entries) -- a single flat RawSpec/SchemaSource pair, this package's
+// entire shape through SchemaFormat 2, cannot represent that at all,
+// confirmed directly against the struct before this change, not assumed.
+//
+// Snapshot is now the real, whole-group container: one Provider (the
+// group's own repo_name), one mechanically-derived Version for the whole
+// group, and a Members map -- one MemberSnapshot per real
+// [dynamic_providers.<name>] table the group actually bundles, each
+// keeping its own SchemaSource/RawSpec/Mode, since members genuinely
+// differ in source and mode even within one group. A pinned
+// [providers.<name>] entry for ANY one member resolves the SAME real
+// group release (provider.AcquireSchema's own cache-by-source+version
+// already collapses redundant downloads for free); the launched process
+// picks its own member back out of Members by the same
+// UBX_DYNAMIC_PROVIDER_NAME it already receives.
+//
+// Real, deliberate, accepted break: SchemaFormat 2 (a flat, single-member
+// snapshot) is not readable by this build at all -- CheckFormat refuses
+// it the same way it refuses anything outside [MinSupportedSchemaFormat,
+// MaxSupportedSchemaFormat], both now 3. Only one real snapshot was ever
+// published under format 2 (ubx-schema-kubernetes v1.0.0, this same
+// session), and nothing but this session's own verification tests
+// depended on it -- carrying a compatibility shim for one immediately-
+// superseded artifact would be real, permanent cost with no real
+// beneficiary. v1.0.0 is superseded by a real v2.0.0 (a genuinely
+// breaking format change, not a routine content bump) once this ships.
 //
 // Two real, separately-versioned numbers, deliberately not one:
 //
 //   - SchemaFormat is THIS PACKAGE's own capability version -- which
 //     shape of snapshot file a given binary build knows how to read.
-//     Changes only when the binary itself gains a real new capability
-//     (a new field this struct needs, a new SchemaSource this package
-//     learns to generate/load). A schema_format outside a binary's own
-//     declared [MinSupportedSchemaFormat, MaxSupportedSchemaFormat]
-//     range is refused loudly (CheckFormat) -- never silently
-//     misinterpreted.
-//   - Version is the PROVIDER's own real API-surface version -- a real
-//     semver string, mechanically derived (internal/snapshot/diff.go)
-//     from what actually changed in the provider's own real spec between
-//     one snapshot and the next, never hand-picked.
+//     Changes only when the binary itself gains a real new capability. A
+//     schema_format outside a binary's own declared range is refused
+//     loudly (CheckFormat) -- never silently misinterpreted.
+//   - Version is the real GROUP's own real API-surface version -- a real
+//     semver string, mechanically derived (internal/snapshot/diff.go,
+//     AssembleGroup) from the highest real change level found across
+//     every member's own translated schema between one snapshot and the
+//     next (a whole member disappearing counts as Major, unconditionally
+//     -- see AssembleGroup's own doc comment), never hand-picked.
 //
-// UBI-182: this package's own real Generate/Load pair now covers all
-// four real schema sources (GenerateOpenAPI/LoadOpenAPI,
-// GenerateCloudFormation/LoadCloudFormation, GenerateSmithy/LoadSmithy,
-// GenerateDiscoveryDoc/LoadDiscoveryDoc) -- each has its own real fetch
-// mechanics and Build signature (cmd/ubx-provider-dynamic/main.go's own
-// real per-source branches), but every one of them converges on the
-// SAME real translated type (map[string]*tfprotov6.Schema, produced by
-// internal/schema.Translator.BuildTopLevel, completely unchanged
-// regardless of source) before diffing/versioning/Snapshot construction
-// happens -- generateFromSchemas (generate.go) is that one, real, shared
-// core every Generate<Source> funnels through, so the "one implementation
-// rather than four" the design calls for lives at the level the sources
-// actually converge (post-translation), not forced onto the fetch/Build
-// step itself, which genuinely differs per source (CFN fetches a zip of
-// many files; Smithy/DiscoveryDoc/OpenAPI fetch one document each).
+// Mode (ModeResource / ModeDataSource) is UBI-182's other real addition:
+// resource-mode and data-source-mode entries go through genuinely
+// different discovery/translation pipelines (dynserver.Build vs
+// resourcemap.BuildDataSources, and the smithy/discoverydoc equivalents)
+// -- a snapshot with no way to record which one a member needs used to
+// mean a pinned data-source entry would silently be served as
+// resource-shaped output instead (or, for the two sources with no
+// generation support at all before this, simply fail to generate). Every
+// Generate<Source>Member/Load<Source>Member pair now checks Mode against
+// what that specific source actually supports and fails loud
+// (ErrUnsupportedMode) on any mismatch, immediately -- never falls
+// through to the wrong shape. CloudFormation has no real data-source
+// concept at all (confirmed directly: zero BuildDataSources/DataSource
+// references anywhere in internal/cloudformation) -- ModeDataSource is
+// simply not a supported Mode for that source, ever.
 package snapshot
 
 import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 
 	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
 )
 
 // CurrentSchemaFormat is what THIS BUILD of the binary writes when it
 // generates a new snapshot -- always the max of its own declared
-// supported range (a binary always writes its own newest, best-understood
-// shape; MinSupportedSchemaFormat exists only so a build one or more
-// versions old can still read snapshots older builds already wrote).
-const CurrentSchemaFormat = 2
+// supported range.
+const CurrentSchemaFormat = 3
 
 // MinSupportedSchemaFormat/MaxSupportedSchemaFormat is THIS BUILD's own
-// real, declared compatibility range -- CheckFormat's own real source of
-// truth. Bumped to 2 for UBI-182's own real, additive change (WireName/
-// VersionQualifier/TargetPrefix, see the Snapshot struct's own doc
-// comment) -- MinSupportedSchemaFormat stays at 1 rather than following
-// Max upward, since a real format-1 snapshot (every real openapi/
-// cloudformation snapshot ever generated, and any smithy/discoverydoc
-// snapshot has no format-1 precedent to be backward-compatible WITH in
-// the first place) unmarshals into the three new fields as their real
-// Go zero value (empty string), which is exactly what an
-// openapi/cloudformation snapshot's own real JSON already omits via
-// their own omitempty tags -- a genuinely, not just nominally,
-// backward-compatible read.
+// real, declared compatibility range. Both moved to 3 together for
+// UBI-182's group-container change -- a real, deliberate break, not a
+// backward-compatible extension the way 1->2 was (see the package doc
+// comment for why format 2 is not worth carrying forward).
 const (
-	MinSupportedSchemaFormat = 1
-	MaxSupportedSchemaFormat = 2
+	MinSupportedSchemaFormat = 3
+	MaxSupportedSchemaFormat = 3
 )
 
-// SchemaSource names which real Build pipeline a Snapshot's own RawSpec
-// needs (mirrors config.SchemaSourceType's own real values -- a separate
-// type, not a reuse of it, since a Snapshot is real, on-disk, versioned
-// data with its own independent compatibility contract, deliberately not
-// coupled to config.Provider's own in-memory, TOML-sourced shape even
-// though the same real strings apply).
+// SchemaSource names which real Build/BuildDataSources pipeline a
+// MemberSnapshot's own RawSpec needs.
 type SchemaSource string
 
 const (
@@ -91,93 +114,119 @@ const (
 	SchemaSourceDiscoveryDoc   SchemaSource = "discovery_docs"
 )
 
-// Snapshot is one real, frozen file: everything the binary needs to serve
-// a provider's real schema with zero network calls at resolution time.
+// Mode names which real discovery/translation pipeline a member's own
+// RawSpec goes through -- the same real distinction
+// config.Provider.DataSources (a plain bool) already drives on the live-
+// fetch path, made an explicit, checked, first-class part of the frozen
+// artifact instead of an implicit runtime flag a snapshot had no way to
+// carry at all.
+type Mode string
+
+const (
+	// ModeResource is the default, CRUD-shaped discovery every source
+	// supports: dynserver.Build (openapi), cloudformation.Build,
+	// smithy.Build, discoverydoc.Build.
+	ModeResource Mode = "resource"
+	// ModeDataSource is UBI-186's own schema-only discovery:
+	// resourcemap.BuildDataSources (openapi), smithy.BuildDataSources,
+	// discoverydoc.BuildDataSources. Not supported by
+	// SchemaSourceCloudFormation at all -- see the package doc comment.
+	ModeDataSource Mode = "data_source"
+)
+
+// ErrUnsupportedMode is every Generate<Source>Member/Load<Source>Member
+// pair's own real, fail-loud sentinel for a Mode that source doesn't (or
+// doesn't yet) support -- wrapped, not returned bare, so a caller can
+// errors.Is against it regardless of which source/direction produced it.
+// The whole real point of adding Mode: a mismatch here must be a real,
+// immediate, unmistakable error, never a silent fall-through to the
+// wrong shape (resource-shaped output served under a data-source label,
+// or the reverse).
+var ErrUnsupportedMode = fmt.Errorf("schema source does not support this mode")
+
+// MemberSnapshot is one real [dynamic_providers.<name>] table's own
+// frozen content -- everything Generate<Source>Member captured for ONE
+// member of a real group, in whichever Mode that member actually is.
+type MemberSnapshot struct {
+	// SchemaSource names which real Build/BuildDataSources pipeline
+	// RawSpec needs.
+	SchemaSource SchemaSource `json:"schema_source"`
+
+	// Mode names which real pipeline within that source -- see the Mode
+	// type's own doc comment.
+	Mode Mode `json:"mode"`
+
+	// Auth is the real, unchanged [dynamic_providers.<name>.auth] table
+	// this member needs at real execution time -- carries auth TYPE and
+	// PARAM NAMES, never a real secret value itself.
+	Auth config.Auth `json:"auth"`
+
+	// BaseURL/Retry/Timeouts/Resources are the real, unchanged execution
+	// config every dynamic provider already declares in
+	// [dynamic_providers.<name>] today -- carried through unchanged so a
+	// pinned member is a real, complete replacement for that table.
+	BaseURL   string                           `json:"base_url"`
+	Retry     config.RetryConfig               `json:"retry"`
+	Timeouts  config.TimeoutsConfig            `json:"timeouts"`
+	Resources map[string]config.ResourceConfig `json:"resources,omitempty"`
+
+	// WireName/VersionQualifier/TargetPrefix/DataSourceNamespace are the
+	// per-source generation/re-translation inputs that were
+	// config.Provider fields with no home on a frozen artifact before
+	// UBI-182 -- necessary once [providers.<name>] is a member's only
+	// config: Load<Source>Member has no live [dynamic_providers.<name>]
+	// table left to read these from otherwise. Empty for whichever
+	// source/mode combination doesn't need a given one -- omitempty
+	// keeps a member's own real JSON free of fields it has no use for.
+	WireName            string `json:"wire_name,omitempty"`
+	VersionQualifier    string `json:"version_qualifier,omitempty"`
+	TargetPrefix        string `json:"target_prefix,omitempty"`
+	DataSourceNamespace string `json:"data_source_namespace,omitempty"`
+
+	// RawSpec is the real, verbatim, already-fetched provider spec this
+	// member was generated from (SchemaSource says which real format).
+	// See the package doc comment (prior, single-member version) for why
+	// this is the RAW input, not this binary's own already-translated
+	// output: re-deriving the translated schema from RawSpec at load
+	// time, every time, using whatever translation logic THIS build
+	// ships, is the whole point of the SchemaFormat/Version split.
+	RawSpec json.RawMessage `json:"raw_spec"`
+}
+
+// Snapshot is one real, frozen file: everything the binary needs to
+// serve a provider's real, WHOLE GROUP schema with zero network calls at
+// resolution time. See the package doc comment for the full real account
+// of why this is a container of members, not one flat spec.
 type Snapshot struct {
 	// SchemaFormat is THIS FILE's own real shape version -- see the
 	// package doc comment. Always checked (CheckFormat) before any other
 	// field is trusted.
 	SchemaFormat int `json:"schema_format"`
 
-	// Provider is the real provider name this snapshot describes (e.g.
-	// "aws", "datadog") -- the same real identity
-	// [dynamic_providers.<name>]'s own table key already carries, kept
-	// here too since a snapshot file is meant to be a real, standalone,
-	// self-describing artifact, not dependent on whatever local config
-	// happens to reference it.
+	// Provider is the real group identity this snapshot describes --
+	// ubiquex's own [dynamic_provider_groups.<x>]'s own repo_name (e.g.
+	// "kubernetes", "aws"), matching the real published
+	// github.com/ubiquex/ubx-schema-<Provider> repo this snapshot IS.
 	Provider string `json:"provider"`
 
-	// Version is the provider's own real, mechanically-derived semver
-	// (internal/snapshot/diff.go) -- see the package doc comment for why
-	// this is a real, separate number from SchemaFormat.
+	// Version is the whole GROUP's own real, mechanically-derived semver
+	// (AssembleGroup) -- one number for every member together, not one
+	// per member. See the package doc comment for why.
 	Version string `json:"version"`
 
-	// SchemaSource names which real Build pipeline RawSpec needs.
-	SchemaSource SchemaSource `json:"schema_source"`
-
-	// Auth is the real, unchanged [dynamic_providers.<name>.auth] table
-	// this provider needs at real execution time -- carries auth TYPE and
-	// PARAM NAMES (e.g. "client_secret_env" -> an env var NAME), never a
-	// real secret value itself, identical to how config.Provider.Auth
-	// already works today.
-	Auth config.Auth `json:"auth"`
-
-	// BaseURL/Retry/Timeouts/Resources are the real, unchanged execution
-	// config every dynamic provider already declares in
-	// [dynamic_providers.<name>] today -- carried through unchanged so a
-	// snapshot is a real, complete replacement for that table, not a
-	// partial one still needing a live config file alongside it for
-	// anything beyond the schema itself.
-	BaseURL   string                           `json:"base_url"`
-	Retry     config.RetryConfig               `json:"retry"`
-	Timeouts  config.TimeoutsConfig            `json:"timeouts"`
-	Resources map[string]config.ResourceConfig `json:"resources,omitempty"`
-
-	// WireName/VersionQualifier/TargetPrefix are UBI-182's own real
-	// addition (SchemaFormat 2): the three remaining per-source
-	// generation/re-translation inputs that were config.Provider fields
-	// but not yet Snapshot fields (config.Provider.WireName,
-	// .VersionQualifier, .TargetPrefix -- config.go's own doc comments
-	// have the full real reason each exists). Necessary, not optional,
-	// once [providers.<name>] collapses to source+version only (UBI-182
-	// piece 4): a caller re-deriving a resource map from a PINNED entry
-	// has no live [dynamic_providers.<name>] table left to read these
-	// from, so Load<Source> needs them to come from the snapshot itself
-	// or it silently can't reproduce what Generate<Source> originally
-	// built. Empty string for every source that doesn't need one
-	// (openapi/cloudformation never populate any of these) -- omitempty
-	// keeps an openapi/cloudformation snapshot's own real JSON free of
-	// three always-empty fields it has no use for.
-	WireName         string `json:"wire_name,omitempty"`
-	VersionQualifier string `json:"version_qualifier,omitempty"`
-	TargetPrefix     string `json:"target_prefix,omitempty"`
-
-	// RawSpec is the real, verbatim, already-fetched provider spec this
-	// snapshot was generated from (SchemaSource says which real format).
-	// Deliberately the RAW spec, not this binary's own already-translated
-	// tfprotov6.Schema output: tftypes.Type (a real field on every
-	// tfprotov6.SchemaAttribute) has no working JSON UnmarshalJSON,
-	// confirmed live before this package was written (marshals fine,
-	// fails to round-trip back) -- but the real, deeper reason is that
-	// storing the RAW input, not the derived output, is what makes the
-	// SchemaFormat/Version split actually correct: Version tracks how
-	// THIS raw spec changed (the real provider's own API surface),
-	// SchemaFormat tracks how the BINARY'S OWN translation of that raw
-	// spec into a servable schema is allowed to change -- re-deriving the
-	// tfprotov6.Schema from RawSpec at load time, every time, using
-	// whatever translation logic THIS build ships, is the whole point.
-	RawSpec json.RawMessage `json:"raw_spec"`
+	// Members is one MemberSnapshot per real [dynamic_providers.<name>]
+	// table this group bundles, keyed by that table's own real name
+	// (e.g. "kubernetes", "kubernetes_ds") -- the exact name a launched
+	// process's own UBX_DYNAMIC_PROVIDER_NAME identifies, used to pick
+	// its own member back out of this map at load time.
+	Members map[string]*MemberSnapshot `json:"members"`
 }
 
 // CheckFormat refuses loudly, real and immediate, if the snapshot's own
 // SchemaFormat falls outside this build's declared
 // [MinSupportedSchemaFormat, MaxSupportedSchemaFormat] range -- never
 // silently misinterpreted as a shape this build doesn't actually
-// understand. The real, explicit direction matters for the error message:
-// a snapshot NEWER than this build understands needs a real binary
-// upgrade; a snapshot OLDER than this build still supports needs nothing
-// (that's the whole point of Min being allowed to trail Max), so only the
-// "too new" and "too old to still support" cases are real errors.
+// understand.
 func CheckFormat(schemaFormat int) error {
 	if schemaFormat < MinSupportedSchemaFormat {
 		return fmt.Errorf("%w: snapshot schema_format %d is older than this binary still supports (minimum %d) -- regenerate the snapshot with a real, current ubx-provider-dynamic build",
@@ -195,10 +244,36 @@ func CheckFormat(schemaFormat int) error {
 // which real direction (too old/too new) produced the message.
 var ErrUnsupportedSchemaFormat = fmt.Errorf("unsupported schema_format")
 
-// Save writes snap to path as real, indented, human-diffable JSON -- a
-// real snapshot file is meant to be reviewable (a real git diff on a
-// version bump should show what actually changed), not a packed binary
-// blob.
+// Member looks up name in snap's own real Members map, returning a real,
+// named, immediate error (not a nil-map panic or a silent zero value) if
+// this group doesn't bundle that member -- the real, single real
+// chokepoint every caller (runServeSnapshot, --dump-signals,
+// --dump-namespaces) uses to resolve its own UBX_DYNAMIC_PROVIDER_NAME
+// against a loaded group container.
+func (s *Snapshot) Member(name string) (*MemberSnapshot, error) {
+	m, ok := s.Members[name]
+	if !ok {
+		return nil, fmt.Errorf("snapshot for group %q has no member %q (real members: %v)", s.Provider, name, memberNames(s.Members))
+	}
+	return m, nil
+}
+
+func memberNames(members map[string]*MemberSnapshot) []string {
+	names := make([]string, 0, len(members))
+	for n := range members {
+		names = append(names, n)
+	}
+	return names
+}
+
+// Save writes snap to path as ONE real, indented, human-diffable JSON
+// file -- kept as this package's own simple, single-file primitive
+// (hermetic tests use it directly, and --prev-snapshot's own internal
+// diffing has no real need for split files) even though UBI-182's own
+// real distribution format (SaveSplit) is what an actual ubx-schema-<name>
+// repo commits and a real pinned resolution reads. Not used by any real
+// CLI path once SaveSplit exists -- deliberately kept as a plain,
+// reusable primitive rather than deleted.
 func Save(path string, snap *Snapshot) error {
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
@@ -206,6 +281,107 @@ func Save(path string, snap *Snapshot) error {
 	}
 	data = append(data, '\n')
 	return os.WriteFile(path, data, 0o644)
+}
+
+// manifest is SaveSplit/LoadSplit's own real, committed manifest.json
+// shape -- everything about the GROUP except its members' own real
+// content (schema_format/provider/version, plus which real member names
+// this group bundles). Deliberately does not embed *MemberSnapshot
+// values themselves -- those live in their own real, separately
+// diffable members/<name>.json files, the whole real reason this split
+// format exists (a version bump's own real git diff shows exactly which
+// members changed, not one undifferentiated blob -- UBI-182's own
+// explicit design decision, made after a real, measured file-size
+// problem at AWS's 430-member scale: one flat file would exceed
+// GitHub's own real 100MB commit limit by more than 2x).
+type manifest struct {
+	SchemaFormat int      `json:"schema_format"`
+	Provider     string   `json:"provider"`
+	Version      string   `json:"version"`
+	Members      []string `json:"members"`
+}
+
+// SaveSplit writes snap as a real, committable directory tree:
+// <dir>/manifest.json plus one <dir>/members/<name>.json per real
+// member, each independently indented and human-diffable. This is the
+// real, on-disk shape a ubx-schema-<type> repo commits, and the real
+// shape a release's own snapshot.tar.gz archive bundles (provider.Acquire
+// Schema, ubiquex) -- SaveSplit's own output IS what gets tar'd, not a
+// separately-derived representation.
+func SaveSplit(dir string, snap *Snapshot) error {
+	membersDir := filepath.Join(dir, "members")
+	if err := os.MkdirAll(membersDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", membersDir, err)
+	}
+
+	names := memberNames(snap.Members)
+	sort.Strings(names)
+	man := manifest{
+		SchemaFormat: snap.SchemaFormat,
+		Provider:     snap.Provider,
+		Version:      snap.Version,
+		Members:      names,
+	}
+	manData, err := json.MarshalIndent(man, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal manifest: %w", err)
+	}
+	manData = append(manData, '\n')
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), manData, 0o644); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
+
+	for _, name := range names {
+		memberData, err := json.MarshalIndent(snap.Members[name], "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshal member %q: %w", name, err)
+		}
+		memberData = append(memberData, '\n')
+		if err := os.WriteFile(filepath.Join(membersDir, name+".json"), memberData, 0o644); err != nil {
+			return fmt.Errorf("write member %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// LoadSplit is SaveSplit's own real, network-free counterpart -- reads a
+// real, already-extracted (or hand-populated mirror/checked-out repo)
+// directory tree back into one in-memory Snapshot. CheckFormat runs
+// here, always, exactly like Load: every real caller gets a real,
+// already-format-checked Snapshot or a real, honest error.
+func LoadSplit(dir string) (*Snapshot, error) {
+	manData, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		return nil, fmt.Errorf("read manifest in %s: %w", dir, err)
+	}
+	var man manifest
+	if err := json.Unmarshal(manData, &man); err != nil {
+		return nil, fmt.Errorf("parse manifest in %s: %w", dir, err)
+	}
+	if err := CheckFormat(man.SchemaFormat); err != nil {
+		return nil, fmt.Errorf("snapshot %s: %w", dir, err)
+	}
+
+	members := make(map[string]*MemberSnapshot, len(man.Members))
+	for _, name := range man.Members {
+		memberPath := filepath.Join(dir, "members", name+".json")
+		memberData, err := os.ReadFile(memberPath)
+		if err != nil {
+			return nil, fmt.Errorf("read member %q in %s: %w", name, dir, err)
+		}
+		var member MemberSnapshot
+		if err := json.Unmarshal(memberData, &member); err != nil {
+			return nil, fmt.Errorf("parse member %q in %s: %w", name, dir, err)
+		}
+		members[name] = &member
+	}
+
+	return &Snapshot{
+		SchemaFormat: man.SchemaFormat,
+		Provider:     man.Provider,
+		Version:      man.Version,
+		Members:      members,
+	}, nil
 }
 
 // Load reads and real-validates path's own snapshot -- CheckFormat runs
