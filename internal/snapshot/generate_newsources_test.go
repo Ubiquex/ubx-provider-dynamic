@@ -320,7 +320,7 @@ const widgetDiscoveryDocV2AddsField = `{
 
 func TestGenerateDiscoveryDocMember_FirstEverMember_RealMinorLevel(t *testing.T) {
 	url := serveSpec(t, widgetDiscoveryDocV1)
-	member, _, level, err := GenerateDiscoveryDocMember("widget", url, "", ModeResource, config.Provider{BaseURL: "https://widget.googleapis.com"}, nil)
+	member, _, level, err := GenerateDiscoveryDocMember("widget", "widget", url, "", ModeResource, config.Provider{BaseURL: "https://widget.googleapis.com"}, nil)
 	if err != nil {
 		t.Fatalf("GenerateDiscoveryDocMember: %v", err)
 	}
@@ -342,12 +342,12 @@ func TestGenerateDiscoveryDocMember_FirstEverMember_RealMinorLevel(t *testing.T)
 
 func TestGenerateDiscoveryDocMember_AdditiveChange_RealMinorLevel(t *testing.T) {
 	execCfg := config.Provider{BaseURL: "https://widget.googleapis.com"}
-	prevMember, _, _, err := GenerateDiscoveryDocMember("widget", serveSpec(t, widgetDiscoveryDocV1), "", ModeResource, execCfg, nil)
+	prevMember, _, _, err := GenerateDiscoveryDocMember("widget", "widget", serveSpec(t, widgetDiscoveryDocV1), "", ModeResource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("first generation: %v", err)
 	}
 
-	_, _, level, err := GenerateDiscoveryDocMember("widget", serveSpec(t, widgetDiscoveryDocV2AddsField), "", ModeResource, execCfg, prevMember)
+	_, _, level, err := GenerateDiscoveryDocMember("widget", "widget", serveSpec(t, widgetDiscoveryDocV2AddsField), "", ModeResource, execCfg, prevMember)
 	if err != nil {
 		t.Fatalf("second generation: %v", err)
 	}
@@ -358,7 +358,7 @@ func TestGenerateDiscoveryDocMember_AdditiveChange_RealMinorLevel(t *testing.T) 
 
 func TestGenerateDiscoveryDocMember_DataSourceMode_RealDataSources(t *testing.T) {
 	url := serveSpec(t, widgetDiscoveryDocV1)
-	member, schemas, level, err := GenerateDiscoveryDocMember("widget_ds", url, "", ModeDataSource, config.Provider{BaseURL: "https://widget.googleapis.com"}, nil)
+	member, schemas, level, err := GenerateDiscoveryDocMember("widget_ds", "widget", url, "", ModeDataSource, config.Provider{BaseURL: "https://widget.googleapis.com"}, nil)
 	if err != nil {
 		t.Fatalf("GenerateDiscoveryDocMember (data source): %v", err)
 	}

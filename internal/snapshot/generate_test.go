@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
@@ -99,7 +100,7 @@ func serveSpec(t *testing.T, body string) string {
 
 func TestGenerateOpenAPIMember_FirstEverMember_RealMinorLevel(t *testing.T) {
 	url := serveSpec(t, widgetSpecV1)
-	member, schemas, level, err := GenerateOpenAPIMember("widgetco", url, ModeResource, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
+	member, schemas, level, err := GenerateOpenAPIMember("widgetco", "widgetco", url, ModeResource, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
 	if err != nil {
 		t.Fatalf("GenerateOpenAPIMember: %v", err)
 	}
@@ -120,12 +121,12 @@ func TestGenerateOpenAPIMember_FirstEverMember_RealMinorLevel(t *testing.T) {
 
 func TestGenerateOpenAPIMember_AdditiveChange_RealMinorLevel(t *testing.T) {
 	execCfg := config.Provider{BaseURL: "https://api.widgetco.example"}
-	prevMember, _, _, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
+	prevMember, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("first generation: %v", err)
 	}
 
-	_, _, level, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV2AddsField), ModeResource, execCfg, prevMember)
+	_, _, level, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV2AddsField), ModeResource, execCfg, prevMember)
 	if err != nil {
 		t.Fatalf("second generation: %v", err)
 	}
@@ -136,12 +137,12 @@ func TestGenerateOpenAPIMember_AdditiveChange_RealMinorLevel(t *testing.T) {
 
 func TestGenerateOpenAPIMember_BreakingChange_RealMajorLevel(t *testing.T) {
 	execCfg := config.Provider{BaseURL: "https://api.widgetco.example"}
-	prevMember, _, _, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
+	prevMember, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("first generation: %v", err)
 	}
 
-	_, _, level, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV3RemovesRequiredField), ModeResource, execCfg, prevMember)
+	_, _, level, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV3RemovesRequiredField), ModeResource, execCfg, prevMember)
 	if err != nil {
 		t.Fatalf("second generation: %v", err)
 	}
@@ -152,12 +153,12 @@ func TestGenerateOpenAPIMember_BreakingChange_RealMajorLevel(t *testing.T) {
 
 func TestGenerateOpenAPIMember_NoChange_RealNoChangeLevel(t *testing.T) {
 	execCfg := config.Provider{BaseURL: "https://api.widgetco.example"}
-	prevMember, _, _, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
+	prevMember, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("first generation: %v", err)
 	}
 
-	_, _, level, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, prevMember)
+	_, _, level, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, prevMember)
 	if err != nil {
 		t.Fatalf("second generation: %v", err)
 	}
@@ -174,7 +175,7 @@ func TestGenerateOpenAPIMember_NoChange_RealNoChangeLevel(t *testing.T) {
 // data-source-mode member could not be generated at all for openapi.
 func TestGenerateOpenAPIMember_DataSourceMode_RealDataSourceCandidate(t *testing.T) {
 	url := serveSpec(t, widgetSpecV1)
-	member, schemas, level, err := GenerateOpenAPIMember("widgetco", url, ModeDataSource, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
+	member, schemas, level, err := GenerateOpenAPIMember("widgetco", "widgetco", url, ModeDataSource, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
 	if err != nil {
 		t.Fatalf("GenerateOpenAPIMember (data source): %v", err)
 	}
@@ -203,11 +204,55 @@ func TestGenerateOpenAPIMember_DataSourceMode_RealDataSourceCandidate(t *testing
 	}
 }
 
+// TestGenerateOpenAPIMember_WireNameOverride_RealDistinctTypeNames is a
+// real regression guard for a real, live-found bug this session's own
+// merge-group work caught before it could ship: GenerateOpenAPIMember
+// originally used name for BOTH identity/diffing AND wire-type
+// translation, silently ignoring a distinct wireName the way
+// GenerateSmithyMember already correctly did -- a data-source-mode
+// member keyed under a distinct table name (kubernetes_ds, matching
+// Kubernetes' own real config) generated wire type names prefixed
+// "kubernetes_ds_" instead of the intended, shared "kubernetes_" prefix
+// -- confirmed live against the already-generated, already-published
+// real kubernetes_ds member before this fix landed, not assumed. Proves
+// directly here that a member keyed "widgetco_ds" but given wireName
+// "widgetco" produces type names carrying the "widgetco_" prefix, not
+// "widgetco_ds_".
+func TestGenerateOpenAPIMember_WireNameOverride_RealDistinctTypeNames(t *testing.T) {
+	member, schemas, _, err := GenerateOpenAPIMember("widgetco_ds", "widgetco", serveSpec(t, widgetSpecV1), ModeDataSource, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
+	if err != nil {
+		t.Fatalf("GenerateOpenAPIMember: %v", err)
+	}
+	if member.WireName != "widgetco" {
+		t.Fatalf("WireName = %q, want %q (not stored, or lost)", member.WireName, "widgetco")
+	}
+	for typeName := range schemas {
+		if !strings.HasPrefix(typeName, "widgetco_") {
+			t.Errorf("type name %q does not carry the real wireName prefix \"widgetco_\" -- the table key \"widgetco_ds\" leaked into translation instead", typeName)
+		}
+		if strings.HasPrefix(typeName, "widgetco_ds_") {
+			t.Errorf("type name %q carries the table key's own \"widgetco_ds_\" prefix -- wireName was ignored", typeName)
+		}
+	}
+
+	// LoadOpenAPIMember must reproduce the IDENTICAL real type names from
+	// the stored WireName alone, with no separate hint from the caller.
+	_, dataSources, err := LoadOpenAPIMember("widgetco_ds", member)
+	if err != nil {
+		t.Fatalf("LoadOpenAPIMember: %v", err)
+	}
+	for typeName := range dataSources {
+		if !strings.HasPrefix(typeName, "widgetco_") || strings.HasPrefix(typeName, "widgetco_ds_") {
+			t.Errorf("reloaded type name %q does not match the real generated wireName prefix", typeName)
+		}
+	}
+}
+
 // TestGenerateOpenAPIMember_UnknownMode_RealFailLoud proves the fail-loud
 // requirement directly: an unrecognized Mode must error immediately, not
 // silently fall through to resource-shaped output.
 func TestGenerateOpenAPIMember_UnknownMode_RealFailLoud(t *testing.T) {
-	_, _, _, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV1), Mode("not-a-real-mode"), config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
+	_, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), Mode("not-a-real-mode"), config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
 	if err == nil {
 		t.Fatal("expected a real error for an unrecognized Mode")
 	}
@@ -227,7 +272,7 @@ func TestGenerateOpenAPIMember_ExternalRefs_RealRefusal(t *testing.T) {
 		t.Skip("set UBX_LIVE_VALIDATION=1 to run live validation against real, published specs")
 	}
 	const url = "https://raw.githubusercontent.com/Azure/azure-rest-api-specs/main/specification/compute/resource-manager/Microsoft.Compute/Compute/stable/2026-04-01/ComputeRP.json"
-	_, _, _, err := GenerateOpenAPIMember("azure", url, ModeResource, config.Provider{BaseURL: "https://management.azure.com"}, nil)
+	_, _, _, err := GenerateOpenAPIMember("azure", "azure", url, ModeResource, config.Provider{BaseURL: "https://management.azure.com"}, nil)
 	if err == nil {
 		t.Fatal("GenerateOpenAPIMember accepted a real spec with external $refs -- should have refused")
 	}
@@ -241,11 +286,11 @@ func TestGenerateOpenAPIMember_ExternalRefs_RealRefusal(t *testing.T) {
 // ---------------------------------------------------------------------
 
 func TestAssembleGroup_FirstEverGroup_RealVersion100(t *testing.T) {
-	resourceMember, _, _, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV1), ModeResource, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
+	resourceMember, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
 	if err != nil {
 		t.Fatalf("generate resource member: %v", err)
 	}
-	dsMember, _, _, err := GenerateOpenAPIMember("widgetco_ds", serveSpec(t, widgetSpecV1), ModeDataSource, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
+	dsMember, _, _, err := GenerateOpenAPIMember("widgetco_ds", "widgetco_ds", serveSpec(t, widgetSpecV1), ModeDataSource, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
 	if err != nil {
 		t.Fatalf("generate data-source member: %v", err)
 	}
@@ -269,11 +314,11 @@ func TestAssembleGroup_FirstEverGroup_RealVersion100(t *testing.T) {
 
 func TestAssembleGroup_OneMemberMajorChange_RealMajorGroupBump(t *testing.T) {
 	execCfg := config.Provider{BaseURL: "https://api.widgetco.example"}
-	prevResource, _, _, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
+	prevResource, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("prev resource member: %v", err)
 	}
-	prevDS, _, _, err := GenerateOpenAPIMember("widgetco_ds", serveSpec(t, widgetSpecV1), ModeDataSource, execCfg, nil)
+	prevDS, _, _, err := GenerateOpenAPIMember("widgetco_ds", "widgetco_ds", serveSpec(t, widgetSpecV1), ModeDataSource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("prev data-source member: %v", err)
 	}
@@ -286,11 +331,11 @@ func TestAssembleGroup_OneMemberMajorChange_RealMajorGroupBump(t *testing.T) {
 	// unchanged (NoChange level) -- the GROUP's own real version must
 	// still bump Major, since AssembleGroup takes the max across every
 	// member, not an average or a per-member vote.
-	nextResource, _, resourceLevel, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV3RemovesRequiredField), ModeResource, execCfg, prevResource)
+	nextResource, _, resourceLevel, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV3RemovesRequiredField), ModeResource, execCfg, prevResource)
 	if err != nil {
 		t.Fatalf("next resource member: %v", err)
 	}
-	nextDS, _, dsLevel, err := GenerateOpenAPIMember("widgetco_ds", serveSpec(t, widgetSpecV1), ModeDataSource, execCfg, prevDS)
+	nextDS, _, dsLevel, err := GenerateOpenAPIMember("widgetco_ds", "widgetco_ds", serveSpec(t, widgetSpecV1), ModeDataSource, execCfg, prevDS)
 	if err != nil {
 		t.Fatalf("next data-source member: %v", err)
 	}
@@ -312,11 +357,11 @@ func TestAssembleGroup_OneMemberMajorChange_RealMajorGroupBump(t *testing.T) {
 
 func TestAssembleGroup_MemberRemoved_RealMajorBumpUnconditional(t *testing.T) {
 	execCfg := config.Provider{BaseURL: "https://api.widgetco.example"}
-	resourceMember, _, _, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
+	resourceMember, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("resource member: %v", err)
 	}
-	dsMember, _, _, err := GenerateOpenAPIMember("widgetco_ds", serveSpec(t, widgetSpecV1), ModeDataSource, execCfg, nil)
+	dsMember, _, _, err := GenerateOpenAPIMember("widgetco_ds", "widgetco_ds", serveSpec(t, widgetSpecV1), ModeDataSource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("data-source member: %v", err)
 	}
@@ -328,7 +373,7 @@ func TestAssembleGroup_MemberRemoved_RealMajorBumpUnconditional(t *testing.T) {
 	// The next real generation only re-generates "widgetco" -- "widgetco_ds"
 	// is gone from the group entirely, an unconditional Major regardless
 	// of what its own content used to look like.
-	nextResource, _, resourceLevel, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, resourceMember)
+	nextResource, _, resourceLevel, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, resourceMember)
 	if err != nil {
 		t.Fatalf("next resource member: %v", err)
 	}
@@ -343,11 +388,11 @@ func TestAssembleGroup_MemberRemoved_RealMajorBumpUnconditional(t *testing.T) {
 
 func TestSnapshotSaveLoad_GroupContainer_RealRoundTrip(t *testing.T) {
 	execCfg := config.Provider{BaseURL: "https://api.widgetco.example"}
-	resourceMember, _, _, err := GenerateOpenAPIMember("widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
+	resourceMember, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("resource member: %v", err)
 	}
-	dsMember, _, _, err := GenerateOpenAPIMember("widgetco_ds", serveSpec(t, widgetSpecV1), ModeDataSource, execCfg, nil)
+	dsMember, _, _, err := GenerateOpenAPIMember("widgetco_ds", "widgetco_ds", serveSpec(t, widgetSpecV1), ModeDataSource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("data-source member: %v", err)
 	}
