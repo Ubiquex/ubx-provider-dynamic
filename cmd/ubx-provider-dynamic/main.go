@@ -74,12 +74,11 @@ var dumpNamespacesFlag = flag.Bool("dump-namespaces", false, "print real per-res
 // dumpSignalsFlag's own established shape: fetch this [dynamic_providers.
 // <name>] entry's real, live schema_url ONE time, verify it needs no
 // further network access, write a real internal/snapshot.Snapshot to the
-// given path, and exit -- never serves a tfplugin6 provider. Real,
-// explicit scope: only schema_source = "openapi" is wired to this flag
-// today (internal/snapshot's own doc comment has the full real account
-// of why smithy/cloudformation/discovery_docs each need their own,
-// separate Generate function first).
-var generateSnapshotFlag = flag.String("generate-snapshot", "", "generate a real, frozen schema snapshot to this path instead of serving a tfplugin6 provider, and exit (schema_source = \"openapi\" only today)")
+// given path, and exit -- never serves a tfplugin6 provider. UBI-182:
+// wired to all four real schema sources (was openapi only) --
+// runGenerateSnapshot's own switch dispatches to the source-appropriate
+// Generate<Source>.
+var generateSnapshotFlag = flag.String("generate-snapshot", "", "generate a real, frozen schema snapshot to this path instead of serving a tfplugin6 provider, and exit")
 
 // prevSnapshotFlag is generateSnapshotFlag's own real, optional sibling:
 // the PRIOR real snapshot (if any) to diff the freshly-fetched spec
@@ -105,9 +104,9 @@ const nameEnvVar = "UBX_DYNAMIC_PROVIDER_NAME"
 // snapshot-driven serving needs none of that table's own
 // schema_source/schema_url fields, only Auth/BaseURL/Retry/Timeouts,
 // which the snapshot itself already carries (Snapshot's own doc comment
-// covers why). Real, explicit scope, matching internal/snapshot's own:
-// only a schema_source = "openapi"-derived snapshot is servable this way
-// today.
+// covers why). UBI-182: servable this way for all four real schema
+// sources (was openapi only) -- runServeSnapshot's own switch dispatches
+// to the source-appropriate Load<Source> and server construction.
 const snapshotPathEnvVar = "UBX_SNAPSHOT_PATH"
 
 func main() {
@@ -126,6 +125,22 @@ func run() error {
 	}
 
 	if snapPath := os.Getenv(snapshotPathEnvVar); snapPath != "" {
+		// UBI-182: --dump-signals/--dump-namespaces against a pinned
+		// snapshot -- previously unreachable (this branch always fell
+		// straight to runServeSnapshot, which only ever opens a real
+		// tfplugin6 serve, never checks either flag) -- confirmed the
+		// real, root gap ubiquex's own cli/dynamicprovider.go named
+		// (dynamicProviderSignals' own doc comment: "--dump-signals'
+		// own plain-subprocess mode was never wired to snapshot
+		// loading"). Checked here, before runServeSnapshot, mirroring
+		// every live-fetch branch's own real ordering (build resources,
+		// THEN check either flag, THEN fall through to real serving).
+		if *dumpSignalsFlag {
+			return runDumpSignalsFromSnapshot(name, snapPath)
+		}
+		if *dumpNamespacesFlag {
+			return runDumpNamespacesFromSnapshot(name, snapPath)
+		}
 		return runServeSnapshot(name, snapPath)
 	}
 
@@ -615,46 +630,104 @@ func run() error {
 }
 
 // runServeSnapshot is snapshotPathEnvVar's own real implementation -- the
-// literal fix for the problem this whole package exists to solve. Loads a
-// real, already-generated Snapshot from snapPath (snapshot.Load already
-// runs CheckFormat, so an out-of-range schema_format refuses loudly right
-// here, before any RPC serving begins), re-derives its real resource map
-// via snapshot.LoadOpenAPI (zero network -- the same real translation the
-// live-fetch path runs, just fed frozen RawSpec bytes), and serves it
-// through the IDENTICAL real tf6server.Serve/dynserver.Server code path
-// run()'s own default-openapi branch above uses -- the only real
-// difference is where Auth/BaseURL/Retry/Resources come from (the
-// snapshot's own fields, not a live .ubx/config fetch).
+// literal fix for the problem this whole package exists to solve. Loads
+// a real, already-generated Snapshot from snapPath (snapshot.Load
+// already runs CheckFormat, so an out-of-range schema_format refuses
+// loudly right here, before any RPC serving begins), re-derives its real
+// resource map via the source-appropriate Load<Source> (zero network --
+// the same real translation the live-fetch path runs, just fed frozen
+// RawSpec bytes), and serves it through the IDENTICAL real server
+// construction run()'s own matching live-fetch branch uses for that
+// source -- UBI-182 generalized this from openapi-only to all four,
+// since each source's own real execution model genuinely differs
+// (dynserver.Server for openapi/discoverydoc, cfnserver.Server for
+// cloudformation, smithyserver.Server for smithy -- confirmed by reading
+// each live-fetch branch's own server construction, not assumed
+// uniform). The only real difference from each source's own live-fetch
+// branch is where Auth/BaseURL/Retry/Resources/WireName/TargetPrefix
+// come from (the snapshot's own fields, not a live .ubx/config fetch).
 func runServeSnapshot(name, snapPath string) error {
 	snap, err := snapshot.Load(snapPath)
 	if err != nil {
 		return fmt.Errorf("load snapshot %s: %w", snapPath, err)
 	}
 
-	resources, err := snapshot.LoadOpenAPI(name, snap)
-	if err != nil {
-		return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
-	}
-	if len(resources) == 0 {
-		return fmt.Errorf("no CRUD-shaped resources in snapshot %s -- nothing to serve", snapPath)
-	}
-
 	authenticator, err := auth.Build(snap.Auth.Type, snap.Auth.Params)
 	if err != nil {
 		return fmt.Errorf("build authenticator: %w", err)
 	}
-
 	retryPolicy, err := dynserver.ResolveRetryPolicy(snap.Retry)
 	if err != nil {
 		return fmt.Errorf("resolve retry policy: %w", err)
 	}
-	client := restexec.NewClient(snap.BaseURL, authenticator)
-	client.Retry = retryPolicy
+	restClient := restexec.NewClient(snap.BaseURL, authenticator)
+	restClient.Retry = retryPolicy
 
-	server := &dynserver.Server{
-		ProviderName: name,
-		Resources:    resources,
-		Client:       client,
+	var server tfprotov6.ProviderServer
+	switch snap.SchemaSource {
+	case snapshot.SchemaSourceOpenAPI:
+		resources, err := snapshot.LoadOpenAPI(name, snap)
+		if err != nil {
+			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+		}
+		if len(resources) == 0 {
+			return fmt.Errorf("no CRUD-shaped resources in snapshot %s -- nothing to serve", snapPath)
+		}
+		server = &dynserver.Server{ProviderName: name, Resources: resources, Client: restClient}
+
+	case snapshot.SchemaSourceDiscoveryDoc:
+		// Schema-layer only, matching run()'s own real discoverydoc
+		// live-fetch branch exactly (that branch's own doc comment:
+		// dynserver.Server is reused UNCHANGED for GetProviderSchema,
+		// since that RPC reads only ResourceType.Schema -- real REST
+		// wire execution against a live GCP endpoint is a separate,
+		// deliberately-unattempted future checkpoint, not something
+		// this snapshot path invents beyond what the live path already
+		// does).
+		built, err := snapshot.LoadDiscoveryDoc(snap)
+		if err != nil {
+			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+		}
+		if len(built) == 0 {
+			return fmt.Errorf("no CRUD-shaped resources in snapshot %s -- nothing to serve", snapPath)
+		}
+		resources := make(map[string]*dynserver.ResourceType, len(built))
+		for typeName, br := range built {
+			resources[typeName] = &dynserver.ResourceType{Schema: br.Schema}
+		}
+		server = &dynserver.Server{ProviderName: name, Resources: resources}
+
+	case snapshot.SchemaSourceCloudFormation:
+		built, err := snapshot.LoadCloudFormation(snap)
+		if err != nil {
+			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+		}
+		if len(built) == 0 {
+			return fmt.Errorf("no resources in snapshot %s -- nothing to serve", snapPath)
+		}
+		server = cfnserver.New(name, built, &ccapi.Client{Rest: restClient})
+
+	case snapshot.SchemaSourceSmithy:
+		var smithyDoc smithy.Model
+		if err := json.Unmarshal(snap.RawSpec, &smithyDoc); err != nil {
+			return fmt.Errorf("parse snapshot's own raw_spec: %w", err)
+		}
+		svc, err := smithy.FindService(&smithyDoc)
+		if err != nil {
+			return fmt.Errorf("find Smithy service in snapshot %s: %w", snapPath, err)
+		}
+		built, err := snapshot.LoadSmithy(snap)
+		if err != nil {
+			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+		}
+		if len(built) == 0 {
+			return fmt.Errorf("no CRUD-shaped resources in snapshot %s -- nothing to serve", snapPath)
+		}
+		wireClient := &wireexec.Client{Rest: restClient, Model: &smithyDoc, Service: svc, TargetPrefix: snap.TargetPrefix}
+		server = &smithyserver.Server{ProviderName: name, Resources: built, Model: &smithyDoc, Wire: wireClient}
+
+	default:
+		return fmt.Errorf("snapshot %s: schema_source %q is not a real, known schema source", snapPath, snap.SchemaSource)
 	}
 
 	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: serving %q from real snapshot %s (version %s, schema_format %d), zero network at schema resolution time\n",
@@ -665,15 +738,123 @@ func runServeSnapshot(name, snapPath string) error {
 	})
 }
 
+// runDumpSignalsFromSnapshot is --dump-signals' own real, snapshot-driven
+// counterpart to each live-fetch branch's own identical `if
+// *dumpSignalsFlag` check -- UBI-182's real fix for the gap
+// ubiquex's own cli/dynamicprovider.go named. Mirrors each source's own
+// real, already-established signal availability exactly: openapi and
+// discoverydoc both carry real, per-field signals on their own built
+// resource (rt.Signals/br.Signals, populated by internal/schema's own
+// CollectSignals during Build); cloudformation and smithy both emit a
+// real, honest empty map, matching their own live-fetch branches'
+// already-documented "not yet implemented for this source" answer --
+// this function doesn't invent capability the live path doesn't have,
+// it only makes what already exists reachable from a pinned snapshot.
+func runDumpSignalsFromSnapshot(name, snapPath string) error {
+	snap, err := snapshot.Load(snapPath)
+	if err != nil {
+		return fmt.Errorf("load snapshot %s: %w", snapPath, err)
+	}
+
+	switch snap.SchemaSource {
+	case snapshot.SchemaSourceOpenAPI:
+		resources, err := snapshot.LoadOpenAPI(name, snap)
+		if err != nil {
+			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+		}
+		out := make(map[string]map[string]*uschema.FieldSignal, len(resources))
+		for typeName, rt := range resources {
+			out[typeName] = rt.Signals
+		}
+		return json.NewEncoder(os.Stdout).Encode(out)
+
+	case snapshot.SchemaSourceDiscoveryDoc:
+		built, err := snapshot.LoadDiscoveryDoc(snap)
+		if err != nil {
+			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+		}
+		out := make(map[string]map[string]*uschema.FieldSignal, len(built))
+		for typeName, br := range built {
+			out[typeName] = br.Signals
+		}
+		return json.NewEncoder(os.Stdout).Encode(out)
+
+	case snapshot.SchemaSourceCloudFormation, snapshot.SchemaSourceSmithy:
+		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: --dump-signals: not yet implemented for schema_source = %q -- emitting an empty, real result, not an error\n", snap.SchemaSource)
+		return json.NewEncoder(os.Stdout).Encode(map[string]map[string]*uschema.FieldSignal{})
+
+	default:
+		return fmt.Errorf("snapshot %s: schema_source %q is not a real, known schema source", snapPath, snap.SchemaSource)
+	}
+}
+
+// runDumpNamespacesFromSnapshot is --dump-namespaces' own real,
+// snapshot-driven counterpart -- same real reasoning as
+// runDumpSignalsFromSnapshot. openapi and discoverydoc both emit a real,
+// honest empty map (their own live-fetch branches' own documented
+// "already correct by construction" finding -- nothing for this
+// override to add). cloudformation and smithy both compute a real
+// namespace per resource, mirroring their own live-fetch branches
+// exactly (cloudformation.SplitTypeName; smithy.ServiceNamespace, which
+// needs the real Smithy service shape -- re-derived here via
+// smithy.FindService against the snapshot's own frozen RawSpec, zero
+// network).
+func runDumpNamespacesFromSnapshot(name, snapPath string) error {
+	snap, err := snapshot.Load(snapPath)
+	if err != nil {
+		return fmt.Errorf("load snapshot %s: %w", snapPath, err)
+	}
+
+	switch snap.SchemaSource {
+	case snapshot.SchemaSourceOpenAPI, snapshot.SchemaSourceDiscoveryDoc:
+		return json.NewEncoder(os.Stdout).Encode(map[string]string{})
+
+	case snapshot.SchemaSourceCloudFormation:
+		built, err := snapshot.LoadCloudFormation(snap)
+		if err != nil {
+			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+		}
+		out := make(map[string]string, len(built))
+		for resourceTypeName, br := range built {
+			ns, _ := cloudformation.SplitTypeName(br.TypeName)
+			out[resourceTypeName] = strings.ToLower(ns)
+		}
+		return json.NewEncoder(os.Stdout).Encode(out)
+
+	case snapshot.SchemaSourceSmithy:
+		var smithyDoc smithy.Model
+		if err := json.Unmarshal(snap.RawSpec, &smithyDoc); err != nil {
+			return fmt.Errorf("parse snapshot's own raw_spec: %w", err)
+		}
+		svc, err := smithy.FindService(&smithyDoc)
+		if err != nil {
+			return fmt.Errorf("find Smithy service in snapshot %s: %w", snapPath, err)
+		}
+		built, err := snapshot.LoadSmithy(snap)
+		if err != nil {
+			return fmt.Errorf("rebuild resource schemas from snapshot %s: %w", snapPath, err)
+		}
+		out := make(map[string]string, len(built))
+		for hcName := range built {
+			out[hcName] = smithy.ServiceNamespace(svc)
+		}
+		return json.NewEncoder(os.Stdout).Encode(out)
+
+	default:
+		return fmt.Errorf("snapshot %s: schema_source %q is not a real, known schema source", snapPath, snap.SchemaSource)
+	}
+}
+
 // runGenerateSnapshot is generateSnapshotFlag's own real implementation --
-// see its own doc comment for scope (schema_source = "openapi" only
-// today). Loads prevPath (if given) for real, mechanical version
-// derivation, fetches cfg's own real, live schema ONE time, and writes a
-// real, complete Snapshot to outPath.
+// UBI-182 opened this to all four real schema sources (was openapi
+// only). Loads prevPath (if given) for real, mechanical version
+// derivation, fetches cfg's own real, live schema ONE time via the
+// source-appropriate Generate<Source>, and writes a real, complete
+// Snapshot to outPath.
 func runGenerateSnapshot(name string, cfg config.Provider, outPath, prevPath string) error {
-	if cfg.SchemaSource != config.SchemaSourceOpenAPI {
-		return fmt.Errorf("--generate-snapshot: [dynamic_providers.%s]'s own schema_source %q is not yet supported -- only %q is wired to real snapshot generation today (internal/snapshot's own doc comment has the full real scope statement)",
-			name, cfg.SchemaSource, config.SchemaSourceOpenAPI)
+	wireName := name
+	if cfg.WireName != "" {
+		wireName = cfg.WireName
 	}
 
 	var prev *snapshot.Snapshot
@@ -685,7 +866,20 @@ func runGenerateSnapshot(name string, cfg config.Provider, outPath, prevPath str
 		prev = p
 	}
 
-	snap, err := snapshot.GenerateOpenAPI(name, cfg.SchemaURL, cfg, prev)
+	var snap *snapshot.Snapshot
+	var err error
+	switch cfg.SchemaSource {
+	case config.SchemaSourceOpenAPI:
+		snap, err = snapshot.GenerateOpenAPI(name, cfg.SchemaURL, cfg, prev)
+	case config.SchemaSourceCloudFormation:
+		snap, err = snapshot.GenerateCloudFormation(name, cfg.SchemaURL, cfg, prev)
+	case config.SchemaSourceSmithy:
+		snap, err = snapshot.GenerateSmithy(name, wireName, cfg.SchemaURL, cfg.TargetPrefix, cfg, prev)
+	case config.SchemaSourceDiscoveryDoc:
+		snap, err = snapshot.GenerateDiscoveryDoc(name, cfg.SchemaURL, cfg.VersionQualifier, cfg, prev)
+	default:
+		return fmt.Errorf("--generate-snapshot: [dynamic_providers.%s]'s own schema_source %q is not a real, known schema source", name, cfg.SchemaSource)
+	}
 	if err != nil {
 		return fmt.Errorf("generate snapshot for %q: %w", name, err)
 	}

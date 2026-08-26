@@ -26,15 +26,21 @@
 //     from what actually changed in the provider's own real spec between
 //     one snapshot and the next, never hand-picked.
 //
-// Scope, real and explicit, not silently assumed to generalize further:
-// this package's own real Generate/Load pair is built and proven for
-// schema_source = "openapi" only (GenerateOpenAPI/LoadOpenAPI) --
-// smithy/cloudformation/discovery_docs each have their own real, separate
-// Build pipeline (cmd/ubx-provider-dynamic/main.go's own real per-source
-// branches) and need their own real Generate/Load pair before this
-// package's own promise ("no network at schema resolution time") is true
-// for them too. Named here as real, necessary follow-up work, not
-// attempted this session.
+// UBI-182: this package's own real Generate/Load pair now covers all
+// four real schema sources (GenerateOpenAPI/LoadOpenAPI,
+// GenerateCloudFormation/LoadCloudFormation, GenerateSmithy/LoadSmithy,
+// GenerateDiscoveryDoc/LoadDiscoveryDoc) -- each has its own real fetch
+// mechanics and Build signature (cmd/ubx-provider-dynamic/main.go's own
+// real per-source branches), but every one of them converges on the
+// SAME real translated type (map[string]*tfprotov6.Schema, produced by
+// internal/schema.Translator.BuildTopLevel, completely unchanged
+// regardless of source) before diffing/versioning/Snapshot construction
+// happens -- generateFromSchemas (generate.go) is that one, real, shared
+// core every Generate<Source> funnels through, so the "one implementation
+// rather than four" the design calls for lives at the level the sources
+// actually converge (post-translation), not forced onto the fetch/Build
+// step itself, which genuinely differs per source (CFN fetches a zip of
+// many files; Smithy/DiscoveryDoc/OpenAPI fetch one document each).
 package snapshot
 
 import (
@@ -50,19 +56,24 @@ import (
 // supported range (a binary always writes its own newest, best-understood
 // shape; MinSupportedSchemaFormat exists only so a build one or more
 // versions old can still read snapshots older builds already wrote).
-const CurrentSchemaFormat = 1
+const CurrentSchemaFormat = 2
 
 // MinSupportedSchemaFormat/MaxSupportedSchemaFormat is THIS BUILD's own
 // real, declared compatibility range -- CheckFormat's own real source of
-// truth. Both equal CurrentSchemaFormat today (this package's first real
-// version); a future binary that changes the snapshot shape bumps
-// CurrentSchemaFormat and MaxSupportedSchemaFormat together and may widen
-// MinSupportedSchemaFormat downward if it chooses to keep reading the
-// prior shape too -- a real, deliberate choice for that future change to
-// make, not decided here.
+// truth. Bumped to 2 for UBI-182's own real, additive change (WireName/
+// VersionQualifier/TargetPrefix, see the Snapshot struct's own doc
+// comment) -- MinSupportedSchemaFormat stays at 1 rather than following
+// Max upward, since a real format-1 snapshot (every real openapi/
+// cloudformation snapshot ever generated, and any smithy/discoverydoc
+// snapshot has no format-1 precedent to be backward-compatible WITH in
+// the first place) unmarshals into the three new fields as their real
+// Go zero value (empty string), which is exactly what an
+// openapi/cloudformation snapshot's own real JSON already omits via
+// their own omitempty tags -- a genuinely, not just nominally,
+// backward-compatible read.
 const (
 	MinSupportedSchemaFormat = 1
-	MaxSupportedSchemaFormat = 1
+	MaxSupportedSchemaFormat = 2
 )
 
 // SchemaSource names which real Build pipeline a Snapshot's own RawSpec
@@ -74,7 +85,10 @@ const (
 type SchemaSource string
 
 const (
-	SchemaSourceOpenAPI SchemaSource = "openapi"
+	SchemaSourceOpenAPI        SchemaSource = "openapi"
+	SchemaSourceCloudFormation SchemaSource = "cloudformation"
+	SchemaSourceSmithy         SchemaSource = "smithy"
+	SchemaSourceDiscoveryDoc   SchemaSource = "discovery_docs"
 )
 
 // Snapshot is one real, frozen file: everything the binary needs to serve
@@ -118,6 +132,25 @@ type Snapshot struct {
 	Retry     config.RetryConfig               `json:"retry"`
 	Timeouts  config.TimeoutsConfig            `json:"timeouts"`
 	Resources map[string]config.ResourceConfig `json:"resources,omitempty"`
+
+	// WireName/VersionQualifier/TargetPrefix are UBI-182's own real
+	// addition (SchemaFormat 2): the three remaining per-source
+	// generation/re-translation inputs that were config.Provider fields
+	// but not yet Snapshot fields (config.Provider.WireName,
+	// .VersionQualifier, .TargetPrefix -- config.go's own doc comments
+	// have the full real reason each exists). Necessary, not optional,
+	// once [providers.<name>] collapses to source+version only (UBI-182
+	// piece 4): a caller re-deriving a resource map from a PINNED entry
+	// has no live [dynamic_providers.<name>] table left to read these
+	// from, so Load<Source> needs them to come from the snapshot itself
+	// or it silently can't reproduce what Generate<Source> originally
+	// built. Empty string for every source that doesn't need one
+	// (openapi/cloudformation never populate any of these) -- omitempty
+	// keeps an openapi/cloudformation snapshot's own real JSON free of
+	// three always-empty fields it has no use for.
+	WireName         string `json:"wire_name,omitempty"`
+	VersionQualifier string `json:"version_qualifier,omitempty"`
+	TargetPrefix     string `json:"target_prefix,omitempty"`
 
 	// RawSpec is the real, verbatim, already-fetched provider spec this
 	// snapshot was generated from (SchemaSource says which real format).
