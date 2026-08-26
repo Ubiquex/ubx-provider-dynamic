@@ -297,7 +297,7 @@ func TestAssembleGroup_FirstEverGroup_RealVersion100(t *testing.T) {
 
 	members := map[string]*MemberSnapshot{"widgetco": resourceMember, "widgetco_ds": dsMember}
 	levels := map[string]ChangeLevel{"widgetco": Minor, "widgetco_ds": Minor}
-	group, err := AssembleGroup("widgetco", nil, members, levels)
+	group, err := AssembleGroup("widgetco", nil, members, levels, nil)
 	if err != nil {
 		t.Fatalf("AssembleGroup: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestAssembleGroup_OneMemberMajorChange_RealMajorGroupBump(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prev data-source member: %v", err)
 	}
-	prevGroup, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": prevResource, "widgetco_ds": prevDS}, map[string]ChangeLevel{"widgetco": Minor, "widgetco_ds": Minor})
+	prevGroup, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": prevResource, "widgetco_ds": prevDS}, map[string]ChangeLevel{"widgetco": Minor, "widgetco_ds": Minor}, nil)
 	if err != nil {
 		t.Fatalf("AssembleGroup (prev): %v", err)
 	}
@@ -346,7 +346,7 @@ func TestAssembleGroup_OneMemberMajorChange_RealMajorGroupBump(t *testing.T) {
 		t.Fatalf("data-source member level = %s, want none (test setup)", dsLevel)
 	}
 
-	nextGroup, err := AssembleGroup("widgetco", prevGroup, map[string]*MemberSnapshot{"widgetco": nextResource, "widgetco_ds": nextDS}, map[string]ChangeLevel{"widgetco": resourceLevel, "widgetco_ds": dsLevel})
+	nextGroup, err := AssembleGroup("widgetco", prevGroup, map[string]*MemberSnapshot{"widgetco": nextResource, "widgetco_ds": nextDS}, map[string]ChangeLevel{"widgetco": resourceLevel, "widgetco_ds": dsLevel}, nil)
 	if err != nil {
 		t.Fatalf("AssembleGroup (next): %v", err)
 	}
@@ -365,7 +365,7 @@ func TestAssembleGroup_MemberRemoved_RealMajorBumpUnconditional(t *testing.T) {
 	if err != nil {
 		t.Fatalf("data-source member: %v", err)
 	}
-	prevGroup, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": resourceMember, "widgetco_ds": dsMember}, map[string]ChangeLevel{"widgetco": Minor, "widgetco_ds": Minor})
+	prevGroup, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": resourceMember, "widgetco_ds": dsMember}, map[string]ChangeLevel{"widgetco": Minor, "widgetco_ds": Minor}, nil)
 	if err != nil {
 		t.Fatalf("AssembleGroup (prev): %v", err)
 	}
@@ -377,7 +377,7 @@ func TestAssembleGroup_MemberRemoved_RealMajorBumpUnconditional(t *testing.T) {
 	if err != nil {
 		t.Fatalf("next resource member: %v", err)
 	}
-	nextGroup, err := AssembleGroup("widgetco", prevGroup, map[string]*MemberSnapshot{"widgetco": nextResource}, map[string]ChangeLevel{"widgetco": resourceLevel})
+	nextGroup, err := AssembleGroup("widgetco", prevGroup, map[string]*MemberSnapshot{"widgetco": nextResource}, map[string]ChangeLevel{"widgetco": resourceLevel}, nil)
 	if err != nil {
 		t.Fatalf("AssembleGroup (next): %v", err)
 	}
@@ -396,7 +396,7 @@ func TestSnapshotSaveLoad_GroupContainer_RealRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("data-source member: %v", err)
 	}
-	group, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": resourceMember, "widgetco_ds": dsMember}, map[string]ChangeLevel{"widgetco": Minor, "widgetco_ds": Minor})
+	group, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": resourceMember, "widgetco_ds": dsMember}, map[string]ChangeLevel{"widgetco": Minor, "widgetco_ds": Minor}, nil)
 	if err != nil {
 		t.Fatalf("AssembleGroup: %v", err)
 	}

@@ -99,6 +99,19 @@ var groupRepoNameFlag = flag.String("group-repo-name", "", "the group's own real
 // one active name).
 var groupMembersFlag = flag.String("group-members", "", "comma-separated [dynamic_providers.<name>] table names this group bundles -- required with --generate-snapshot-group")
 
+// groupExcludeFlag is generateSnapshotGroupFlag's own optional sibling
+// carrying UBI-182's own real precedence record: a JSON object, member
+// name -> real wire type names that member's own copy loses a
+// collision for (the SAME real shape and the SAME real judgment
+// ubiquex's own [dynamic_provider_groups.<x>.exclude] table already
+// records for codegen -- e.g. Datadog's own real v1/v2 collisions,
+// where v1's richer version wins both times). Recorded verbatim onto
+// the written Snapshot's own Exclude field (internal/snapshot.AssembleGroup)
+// -- this flag is where a caller who already knows a real collision
+// (from that SAME config) passes the judgment through, not where one
+// gets invented. Omit for a group with no known real collisions.
+var groupExcludeFlag = flag.String("group-exclude", "", "JSON object of member name -> real wire type names that member's own copy loses a collision for (mirrors ubiquex's own dynamic_provider_groups exclude table) -- optional with --generate-snapshot-group")
+
 // prevSnapshotFlag is generateSnapshotGroupFlag's own real, optional
 // sibling: the PRIOR real group container (if any) to diff the freshly-
 // fetched members against, so the new group's own Version is
@@ -143,7 +156,7 @@ func run() error {
 	// into one group container, so it has no single active
 	// UBX_DYNAMIC_PROVIDER_NAME to require at all.
 	if *generateSnapshotGroupFlag != "" {
-		return runGenerateSnapshotGroup(*generateSnapshotGroupFlag, *groupRepoNameFlag, *groupMembersFlag, *prevSnapshotFlag)
+		return runGenerateSnapshotGroup(*generateSnapshotGroupFlag, *groupRepoNameFlag, *groupMembersFlag, *prevSnapshotFlag, *groupExcludeFlag)
 	}
 
 	name := os.Getenv(nameEnvVar)
@@ -956,12 +969,19 @@ func runDumpNamespacesFromSnapshot(name, snapPath string) error {
 // real time via the source-and-mode-appropriate Generate<Source>Member,
 // and assembles them into ONE real, versioned group container
 // (AssembleGroup) written to outPath.
-func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath string) error {
+func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJSON string) error {
 	if repoName == "" {
 		return fmt.Errorf("--generate-snapshot-group requires --group-repo-name")
 	}
 	if membersCSV == "" {
 		return fmt.Errorf("--generate-snapshot-group requires --group-members (comma-separated [dynamic_providers.<name>] table names)")
+	}
+
+	var exclude map[string][]string
+	if excludeJSON != "" {
+		if err := json.Unmarshal([]byte(excludeJSON), &exclude); err != nil {
+			return fmt.Errorf("--group-exclude: invalid JSON: %w", err)
+		}
 	}
 
 	dir, err := os.Getwd()
@@ -1027,7 +1047,7 @@ func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath string) er
 		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: generated member %q (%s, %s), own change level: %s\n", memberName, cfg.SchemaSource, mode, level)
 	}
 
-	group, err := snapshot.AssembleGroup(repoName, prev, members, levels)
+	group, err := snapshot.AssembleGroup(repoName, prev, members, levels, exclude)
 	if err != nil {
 		return fmt.Errorf("assemble group %q: %w", repoName, err)
 	}

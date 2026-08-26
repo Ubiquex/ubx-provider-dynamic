@@ -55,19 +55,73 @@ var ErrMixedSchemaSourceGroup = fmt.Errorf("group spans more than one real schem
 
 // ErrDuplicateWireType is a real, named, honest refusal -- two members
 // of the same group produced the identical real wire type name within
-// the SAME schema role (both resource-mode, or both data-source-mode).
-// Confirmed live for a real group this session (Datadog's own v1/v2:
-// two colliding resource names, one colliding data-source name,
-// documented in ubiquex's own sdk/providers/.ubx/config) -- resolving
-// this today requires a real precedence rule (v1's own richer version
-// wins, currently only implemented as ubx sdk gen's own codegen-time
-// exclude table, a separate mechanism this package does not yet share).
-// Refusing loudly here, rather than letting Go's own map-merge order
-// silently pick an arbitrary winner, is the real, deliberate choice --
-// a group with a real collision needs that precedence rule built
-// before it can be served merged; named as real, explicit follow-up
-// work, not solved here.
-var ErrDuplicateWireType = fmt.Errorf("duplicate wire type name across group members of the same schema role")
+// the SAME schema role (both resource-mode, or both data-source-mode),
+// and the snapshot's own Exclude does not name a real precedence
+// resolving it. Confirmed live for a real group this session (Datadog's
+// own v1/v2: two colliding resource names, one colliding data-source
+// name, documented in ubiquex's own sdk/providers/.ubx/config) --
+// resolving a real, KNOWN collision is Exclude's own real job (see
+// Snapshot.Exclude's own doc comment); this error means the collision
+// was NOT known, or Exclude's own real entry doesn't actually name the
+// member that lost. Refusing loudly here, rather than letting Go's own
+// map-merge order silently pick an arbitrary winner, is the real,
+// deliberate choice -- a silent default is exactly what the wire_name
+// bug this same arc found and fixed was already doing.
+var ErrDuplicateWireType = fmt.Errorf("duplicate wire type name across group members of the same schema role, not resolved by the snapshot's own exclude table")
+
+// mergeWithExclude adds one real member's own contributions into dest,
+// resolving any real collision via snap's own Exclude table (the SAME
+// real precedence judgment ubx sdk gen's own codegen-time exclude table
+// already recorded for this exact group -- see Snapshot.Exclude's own
+// doc comment). placedBy tracks which real member currently owns each
+// key already placed in dest, so a collision resolves correctly
+// regardless of which member happens to be processed first (Exclude
+// entries name the LOSING member+typeName pair explicitly, not "whoever
+// got there first"). typeNames are walked in sorted order -- the exact
+// real determinism discipline ubiquex's own mergeDynamicProviderGroupMembers
+// already established for the identical real reason (Go's own map
+// iteration is deliberately randomized per process; CLAUDE.md's own
+// determinism rule forbids that leaking into a real, reported result).
+// Fails loud (ErrDuplicateWireType) if a real collision has no Exclude
+// entry naming either side as the loser.
+func mergeWithExclude[T any](dest map[string]T, placedBy map[string]string, contributions map[string]T, memberName string, exclude map[string][]string, role string) error {
+	typeNames := make([]string, 0, len(contributions))
+	for typeName := range contributions {
+		typeNames = append(typeNames, typeName)
+	}
+	sort.Strings(typeNames)
+
+	for _, typeName := range typeNames {
+		value := contributions[typeName]
+		existingMember, exists := placedBy[typeName]
+		if !exists {
+			dest[typeName] = value
+			placedBy[typeName] = memberName
+			continue
+		}
+		if isExcluded(exclude, memberName, typeName) {
+			continue // this member's own copy loses -- the existing value stays
+		}
+		if isExcluded(exclude, existingMember, typeName) {
+			dest[typeName] = value // the existing member's own copy loses -- this one replaces it
+			placedBy[typeName] = memberName
+			continue
+		}
+		return fmt.Errorf("%w: %q (%s), contributed by both %q and %q", ErrDuplicateWireType, typeName, role, existingMember, memberName)
+	}
+	return nil
+}
+
+// isExcluded reports whether exclude records member's own copy of
+// typeName as the real, known loser of a collision.
+func isExcluded(exclude map[string][]string, member, typeName string) bool {
+	for _, tn := range exclude[member] {
+		if tn == typeName {
+			return true
+		}
+	}
+	return false
+}
 
 // GroupSchemaSource returns the single real SchemaSource every member of
 // s shares, or ErrMixedSchemaSourceGroup if the group has none or spans
@@ -162,30 +216,26 @@ func MergeOpenAPIGroup(snap *Snapshot) (resources map[string]*dynserver.Resource
 	}
 
 	resources = map[string]*dynserver.ResourceType{}
+	resourcePlacedBy := map[string]string{}
 	for _, name := range snap.MemberNamesByMode(ModeResource) {
 		built, _, err := LoadOpenAPIMember(name, snap.Members[name])
 		if err != nil {
 			return nil, nil, fmt.Errorf("member %q: %w", name, err)
 		}
-		for typeName, rt := range built {
-			if _, dup := resources[typeName]; dup {
-				return nil, nil, fmt.Errorf("%w: %q (resource), contributed by member %q", ErrDuplicateWireType, typeName, name)
-			}
-			resources[typeName] = rt
+		if err := mergeWithExclude(resources, resourcePlacedBy, built, name, snap.Exclude, "resource"); err != nil {
+			return nil, nil, err
 		}
 	}
 
 	dataSources = map[string]*resourcemap.BuiltDataSource{}
+	dataSourcePlacedBy := map[string]string{}
 	for _, name := range snap.MemberNamesByMode(ModeDataSource) {
 		_, built, err := LoadOpenAPIMember(name, snap.Members[name])
 		if err != nil {
 			return nil, nil, fmt.Errorf("member %q: %w", name, err)
 		}
-		for typeName, ds := range built {
-			if _, dup := dataSources[typeName]; dup {
-				return nil, nil, fmt.Errorf("%w: %q (data source), contributed by member %q", ErrDuplicateWireType, typeName, name)
-			}
-			dataSources[typeName] = ds
+		if err := mergeWithExclude(dataSources, dataSourcePlacedBy, built, name, snap.Exclude, "data source"); err != nil {
+			return nil, nil, err
 		}
 	}
 	return resources, dataSources, nil
@@ -201,30 +251,26 @@ func MergeDiscoveryDocGroup(snap *Snapshot) (resources map[string]*discoverydoc.
 	}
 
 	resources = map[string]*discoverydoc.BuiltResource{}
+	resourcePlacedBy := map[string]string{}
 	for _, name := range snap.MemberNamesByMode(ModeResource) {
 		built, _, err := LoadDiscoveryDocMember(name, snap.Members[name])
 		if err != nil {
 			return nil, nil, fmt.Errorf("member %q: %w", name, err)
 		}
-		for typeName, rt := range built {
-			if _, dup := resources[typeName]; dup {
-				return nil, nil, fmt.Errorf("%w: %q (resource), contributed by member %q", ErrDuplicateWireType, typeName, name)
-			}
-			resources[typeName] = rt
+		if err := mergeWithExclude(resources, resourcePlacedBy, built, name, snap.Exclude, "resource"); err != nil {
+			return nil, nil, err
 		}
 	}
 
 	dataSources = map[string]*discoverydoc.BuiltDataSource{}
+	dataSourcePlacedBy := map[string]string{}
 	for _, name := range snap.MemberNamesByMode(ModeDataSource) {
 		_, built, err := LoadDiscoveryDocMember(name, snap.Members[name])
 		if err != nil {
 			return nil, nil, fmt.Errorf("member %q: %w", name, err)
 		}
-		for typeName, ds := range built {
-			if _, dup := dataSources[typeName]; dup {
-				return nil, nil, fmt.Errorf("%w: %q (data source), contributed by member %q", ErrDuplicateWireType, typeName, name)
-			}
-			dataSources[typeName] = ds
+		if err := mergeWithExclude(dataSources, dataSourcePlacedBy, built, name, snap.Exclude, "data source"); err != nil {
+			return nil, nil, err
 		}
 	}
 	return resources, dataSources, nil
@@ -243,16 +289,14 @@ func MergeCloudFormationGroup(snap *Snapshot) (resources map[string]*cloudformat
 	}
 
 	resources = map[string]*cloudformation.BuiltResource{}
+	resourcePlacedBy := map[string]string{}
 	for _, name := range snap.MemberNamesByMode(ModeResource) {
 		built, err := LoadCloudFormationMember(name, snap.Members[name])
 		if err != nil {
 			return nil, fmt.Errorf("member %q: %w", name, err)
 		}
-		for typeName, rt := range built {
-			if _, dup := resources[typeName]; dup {
-				return nil, fmt.Errorf("%w: %q (resource), contributed by member %q", ErrDuplicateWireType, typeName, name)
-			}
-			resources[typeName] = rt
+		if err := mergeWithExclude(resources, resourcePlacedBy, built, name, snap.Exclude, "resource"); err != nil {
+			return nil, err
 		}
 	}
 	return resources, nil
@@ -299,16 +343,14 @@ func MergeSmithyGroup(snap *Snapshot) (resources map[string]*smithy.BuiltResourc
 	}
 
 	dataSources = map[string]*smithy.BuiltDataSource{}
+	dataSourcePlacedBy := map[string]string{}
 	for _, name := range snap.MemberNamesByMode(ModeDataSource) {
 		_, built, err := LoadSmithyMember(name, snap.Members[name])
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("member %q: %w", name, err)
 		}
-		for typeName, ds := range built {
-			if _, dup := dataSources[typeName]; dup {
-				return nil, nil, nil, fmt.Errorf("%w: %q (data source), contributed by member %q", ErrDuplicateWireType, typeName, name)
-			}
-			dataSources[typeName] = ds
+		if err := mergeWithExclude(dataSources, dataSourcePlacedBy, built, name, snap.Exclude, "data source"); err != nil {
+			return nil, nil, nil, err
 		}
 	}
 	return resources, dataSources, resourceModel, nil
