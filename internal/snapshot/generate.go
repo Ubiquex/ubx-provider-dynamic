@@ -29,7 +29,17 @@ import (
 // own first-ever snapshot (every member is new content, Minor at most,
 // matching NextVersion("", ...)'s own real, existing single-member
 // discipline one level up -- never hand-picked here either).
-func AssembleGroup(repoName string, prev *Snapshot, members map[string]*MemberSnapshot, memberLevels map[string]ChangeLevel) (*Snapshot, error) {
+//
+// exclude is UBI-182's own real precedence record -- which real member's
+// own copy of a colliding wire type name loses, keyed by member name.
+// Recorded on the returned Snapshot verbatim (never inferred, never
+// computed here): this is the SAME real judgment ubiquex's own
+// [dynamic_provider_groups.<x>.exclude] table already made for codegen
+// (e.g. Datadog's own real v1/v2 collisions -- v1's richer version
+// wins), passed through by whatever real caller already has it (the
+// group's own hash-watch.yml, via --group-exclude), not invented fresh
+// here. May be nil for a group with no known real collisions.
+func AssembleGroup(repoName string, prev *Snapshot, members map[string]*MemberSnapshot, memberLevels map[string]ChangeLevel, exclude map[string][]string) (*Snapshot, error) {
 	var version string
 	var err error
 	if prev == nil {
@@ -60,6 +70,7 @@ func AssembleGroup(repoName string, prev *Snapshot, members map[string]*MemberSn
 		Provider:     repoName,
 		Version:      version,
 		Members:      members,
+		Exclude:      exclude,
 	}, nil
 }
 

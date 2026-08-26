@@ -27,7 +27,7 @@ func realKubernetesLikeGroup(t *testing.T) *Snapshot {
 	if err != nil {
 		t.Fatalf("generate data-source member: %v", err)
 	}
-	group, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": resourceMember, "widgetco_ds": dsMember}, map[string]ChangeLevel{"widgetco": Minor, "widgetco_ds": Minor})
+	group, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": resourceMember, "widgetco_ds": dsMember}, map[string]ChangeLevel{"widgetco": Minor, "widgetco_ds": Minor}, nil)
 	if err != nil {
 		t.Fatalf("AssembleGroup: %v", err)
 	}
@@ -55,35 +55,80 @@ func TestMergeOpenAPIGroup_RealTwoMemberGroup_MergesCleanly(t *testing.T) {
 	t.Logf("merged: %d resources, %d data sources", len(resources), len(dataSources))
 }
 
-// TestMergeOpenAPIGroup_DuplicateResourceWireType_RealFailLoud is the
-// real, direct proof of the founder's own explicit requirement: a
-// group with a genuine collision (Datadog's own real v1/v2 shape, not
-// hypothetical) must refuse loudly, never let one member's own content
-// silently overwrite another's.
-func TestMergeOpenAPIGroup_DuplicateResourceWireType_RealFailLoud(t *testing.T) {
+// realDatadogLikeCollidingGroup builds a real, two-member group that
+// genuinely collides on one resource wire type name -- the same real
+// shape Datadog's own live v1/v2 group has (both members share
+// wireName "widgetco", both generated from the identical real spec, so
+// both produce the identical real "widgetco_widget" type name).
+func realDatadogLikeCollidingGroup(t *testing.T, exclude map[string][]string) *Snapshot {
+	t.Helper()
 	execCfg := config.Provider{BaseURL: "https://api.widgetco.example"}
 	memberA, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("generate member A: %v", err)
 	}
-	// memberB is a real, SEPARATE member sharing the SAME real wireName
-	// as memberA (mirroring Datadog's own real v1/v2 shape, where BOTH
-	// members carry wire_name = "datadog") and generated from the SAME
-	// real spec, so it produces the IDENTICAL real wire type name
-	// "widgetco_widget" -- a genuine, real collision, not a contrived
-	// edge case.
 	memberB, _, _, err := GenerateOpenAPIMember("widgetco_v2", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("generate member B: %v", err)
 	}
-	group, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": memberA, "widgetco_v2": memberB}, map[string]ChangeLevel{"widgetco": Minor, "widgetco_v2": Minor})
+	group, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": memberA, "widgetco_v2": memberB}, map[string]ChangeLevel{"widgetco": Minor, "widgetco_v2": Minor}, exclude)
 	if err != nil {
 		t.Fatalf("AssembleGroup: %v", err)
 	}
+	return group
+}
 
-	_, _, err = MergeOpenAPIGroup(group)
+// TestMergeOpenAPIGroup_DuplicateResourceWireType_RealFailLoud is the
+// real, direct proof of the founder's own explicit requirement: a
+// group with a genuine collision (Datadog's own real v1/v2 shape, not
+// hypothetical) that the snapshot's own Exclude does NOT resolve must
+// refuse loudly, never let one member's own content silently overwrite
+// another's -- the exact real failure mode the wire_name bug was
+// producing before Exclude existed at all.
+func TestMergeOpenAPIGroup_DuplicateResourceWireType_RealFailLoud(t *testing.T) {
+	group := realDatadogLikeCollidingGroup(t, nil)
+
+	_, _, err := MergeOpenAPIGroup(group)
 	if err == nil {
-		t.Fatal("expected a real error for two resource-mode members producing the identical wire type name")
+		t.Fatal("expected a real error for two resource-mode members producing the identical wire type name with no Exclude entry")
+	}
+	if !errors.Is(err, ErrDuplicateWireType) {
+		t.Errorf("error doesn't wrap ErrDuplicateWireType: %v", err)
+	}
+}
+
+// TestMergeOpenAPIGroup_DuplicateResourceWireType_ResolvedByExclude is
+// the founder's own explicit design, made real: the SAME real collision
+// as the fail-loud test above, but this time the snapshot's own Exclude
+// records the real precedence judgment (widgetco_v2's own copy loses,
+// mirroring Datadog's own real "v1 wins" rule) -- the merge must now
+// succeed, keeping memberA's own value under the contested type name.
+func TestMergeOpenAPIGroup_DuplicateResourceWireType_ResolvedByExclude(t *testing.T) {
+	group := realDatadogLikeCollidingGroup(t, map[string][]string{
+		"widgetco_v2": {"widgetco_widget"},
+	})
+
+	resources, _, err := MergeOpenAPIGroup(group)
+	if err != nil {
+		t.Fatalf("MergeOpenAPIGroup with a real Exclude entry resolving the collision: %v", err)
+	}
+	if _, ok := resources["widgetco_widget"]; !ok {
+		t.Fatal("expected widgetco_widget to survive the merge (memberA's own copy, per Exclude)")
+	}
+}
+
+// TestMergeOpenAPIGroup_ExcludeOnWrongMember_StillFailsLoud proves
+// Exclude is checked by REAL (member, typeName) pair, not just typeName
+// alone -- excluding a DIFFERENT member for the SAME contested type name
+// does not accidentally resolve this real collision.
+func TestMergeOpenAPIGroup_ExcludeOnWrongMember_StillFailsLoud(t *testing.T) {
+	group := realDatadogLikeCollidingGroup(t, map[string][]string{
+		"widgetco_v2": {"some_other_type_name_entirely"},
+	})
+
+	_, _, err := MergeOpenAPIGroup(group)
+	if err == nil {
+		t.Fatal("expected a real error -- the real Exclude entry names a different type name, not the one that actually collided")
 	}
 	if !errors.Is(err, ErrDuplicateWireType) {
 		t.Errorf("error doesn't wrap ErrDuplicateWireType: %v", err)

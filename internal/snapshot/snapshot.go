@@ -220,6 +220,23 @@ type Snapshot struct {
 	// process's own UBX_DYNAMIC_PROVIDER_NAME identifies, used to pick
 	// its own member back out of this map at load time.
 	Members map[string]*MemberSnapshot `json:"members"`
+
+	// Exclude records which real member's own copy of a colliding wire
+	// type name loses, keyed by member name -- the SAME real shape and
+	// the SAME real judgment ubiquex's own [dynamic_provider_groups.<x>
+	// .exclude] table already records for codegen (Datadog's own real
+	// v1/v2 collisions: v1's richer version wins both times), now a real
+	// property of the PUBLISHED ARTIFACT itself rather than only the
+	// consuming config -- the pinned-resolution path (mergegroup.go)
+	// reads this to resolve a real collision the same way codegen
+	// already does, instead of inventing a second, parallel precedence
+	// mechanism. Empty/absent means the group has no known real
+	// collisions to resolve -- see mergegroup.go's own doc comment for
+	// what happens when a real collision has no matching entry here
+	// (fails loud, always -- an unresolved collision is never silently
+	// defaulted, the exact real failure mode the wire_name bug produced
+	// before this existed).
+	Exclude map[string][]string `json:"exclude,omitempty"`
 }
 
 // CheckFormat refuses loudly, real and immediate, if the snapshot's own
@@ -295,10 +312,11 @@ func Save(path string, snap *Snapshot) error {
 // problem at AWS's 430-member scale: one flat file would exceed
 // GitHub's own real 100MB commit limit by more than 2x).
 type manifest struct {
-	SchemaFormat int      `json:"schema_format"`
-	Provider     string   `json:"provider"`
-	Version      string   `json:"version"`
-	Members      []string `json:"members"`
+	SchemaFormat int                 `json:"schema_format"`
+	Provider     string              `json:"provider"`
+	Version      string              `json:"version"`
+	Members      []string            `json:"members"`
+	Exclude      map[string][]string `json:"exclude,omitempty"`
 }
 
 // SaveSplit writes snap as a real, committable directory tree:
@@ -321,6 +339,7 @@ func SaveSplit(dir string, snap *Snapshot) error {
 		Provider:     snap.Provider,
 		Version:      snap.Version,
 		Members:      names,
+		Exclude:      snap.Exclude,
 	}
 	manData, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
@@ -381,6 +400,7 @@ func LoadSplit(dir string) (*Snapshot, error) {
 		Provider:     man.Provider,
 		Version:      man.Version,
 		Members:      members,
+		Exclude:      man.Exclude,
 	}, nil
 }
 
