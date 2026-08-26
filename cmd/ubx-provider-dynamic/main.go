@@ -674,119 +674,135 @@ func runServeSnapshot(name, snapPath string) error {
 	if err != nil {
 		return fmt.Errorf("load snapshot %s: %w", snapPath, err)
 	}
-	member, err := snap.Member(name)
+	// UBI-182 real, follow-up fix: a pinned launch always serves the
+	// WHOLE real group under its own real published identity -- the
+	// resource/data-source split (kubernetes vs kubernetes_ds) is a real,
+	// internal discovery-time detail, never something a user should need
+	// to know or write two separate pins for (see mergegroup.go's own
+	// doc comment for the full real account of why nothing in the wire
+	// protocol or this binary's own server types ever required
+	// otherwise). name here is expected to equal snap.Provider exactly
+	// -- a real mismatch means a real misconfiguration (a stray old-style
+	// sub-member reference), caught here, loudly, rather than silently
+	// resolving a partial or wrong schema.
+	if name != snap.Provider {
+		return fmt.Errorf("snapshot %s is for group %q, but %s is %q -- a pinned entry always serves the whole real group under its own published identity, not one internal member", snapPath, snap.Provider, nameEnvVar, name)
+	}
+
+	execCfg, err := snap.ExecConfig()
+	if err != nil {
+		return fmt.Errorf("snapshot %s: %w", snapPath, err)
+	}
+	authenticator, err := auth.Build(execCfg.Auth.Type, execCfg.Auth.Params)
+	if err != nil {
+		return fmt.Errorf("build authenticator: %w", err)
+	}
+	retryPolicy, err := dynserver.ResolveRetryPolicy(execCfg.Retry)
+	if err != nil {
+		return fmt.Errorf("resolve retry policy: %w", err)
+	}
+	restClient := restexec.NewClient(execCfg.BaseURL, authenticator)
+	restClient.Retry = retryPolicy
+
+	src, err := snap.GroupSchemaSource()
 	if err != nil {
 		return fmt.Errorf("snapshot %s: %w", snapPath, err)
 	}
 
-	authenticator, err := auth.Build(member.Auth.Type, member.Auth.Params)
-	if err != nil {
-		return fmt.Errorf("build authenticator: %w", err)
-	}
-	retryPolicy, err := dynserver.ResolveRetryPolicy(member.Retry)
-	if err != nil {
-		return fmt.Errorf("resolve retry policy: %w", err)
-	}
-	restClient := restexec.NewClient(member.BaseURL, authenticator)
-	restClient.Retry = retryPolicy
-
 	var server tfprotov6.ProviderServer
-	switch member.SchemaSource {
+	switch src {
 	case snapshot.SchemaSourceOpenAPI:
-		resources, dataSources, err := snapshot.LoadOpenAPIMember(name, member)
+		resources, dataSources, err := snapshot.MergeOpenAPIGroup(snap)
 		if err != nil {
-			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
+			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
 		}
-		switch member.Mode {
-		case snapshot.ModeResource:
-			if len(resources) == 0 {
-				return fmt.Errorf("no CRUD-shaped resources for member %q in snapshot %s -- nothing to serve", name, snapPath)
-			}
-			server = &dynserver.Server{ProviderName: name, Resources: resources, Client: restClient}
-		case snapshot.ModeDataSource:
-			// Schema-only, matching run()'s own real openapi
-			// data-source live-fetch branch exactly -- no Client at
-			// all, GetProviderSchema is the only real RPC this ever
-			// answers.
-			server = &dynserver.Server{ProviderName: name, DataSources: dataSourcesToResourceTypes(dataSources)}
+		if len(resources) == 0 && len(dataSources) == 0 {
+			return fmt.Errorf("no resources or data sources in group %q (snapshot %s) -- nothing to serve", name, snapPath)
 		}
+		server = &dynserver.Server{ProviderName: name, Resources: resources, DataSources: dataSourcesToResourceTypes(dataSources), Client: restClient}
 
 	case snapshot.SchemaSourceDiscoveryDoc:
-		// Schema-layer only for BOTH modes, matching run()'s own real
-		// discoverydoc live-fetch branches exactly (that branch's own
-		// doc comment: dynserver.Server is reused UNCHANGED for
-		// GetProviderSchema, since that RPC reads only
-		// ResourceType.Schema -- real REST wire execution against a
-		// live GCP endpoint is a separate, deliberately-unattempted
-		// future checkpoint).
-		resources, dataSources, err := snapshot.LoadDiscoveryDocMember(name, member)
+		// Schema-layer only, matching run()'s own real discoverydoc
+		// live-fetch branches exactly (that branch's own doc comment:
+		// dynserver.Server is reused UNCHANGED for GetProviderSchema,
+		// since that RPC reads only ResourceType.Schema -- real REST
+		// wire execution against a live GCP endpoint is a separate,
+		// deliberately-unattempted future checkpoint).
+		resources, dataSources, err := snapshot.MergeDiscoveryDocGroup(snap)
 		if err != nil {
-			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
+			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
 		}
-		switch member.Mode {
-		case snapshot.ModeResource:
-			if len(resources) == 0 {
-				return fmt.Errorf("no CRUD-shaped resources for member %q in snapshot %s -- nothing to serve", name, snapPath)
-			}
-			built := make(map[string]*dynserver.ResourceType, len(resources))
-			for typeName, br := range resources {
-				built[typeName] = &dynserver.ResourceType{Schema: br.Schema}
-			}
-			server = &dynserver.Server{ProviderName: name, Resources: built}
-		case snapshot.ModeDataSource:
-			out := make(map[string]*dynserver.ResourceType, len(dataSources))
-			for typeName, ds := range dataSources {
-				out[typeName] = &dynserver.ResourceType{Schema: ds.Schema}
-			}
-			server = &dynserver.Server{ProviderName: name, DataSources: out}
+		if len(resources) == 0 && len(dataSources) == 0 {
+			return fmt.Errorf("no resources or data sources in group %q (snapshot %s) -- nothing to serve", name, snapPath)
 		}
+		built := make(map[string]*dynserver.ResourceType, len(resources))
+		for typeName, br := range resources {
+			built[typeName] = &dynserver.ResourceType{Schema: br.Schema}
+		}
+		out := make(map[string]*dynserver.ResourceType, len(dataSources))
+		for typeName, ds := range dataSources {
+			out[typeName] = &dynserver.ResourceType{Schema: ds.Schema}
+		}
+		server = &dynserver.Server{ProviderName: name, Resources: built, DataSources: out}
 
 	case snapshot.SchemaSourceCloudFormation:
-		// LoadCloudFormationMember itself already refuses ModeDataSource
-		// (CloudFormation has no such concept) -- nothing further to
-		// check here, just propagate that fail-loud error.
-		built, err := snapshot.LoadCloudFormationMember(name, member)
+		// MergeCloudFormationGroup itself already refuses any
+		// ModeDataSource member (CloudFormation has no such concept) --
+		// nothing further to check here, just propagate that fail-loud
+		// error.
+		resources, err := snapshot.MergeCloudFormationGroup(snap)
 		if err != nil {
-			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
+			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
 		}
-		if len(built) == 0 {
-			return fmt.Errorf("no resources for member %q in snapshot %s -- nothing to serve", name, snapPath)
+		if len(resources) == 0 {
+			return fmt.Errorf("no resources in group %q (snapshot %s) -- nothing to serve", name, snapPath)
 		}
-		server = cfnserver.New(name, built, &ccapi.Client{Rest: restClient})
+		server = cfnserver.New(name, resources, &ccapi.Client{Rest: restClient})
 
 	case snapshot.SchemaSourceSmithy:
-		resources, dataSources, err := snapshot.LoadSmithyMember(name, member)
+		resources, dataSources, model, err := snapshot.MergeSmithyGroup(snap)
 		if err != nil {
-			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
+			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
 		}
-		var smithyDoc smithy.Model
-		if err := json.Unmarshal(member.RawSpec, &smithyDoc); err != nil {
-			return fmt.Errorf("parse member %q's own raw_spec: %w", name, err)
+		if len(resources) == 0 && len(dataSources) == 0 {
+			return fmt.Errorf("no resources or data sources in group %q (snapshot %s) -- nothing to serve", name, snapPath)
 		}
-		switch member.Mode {
-		case snapshot.ModeResource:
-			if len(resources) == 0 {
-				return fmt.Errorf("no CRUD-shaped resources for member %q in snapshot %s -- nothing to serve", name, snapPath)
-			}
-			svc, err := smithy.FindService(&smithyDoc)
+		if len(resources) > 0 {
+			svc, err := smithy.FindService(model)
 			if err != nil {
-				return fmt.Errorf("find Smithy service for member %q in snapshot %s: %w", name, snapPath, err)
+				return fmt.Errorf("find Smithy service for group %q in snapshot %s: %w", name, snapPath, err)
 			}
-			wireClient := &wireexec.Client{Rest: restClient, Model: &smithyDoc, Service: svc, TargetPrefix: member.TargetPrefix}
-			server = &smithyserver.Server{ProviderName: name, Resources: resources, Model: &smithyDoc, Wire: wireClient}
-		case snapshot.ModeDataSource:
-			// Schema-only, matching run()'s own real Smithy
-			// data-source live-fetch branch exactly -- no Wire client
-			// at all.
-			server = &smithyserver.Server{ProviderName: name, DataSources: dataSources, Model: &smithyDoc}
+			// TargetPrefix comes from whichever member MergeSmithyGroup
+			// anchored its own single real resource-mode model to --
+			// snap.ExecConfig's own member may differ (it only verifies
+			// BaseURL/Auth agree, not TargetPrefix), so resolve it the
+			// same real way: the group's own sole resource-mode member.
+			resourceMemberNames := snap.MemberNamesByMode(snapshot.ModeResource)
+			targetPrefix := snap.Members[resourceMemberNames[0]].TargetPrefix
+			wireClient := &wireexec.Client{Rest: restClient, Model: model, Service: svc, TargetPrefix: targetPrefix}
+			server = &smithyserver.Server{ProviderName: name, Resources: resources, DataSources: dataSources, Model: model, Wire: wireClient}
+		} else {
+			// Real, honest, named scope boundary: a smithy group with
+			// ONLY data-source members has no single real Model to
+			// anchor GetProviderSchema's own construction to in this
+			// binary's own current smithyserver.Server shape (one real
+			// *smithy.Model field, and unlike openapi/discoverydoc,
+			// each real Smithy data-source member's own document is a
+			// genuinely separate real model, not shared) -- not reached
+			// by any real group configured in this org today (AWS's own
+			// smithy members are all data-source-mode, but AWS's own
+			// group is CloudFormation+Smithy mixed, already refused by
+			// GroupSchemaSource before this code path). Named here
+			// rather than silently constructing a Model-less server.
+			return fmt.Errorf("group %q (snapshot %s) has smithy data-source members but no real resource-mode member to anchor a Model to -- serving a smithy-sourced, data-source-only group is real, explicit, unstarted follow-up work, not a silent gap", name, snapPath)
 		}
 
 	default:
-		return fmt.Errorf("snapshot %s: member %q's own schema_source %q is not a real, known schema source", snapPath, name, member.SchemaSource)
+		return fmt.Errorf("snapshot %s: group %q's own schema_source %q is not a real, known schema source", snapPath, name, src)
 	}
 
-	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: serving %q (%s, %s) from real group snapshot %s (group %s, version %s, schema_format %d), zero network at schema resolution time\n",
-		name, member.SchemaSource, member.Mode, snapPath, snap.Provider, snap.Version, snap.SchemaFormat)
+	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: serving %q (%s) from real group snapshot %s (version %s, schema_format %d), zero network at schema resolution time\n",
+		name, src, snapPath, snap.Version, snap.SchemaFormat)
 
 	return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
 		return server
@@ -825,15 +841,18 @@ func runDumpSignalsFromSnapshot(name, snapPath string) error {
 	if err != nil {
 		return fmt.Errorf("load snapshot %s: %w", snapPath, err)
 	}
-	member, err := snap.Member(name)
+	if name != snap.Provider {
+		return fmt.Errorf("snapshot %s is for group %q, but %s is %q -- a pinned entry always serves the whole real group under its own published identity, not one internal member", snapPath, snap.Provider, nameEnvVar, name)
+	}
+	src, err := snap.GroupSchemaSource()
 	if err != nil {
 		return fmt.Errorf("snapshot %s: %w", snapPath, err)
 	}
 
-	if member.SchemaSource == snapshot.SchemaSourceOpenAPI && member.Mode == snapshot.ModeResource {
-		resources, _, err := snapshot.LoadOpenAPIMember(name, member)
+	if src == snapshot.SchemaSourceOpenAPI {
+		resources, _, err := snapshot.MergeOpenAPIGroup(snap)
 		if err != nil {
-			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
+			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
 		}
 		out := make(map[string]map[string]*uschema.FieldSignal, len(resources))
 		for typeName, rt := range resources {
@@ -842,10 +861,10 @@ func runDumpSignalsFromSnapshot(name, snapPath string) error {
 		return json.NewEncoder(os.Stdout).Encode(out)
 	}
 
-	if member.SchemaSource == snapshot.SchemaSourceDiscoveryDoc && member.Mode == snapshot.ModeResource {
-		resources, _, err := snapshot.LoadDiscoveryDocMember(name, member)
+	if src == snapshot.SchemaSourceDiscoveryDoc {
+		resources, _, err := snapshot.MergeDiscoveryDocGroup(snap)
 		if err != nil {
-			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
+			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
 		}
 		out := make(map[string]map[string]*uschema.FieldSignal, len(resources))
 		for typeName, br := range resources {
@@ -854,7 +873,7 @@ func runDumpSignalsFromSnapshot(name, snapPath string) error {
 		return json.NewEncoder(os.Stdout).Encode(out)
 	}
 
-	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: --dump-signals: not yet implemented for member %q (%s, %s) -- emitting an empty, real result, not an error\n", name, member.SchemaSource, member.Mode)
+	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: --dump-signals: not yet implemented for group %q (%s) -- emitting an empty, real result, not an error\n", name, src)
 	return json.NewEncoder(os.Stdout).Encode(map[string]map[string]*uschema.FieldSignal{})
 }
 
@@ -878,55 +897,53 @@ func runDumpNamespacesFromSnapshot(name, snapPath string) error {
 	if err != nil {
 		return fmt.Errorf("load snapshot %s: %w", snapPath, err)
 	}
-	member, err := snap.Member(name)
+	if name != snap.Provider {
+		return fmt.Errorf("snapshot %s is for group %q, but %s is %q -- a pinned entry always serves the whole real group under its own published identity, not one internal member", snapPath, snap.Provider, nameEnvVar, name)
+	}
+	src, err := snap.GroupSchemaSource()
 	if err != nil {
 		return fmt.Errorf("snapshot %s: %w", snapPath, err)
 	}
 
-	switch member.SchemaSource {
+	switch src {
 	case snapshot.SchemaSourceOpenAPI, snapshot.SchemaSourceDiscoveryDoc:
 		return json.NewEncoder(os.Stdout).Encode(map[string]string{})
 
 	case snapshot.SchemaSourceCloudFormation:
-		built, err := snapshot.LoadCloudFormationMember(name, member)
+		resources, err := snapshot.MergeCloudFormationGroup(snap)
 		if err != nil {
-			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
+			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
 		}
-		out := make(map[string]string, len(built))
-		for resourceTypeName, br := range built {
+		out := make(map[string]string, len(resources))
+		for resourceTypeName, br := range resources {
 			ns, _ := cloudformation.SplitTypeName(br.TypeName)
 			out[resourceTypeName] = strings.ToLower(ns)
 		}
 		return json.NewEncoder(os.Stdout).Encode(out)
 
 	case snapshot.SchemaSourceSmithy:
-		var smithyDoc smithy.Model
-		if err := json.Unmarshal(member.RawSpec, &smithyDoc); err != nil {
-			return fmt.Errorf("parse member %q's own raw_spec: %w", name, err)
-		}
-		svc, err := smithy.FindService(&smithyDoc)
+		resources, dataSources, model, err := snapshot.MergeSmithyGroup(snap)
 		if err != nil {
-			return fmt.Errorf("find Smithy service for member %q in snapshot %s: %w", name, snapPath, err)
+			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
 		}
-		resources, dataSources, err := snapshot.LoadSmithyMember(name, member)
-		if err != nil {
-			return fmt.Errorf("rebuild schemas for member %q in snapshot %s: %w", name, snapPath, err)
-		}
-		if member.Mode == snapshot.ModeDataSource {
-			out := make(map[string]string, len(dataSources))
-			for wireType, ds := range dataSources {
-				out[wireType] = ds.RealNamespace
+		out := make(map[string]string, len(resources)+len(dataSources))
+		if len(resources) > 0 {
+			svc, err := smithy.FindService(model)
+			if err != nil {
+				return fmt.Errorf("find Smithy service for group %q in snapshot %s: %w", name, snapPath, err)
 			}
-			return json.NewEncoder(os.Stdout).Encode(out)
+			ns := smithy.ServiceNamespace(svc)
+			for hcName := range resources {
+				out[hcName] = ns
+			}
 		}
-		out := make(map[string]string, len(resources))
-		for hcName := range resources {
-			out[hcName] = smithy.ServiceNamespace(svc)
+		for wireType, ds := range dataSources {
+			out[wireType] = ds.RealNamespace
 		}
 		return json.NewEncoder(os.Stdout).Encode(out)
 
 	default:
-		return fmt.Errorf("snapshot %s: member %q's own schema_source %q is not a real, known schema source", snapPath, name, member.SchemaSource)
+		return fmt.Errorf("snapshot %s: group %q's own schema_source %q is not a real, known schema source", snapPath, name, src)
 	}
 }
 
@@ -992,13 +1009,13 @@ func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath string) er
 		var genErr error
 		switch cfg.SchemaSource {
 		case config.SchemaSourceOpenAPI:
-			member, _, level, genErr = snapshot.GenerateOpenAPIMember(memberName, cfg.SchemaURL, mode, cfg, prevMember)
+			member, _, level, genErr = snapshot.GenerateOpenAPIMember(memberName, wireName, cfg.SchemaURL, mode, cfg, prevMember)
 		case config.SchemaSourceCloudFormation:
 			member, _, level, genErr = snapshot.GenerateCloudFormationMember(memberName, cfg.SchemaURL, mode, cfg, prevMember)
 		case config.SchemaSourceSmithy:
 			member, _, level, genErr = snapshot.GenerateSmithyMember(memberName, wireName, cfg.SchemaURL, cfg.TargetPrefix, mode, cfg.DataSourceNamespace, cfg, prevMember)
 		case config.SchemaSourceDiscoveryDoc:
-			member, _, level, genErr = snapshot.GenerateDiscoveryDocMember(memberName, cfg.SchemaURL, cfg.VersionQualifier, mode, cfg, prevMember)
+			member, _, level, genErr = snapshot.GenerateDiscoveryDocMember(memberName, wireName, cfg.SchemaURL, cfg.VersionQualifier, mode, cfg, prevMember)
 		default:
 			genErr = fmt.Errorf("[dynamic_providers.%s]'s own schema_source %q is not a real, known schema source", memberName, cfg.SchemaSource)
 		}

@@ -105,7 +105,19 @@ func memberChangeLevel(prevMember *MemberSnapshot, oldSchemas, newSchemas map[st
 // before ever returning, and returns ErrExternalRefsUnsupported,
 // unmistakably, if it doesn't. Real bundling support for external refs
 // remains named, explicit, unstarted follow-up work, not a silent gap.
-func GenerateOpenAPIMember(name, schemaURL string, mode Mode, execCfg config.Provider, prevMember *MemberSnapshot) (*MemberSnapshot, map[string]*tfprotov6.Schema, ChangeLevel, error) {
+// wireName, not name, is what gets baked into every generated resource
+// or data-source type name (config.Provider.WireName's own doc comment
+// has the full real reason these can differ) -- matches run()'s own
+// real live-fetch call exactly (dynserver.Build(doc, wireName, cfg) for
+// BOTH the resource and data-source branches; UBI-182's own real,
+// live-found bug, caught before this session's own merge-group work
+// could even validate correctly against it: this function originally
+// used name for translation, silently ignoring wire_name entirely,
+// producing "kubernetes_ds_"-prefixed data source type names instead of
+// the intended, shared "kubernetes_" prefix -- confirmed live against
+// the already-generated kubernetes_ds member before landing this fix,
+// not assumed).
+func GenerateOpenAPIMember(name, wireName, schemaURL string, mode Mode, execCfg config.Provider, prevMember *MemberSnapshot) (*MemberSnapshot, map[string]*tfprotov6.Schema, ChangeLevel, error) {
 	doc, err := openapi.Load(schemaURL)
 	if err != nil {
 		return nil, nil, NoChange, fmt.Errorf("fetch %s: %w", schemaURL, err)
@@ -121,7 +133,7 @@ func GenerateOpenAPIMember(name, schemaURL string, mode Mode, execCfg config.Pro
 			ErrExternalRefsUnsupported, schemaURL, err)
 	}
 
-	newSchemas, err := buildOpenAPISchemasForMode(doc, name, mode, execCfg)
+	newSchemas, err := buildOpenAPISchemasForMode(doc, wireName, mode, execCfg)
 	if err != nil {
 		return nil, nil, NoChange, err
 	}
@@ -134,6 +146,7 @@ func GenerateOpenAPIMember(name, schemaURL string, mode Mode, execCfg config.Pro
 		Retry:        execCfg.Retry,
 		Timeouts:     execCfg.Timeouts,
 		Resources:    execCfg.Resources,
+		WireName:     wireName,
 		RawSpec:      rawSpec,
 	}
 
@@ -149,10 +162,10 @@ func GenerateOpenAPIMember(name, schemaURL string, mode Mode, execCfg config.Pro
 	return member, newSchemas, level, nil
 }
 
-func buildOpenAPISchemasForMode(doc *openapi3.T, name string, mode Mode, execCfg config.Provider) (map[string]*tfprotov6.Schema, error) {
+func buildOpenAPISchemasForMode(doc *openapi3.T, wireName string, mode Mode, execCfg config.Provider) (map[string]*tfprotov6.Schema, error) {
 	switch mode {
 	case ModeResource:
-		built, _, err := dynserver.Build(doc, name, execCfg)
+		built, _, err := dynserver.Build(doc, wireName, execCfg)
 		if err != nil {
 			return nil, fmt.Errorf("build resource schemas: %w", err)
 		}
@@ -162,7 +175,7 @@ func buildOpenAPISchemasForMode(doc *openapi3.T, name string, mode Mode, execCfg
 		}
 		return schemas, nil
 	case ModeDataSource:
-		built, _, err := resourcemap.BuildDataSources(doc, name)
+		built, _, err := resourcemap.BuildDataSources(doc, wireName)
 		if err != nil {
 			return nil, fmt.Errorf("build data source schemas: %w", err)
 		}
@@ -172,7 +185,7 @@ func buildOpenAPISchemasForMode(doc *openapi3.T, name string, mode Mode, execCfg
 		}
 		return schemas, nil
 	default:
-		return nil, fmt.Errorf("%w: openapi member %q requested mode %q", ErrUnsupportedMode, name, mode)
+		return nil, fmt.Errorf("%w: openapi member (wire_name %q) requested mode %q", ErrUnsupportedMode, wireName, mode)
 	}
 }
 
@@ -184,10 +197,17 @@ func buildOpenAPISchemasForMode(doc *openapi3.T, name string, mode Mode, execCfg
 // every call rather than caching the result inside MemberSnapshot itself
 // -- see the package doc comment's own account of why (SchemaFormat's
 // real promise that a newer binary's own improved translation applies to
-// an old, frozen spec unchanged).
+// an old, frozen spec unchanged). Reads WireName from member itself
+// (falls back to name when empty, matching config.Provider.WireName's
+// own "defaults to name" convention and LoadSmithyMember's own identical
+// real fallback).
 func LoadOpenAPIMember(name string, member *MemberSnapshot) (resources map[string]*dynserver.ResourceType, dataSources map[string]*resourcemap.BuiltDataSource, err error) {
 	if member.SchemaSource != SchemaSourceOpenAPI {
 		return nil, nil, fmt.Errorf("member %q's own schema_source %q is not openapi", name, member.SchemaSource)
+	}
+	wireName := member.WireName
+	if wireName == "" {
+		wireName = name
 	}
 	doc, err := openapi.Parse(member.RawSpec, nil)
 	if err != nil {
@@ -201,12 +221,12 @@ func LoadOpenAPIMember(name string, member *MemberSnapshot) (resources map[strin
 	}
 	switch member.Mode {
 	case ModeResource:
-		resources, _, err = dynserver.Build(doc, name, execCfg)
+		resources, _, err = dynserver.Build(doc, wireName, execCfg)
 		if err != nil {
 			return nil, nil, fmt.Errorf("rebuild member %q's own resource schemas: %w", name, err)
 		}
 	case ModeDataSource:
-		dataSources, _, err = resourcemap.BuildDataSources(doc, name)
+		dataSources, _, err = resourcemap.BuildDataSources(doc, wireName)
 		if err != nil {
 			return nil, nil, fmt.Errorf("rebuild member %q's own data source schemas: %w", name, err)
 		}
@@ -492,7 +512,21 @@ func LoadSmithyMemberSchemas(name string, member *MemberSnapshot) (map[string]*t
 // MemberSnapshot -- necessary once a pinned entry is the only config a
 // caller has. ModeDataSource uses discoverydoc.BuildDataSources, the
 // identical pipeline run()'s own live-fetch branch already uses.
-func GenerateDiscoveryDocMember(name, schemaURL, versionQualifier string, mode Mode, execCfg config.Provider, prevMember *MemberSnapshot) (*MemberSnapshot, map[string]*tfprotov6.Schema, ChangeLevel, error) {
+//
+// wireName is deliberately used ONLY for ModeDataSource, not
+// ModeResource -- mirrors run()'s own real, documented asymmetry
+// exactly: every existing real [dynamic_providers.google_<api>]
+// RESOURCE entry's own table key already IS its real, correct provider
+// identity (no separate data-source-mode sibling existed historically to
+// need a distinct key from), but a DATA-SOURCE-mode entry needs a TOML
+// key distinct from its own resource-mode sibling (TOML tables require
+// unique keys), so wireName is what recovers the real, shared identity
+// for that case specifically -- using bare name for data sources too
+// would reproduce the exact real bug this session's own
+// dataSourceWireType doc comment already found and fixed on the
+// live-fetch path (a distinct table key leaking into the wire type's
+// own second token, corrupting the derived service/local split).
+func GenerateDiscoveryDocMember(name, wireName, schemaURL, versionQualifier string, mode Mode, execCfg config.Provider, prevMember *MemberSnapshot) (*MemberSnapshot, map[string]*tfprotov6.Schema, ChangeLevel, error) {
 	doc, err := discoverydoc.Load(schemaURL)
 	if err != nil {
 		return nil, nil, NoChange, fmt.Errorf("fetch %s: %w", schemaURL, err)
@@ -503,7 +537,7 @@ func GenerateDiscoveryDocMember(name, schemaURL, versionQualifier string, mode M
 		return nil, nil, NoChange, fmt.Errorf("marshal fetched spec: %w", err)
 	}
 
-	newSchemas, err := buildDiscoveryDocSchemasForMode(doc, name, mode, versionQualifier)
+	newSchemas, err := buildDiscoveryDocSchemasForMode(doc, name, wireName, mode, versionQualifier)
 	if err != nil {
 		return nil, nil, NoChange, err
 	}
@@ -516,6 +550,7 @@ func GenerateDiscoveryDocMember(name, schemaURL, versionQualifier string, mode M
 		Retry:            execCfg.Retry,
 		Timeouts:         execCfg.Timeouts,
 		Resources:        execCfg.Resources,
+		WireName:         wireName,
 		VersionQualifier: versionQualifier,
 		RawSpec:          rawSpec,
 	}
@@ -532,7 +567,7 @@ func GenerateDiscoveryDocMember(name, schemaURL, versionQualifier string, mode M
 	return member, newSchemas, level, nil
 }
 
-func buildDiscoveryDocSchemasForMode(doc *discoverydoc.Document, name string, mode Mode, versionQualifier string) (map[string]*tfprotov6.Schema, error) {
+func buildDiscoveryDocSchemasForMode(doc *discoverydoc.Document, name, wireName string, mode Mode, versionQualifier string) (map[string]*tfprotov6.Schema, error) {
 	switch mode {
 	case ModeResource:
 		built, _, err := discoverydoc.Build(doc, name, versionQualifier)
@@ -545,7 +580,7 @@ func buildDiscoveryDocSchemasForMode(doc *discoverydoc.Document, name string, mo
 		}
 		return schemas, nil
 	case ModeDataSource:
-		built, _, err := discoverydoc.BuildDataSources(doc, name, versionQualifier)
+		built, _, err := discoverydoc.BuildDataSources(doc, wireName, versionQualifier)
 		if err != nil {
 			return nil, fmt.Errorf("build data source schemas: %w", err)
 		}
@@ -560,10 +595,18 @@ func buildDiscoveryDocSchemasForMode(doc *discoverydoc.Document, name string, mo
 }
 
 // LoadDiscoveryDocMember is GenerateDiscoveryDocMember's own real,
-// network-free counterpart. Reads VersionQualifier from member itself.
+// network-free counterpart. Reads VersionQualifier/WireName from member
+// itself -- WireName falls back to name when empty (a real, pre-fix
+// member, or a resource-mode member, which never sets it), matching
+// GenerateDiscoveryDocMember's own identical resource/data-source
+// asymmetry.
 func LoadDiscoveryDocMember(name string, member *MemberSnapshot) (resources map[string]*discoverydoc.BuiltResource, dataSources map[string]*discoverydoc.BuiltDataSource, err error) {
 	if member.SchemaSource != SchemaSourceDiscoveryDoc {
 		return nil, nil, fmt.Errorf("member %q's own schema_source %q is not discovery_docs", name, member.SchemaSource)
+	}
+	wireName := member.WireName
+	if wireName == "" {
+		wireName = name
 	}
 	var doc discoverydoc.Document
 	if err := json.Unmarshal(member.RawSpec, &doc); err != nil {
@@ -576,7 +619,7 @@ func LoadDiscoveryDocMember(name string, member *MemberSnapshot) (resources map[
 			return nil, nil, fmt.Errorf("rebuild member %q's own resource schemas: %w", name, err)
 		}
 	case ModeDataSource:
-		dataSources, _, err = discoverydoc.BuildDataSources(&doc, name, member.VersionQualifier)
+		dataSources, _, err = discoverydoc.BuildDataSources(&doc, wireName, member.VersionQualifier)
 		if err != nil {
 			return nil, nil, fmt.Errorf("rebuild member %q's own data source schemas: %w", name, err)
 		}
