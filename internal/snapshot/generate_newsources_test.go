@@ -75,14 +75,14 @@ func serveCFNZip(t *testing.T, entries map[string]string) string {
 	return srv.URL
 }
 
-func TestGenerateCloudFormation_FirstEverSnapshot_Real010(t *testing.T) {
+func TestGenerateCloudFormation_FirstEverSnapshot_Real100(t *testing.T) {
 	url := serveCFNZip(t, map[string]string{"aws-widget-thing.json": widgetCFNSchemaV1})
 	snap, err := GenerateCloudFormation("aws", url, config.Provider{BaseURL: "https://cloudcontrolapi.us-east-1.amazonaws.com"}, nil)
 	if err != nil {
 		t.Fatalf("GenerateCloudFormation: %v", err)
 	}
-	if snap.Version != "0.1.0" {
-		t.Errorf("first-ever snapshot version = %q, want 0.1.0", snap.Version)
+	if snap.Version != "1.0.0" {
+		t.Errorf("first-ever snapshot version = %q, want 1.0.0", snap.Version)
 	}
 	if snap.SchemaSource != SchemaSourceCloudFormation {
 		t.Errorf("SchemaSource = %q, want %q", snap.SchemaSource, SchemaSourceCloudFormation)
@@ -112,8 +112,8 @@ func TestGenerateCloudFormation_AdditiveChange_RealMinorBump(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second generation: %v", err)
 	}
-	if next.Version != "0.2.0" {
-		t.Errorf("real minor bump: version = %q, want 0.2.0", next.Version)
+	if next.Version != "1.1.0" {
+		t.Errorf("real minor bump: version = %q, want 1.1.0", next.Version)
 	}
 }
 
@@ -150,8 +150,8 @@ func TestGenerateSmithy_RealSQSFixture_FirstEverSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateSmithy: %v", err)
 	}
-	if snap.Version != "0.1.0" {
-		t.Errorf("first-ever snapshot version = %q, want 0.1.0", snap.Version)
+	if snap.Version != "1.0.0" {
+		t.Errorf("first-ever snapshot version = %q, want 1.0.0", snap.Version)
 	}
 	if snap.SchemaSource != SchemaSourceSmithy {
 		t.Errorf("SchemaSource = %q, want %q", snap.SchemaSource, SchemaSourceSmithy)
@@ -245,14 +245,14 @@ const widgetDiscoveryDocV2AddsField = `{
   }
 }`
 
-func TestGenerateDiscoveryDoc_FirstEverSnapshot_Real010(t *testing.T) {
+func TestGenerateDiscoveryDoc_FirstEverSnapshot_Real100(t *testing.T) {
 	url := serveSpec(t, widgetDiscoveryDocV1)
 	snap, err := GenerateDiscoveryDoc("widget", url, "", config.Provider{BaseURL: "https://widget.googleapis.com"}, nil)
 	if err != nil {
 		t.Fatalf("GenerateDiscoveryDoc: %v", err)
 	}
-	if snap.Version != "0.1.0" {
-		t.Errorf("first-ever snapshot version = %q, want 0.1.0", snap.Version)
+	if snap.Version != "1.0.0" {
+		t.Errorf("first-ever snapshot version = %q, want 1.0.0", snap.Version)
 	}
 	if snap.SchemaSource != SchemaSourceDiscoveryDoc {
 		t.Errorf("SchemaSource = %q, want %q", snap.SchemaSource, SchemaSourceDiscoveryDoc)
@@ -278,7 +278,7 @@ func TestGenerateDiscoveryDoc_AdditiveChange_RealMinorBump(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second generation: %v", err)
 	}
-	if next.Version != "0.2.0" {
-		t.Errorf("real minor bump: version = %q, want 0.2.0", next.Version)
+	if next.Version != "1.1.0" {
+		t.Errorf("real minor bump: version = %q, want 1.1.0", next.Version)
 	}
 }

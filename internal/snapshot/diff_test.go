@@ -161,8 +161,8 @@ func TestNextVersion_NoPriorSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "0.1.0" {
-		t.Errorf("NextVersion(no prior) = %q, want 0.1.0 regardless of level", got)
+	if got != "1.0.0" {
+		t.Errorf("NextVersion(no prior) = %q, want 1.0.0 regardless of level", got)
 	}
 }
 

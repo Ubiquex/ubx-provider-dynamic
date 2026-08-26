@@ -81,14 +81,14 @@ func serveSpec(t *testing.T, body string) string {
 	return srv.URL
 }
 
-func TestGenerateOpenAPI_FirstEverSnapshot_Real010(t *testing.T) {
+func TestGenerateOpenAPI_FirstEverSnapshot_Real100(t *testing.T) {
 	url := serveSpec(t, widgetSpecV1)
 	snap, err := GenerateOpenAPI("widgetco", url, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
 	if err != nil {
 		t.Fatalf("GenerateOpenAPI: %v", err)
 	}
-	if snap.Version != "0.1.0" {
-		t.Errorf("first-ever snapshot version = %q, want 0.1.0", snap.Version)
+	if snap.Version != "1.0.0" {
+		t.Errorf("first-ever snapshot version = %q, want 1.0.0", snap.Version)
 	}
 	if snap.SchemaFormat != CurrentSchemaFormat {
 		t.Errorf("SchemaFormat = %d, want %d", snap.SchemaFormat, CurrentSchemaFormat)
@@ -113,8 +113,8 @@ func TestGenerateOpenAPI_AdditiveChange_RealMinorBump(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second generation: %v", err)
 	}
-	if next.Version != "0.2.0" {
-		t.Errorf("real minor bump: version = %q, want 0.2.0", next.Version)
+	if next.Version != "1.1.0" {
+		t.Errorf("real minor bump: version = %q, want 1.1.0", next.Version)
 	}
 }
 
