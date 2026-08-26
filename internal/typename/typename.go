@@ -47,20 +47,38 @@ func Combine(providerName, service, noun string) string {
 	tail = append(tail, strings.Split(noun, "_")...)
 
 	providerTokens := strings.Split(providerName, "_")
-	overlap := 0
-	for k := 1; k <= len(providerTokens) && k <= len(tail); k++ {
-		matches := true
-		for i := 0; i < k; i++ {
-			if providerTokens[len(providerTokens)-k+i] != tail[i] {
-				matches = false
-				break
+	// Fixed point, not a single trim: a real, live-found triple repeat
+	// (google_dlp combined with service "dlp" and noun "dlp_job" -- the
+	// DLP API's own primary resource is itself named "DlpJob") leaves a
+	// residual overlap a single pass never rechecks. Trimming once
+	// dropped tail's leading "dlp" and stopped, producing
+	// google_dlp_dlp_job instead of the real, correct google_dlp_job --
+	// providerTokens' own trailing "dlp" still equals the new tail's own
+	// leading token after that first trim, the identical overlap
+	// condition this loop already tests for, just not re-run. Confirmed
+	// live: 1 of 1,542 real resources this ever applies to (flagged, not
+	// silently expanded, when first found) -- every other real,
+	// already-correct case collapses in exactly one pass either way, so
+	// looping to a fixed point changes nothing for them.
+	for {
+		overlap := 0
+		for k := 1; k <= len(providerTokens) && k <= len(tail); k++ {
+			matches := true
+			for i := 0; i < k; i++ {
+				if providerTokens[len(providerTokens)-k+i] != tail[i] {
+					matches = false
+					break
+				}
+			}
+			if matches {
+				overlap = k
 			}
 		}
-		if matches {
-			overlap = k
+		if overlap == 0 {
+			break
 		}
+		tail = tail[overlap:]
 	}
-	tail = tail[overlap:]
 
 	if len(tail) == 0 {
 		return providerName

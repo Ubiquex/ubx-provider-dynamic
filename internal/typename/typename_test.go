@@ -38,6 +38,24 @@ func TestCombine_TrimsRealOverlap(t *testing.T) {
 	}
 }
 
+func TestCombine_TrimsToFixedPointOnTripleRepeat(t *testing.T) {
+	// Real, live-found (UBI-189 follow-up): google_dlp combined with
+	// service "dlp" (doc.Name) and noun "dlp_job" (the DLP API's own
+	// primary resource is itself named "DlpJob") -- providerName's own
+	// trailing "dlp" overlaps tail's leading "dlp" TWICE in sequence, a
+	// single trim only ever caught the first, producing the wrong,
+	// once-collapsed google_dlp_dlp_job instead of the real, correct
+	// google_dlp_job. 1 of 1,542 real resources this applies to,
+	// confirmed live -- every other case in the real corpus collapses in
+	// one pass either way (TestCombine_TrimsRealOverlap's own cases
+	// included), so this is additive coverage, not a changed contract.
+	got := Combine("google_dlp", "dlp", "dlp_job")
+	want := "google_dlp_job"
+	if got != want {
+		t.Errorf("Combine(%q, %q, %q) = %q, want %q", "google_dlp", "dlp", "dlp_job", got, want)
+	}
+}
+
 func TestCombine_NoFalsePositiveOnSimilarButDifferentWord(t *testing.T) {
 	// A noun that merely LOOKS similar to the provider's own trailing
 	// token, without an exact token match, must never be trimmed --
