@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -75,45 +76,75 @@ func serveCFNZip(t *testing.T, entries map[string]string) string {
 	return srv.URL
 }
 
-func TestGenerateCloudFormation_FirstEverSnapshot_Real100(t *testing.T) {
+func TestGenerateCloudFormationMember_FirstEverMember_RealMinorLevel(t *testing.T) {
 	url := serveCFNZip(t, map[string]string{"aws-widget-thing.json": widgetCFNSchemaV1})
-	snap, err := GenerateCloudFormation("aws", url, config.Provider{BaseURL: "https://cloudcontrolapi.us-east-1.amazonaws.com"}, nil)
+	member, _, level, err := GenerateCloudFormationMember("aws", url, ModeResource, config.Provider{BaseURL: "https://cloudcontrolapi.us-east-1.amazonaws.com"}, nil)
 	if err != nil {
-		t.Fatalf("GenerateCloudFormation: %v", err)
+		t.Fatalf("GenerateCloudFormationMember: %v", err)
 	}
-	if snap.Version != "1.0.0" {
-		t.Errorf("first-ever snapshot version = %q, want 1.0.0", snap.Version)
+	if level != Minor {
+		t.Errorf("first-ever member level = %s, want minor", level)
 	}
-	if snap.SchemaSource != SchemaSourceCloudFormation {
-		t.Errorf("SchemaSource = %q, want %q", snap.SchemaSource, SchemaSourceCloudFormation)
+	if member.SchemaSource != SchemaSourceCloudFormation {
+		t.Errorf("SchemaSource = %q, want %q", member.SchemaSource, SchemaSourceCloudFormation)
 	}
 	var probe map[string]any
-	if err := json.Unmarshal(snap.RawSpec, &probe); err != nil {
+	if err := json.Unmarshal(member.RawSpec, &probe); err != nil {
 		t.Fatalf("RawSpec is not valid JSON: %v", err)
 	}
 
-	built, err := LoadCloudFormation(snap)
+	built, err := LoadCloudFormationMember("aws", member)
 	if err != nil {
-		t.Fatalf("LoadCloudFormation: %v", err)
+		t.Fatalf("LoadCloudFormationMember: %v", err)
 	}
 	if len(built) != 1 {
-		t.Fatalf("LoadCloudFormation reconstructed %d resources, want 1", len(built))
+		t.Fatalf("LoadCloudFormationMember reconstructed %d resources, want 1", len(built))
 	}
 }
 
-func TestGenerateCloudFormation_AdditiveChange_RealMinorBump(t *testing.T) {
+func TestGenerateCloudFormationMember_AdditiveChange_RealMinorLevel(t *testing.T) {
 	execCfg := config.Provider{BaseURL: "https://cloudcontrolapi.us-east-1.amazonaws.com"}
-	prev, err := GenerateCloudFormation("aws", serveCFNZip(t, map[string]string{"aws-widget-thing.json": widgetCFNSchemaV1}), execCfg, nil)
+	prevMember, _, _, err := GenerateCloudFormationMember("aws", serveCFNZip(t, map[string]string{"aws-widget-thing.json": widgetCFNSchemaV1}), ModeResource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("first generation: %v", err)
 	}
 
-	next, err := GenerateCloudFormation("aws", serveCFNZip(t, map[string]string{"aws-widget-thing.json": widgetCFNSchemaV2AddsField}), execCfg, prev)
+	_, _, level, err := GenerateCloudFormationMember("aws", serveCFNZip(t, map[string]string{"aws-widget-thing.json": widgetCFNSchemaV2AddsField}), ModeResource, execCfg, prevMember)
 	if err != nil {
 		t.Fatalf("second generation: %v", err)
 	}
-	if next.Version != "1.1.0" {
-		t.Errorf("real minor bump: version = %q, want 1.1.0", next.Version)
+	if level != Minor {
+		t.Errorf("real additive change level = %s, want minor", level)
+	}
+}
+
+// TestGenerateCloudFormationMember_DataSourceMode_RealFailLoud is the
+// founder's own explicit requirement made concrete: CloudFormation has
+// no real data-source concept at all, so requesting ModeDataSource must
+// fail immediately and loudly, never silently generate resource-shaped
+// output under a data-source label.
+func TestGenerateCloudFormationMember_DataSourceMode_RealFailLoud(t *testing.T) {
+	url := serveCFNZip(t, map[string]string{"aws-widget-thing.json": widgetCFNSchemaV1})
+	_, _, _, err := GenerateCloudFormationMember("aws", url, ModeDataSource, config.Provider{BaseURL: "https://cloudcontrolapi.us-east-1.amazonaws.com"}, nil)
+	if err == nil {
+		t.Fatal("expected a real error requesting ModeDataSource against cloudformation")
+	}
+	if !errors.Is(err, ErrUnsupportedMode) {
+		t.Errorf("error doesn't wrap ErrUnsupportedMode: %v", err)
+	}
+}
+
+func TestLoadCloudFormationMember_DataSourceMode_RealFailLoud(t *testing.T) {
+	url := serveCFNZip(t, map[string]string{"aws-widget-thing.json": widgetCFNSchemaV1})
+	member, _, _, err := GenerateCloudFormationMember("aws", url, ModeResource, config.Provider{BaseURL: "https://cloudcontrolapi.us-east-1.amazonaws.com"}, nil)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	member.Mode = ModeDataSource // simulate a corrupted/mismatched real container
+	if _, err := LoadCloudFormationMember("aws", member); err == nil {
+		t.Fatal("expected a real error loading a cloudformation member whose own Mode is data_source")
+	} else if !errors.Is(err, ErrUnsupportedMode) {
+		t.Errorf("error doesn't wrap ErrUnsupportedMode: %v", err)
 	}
 }
 
@@ -144,52 +175,76 @@ func serveBytes(t *testing.T, body []byte) string {
 	return srv.URL
 }
 
-func TestGenerateSmithy_RealSQSFixture_FirstEverSnapshot(t *testing.T) {
+func TestGenerateSmithyMember_RealSQSFixture_FirstEverMember(t *testing.T) {
 	url := serveBytes(t, realSQSSmithyModel(t))
-	snap, err := GenerateSmithy("aws", "aws", url, "AmazonSQS", config.Provider{BaseURL: "https://sqs.us-east-1.amazonaws.com"}, nil)
+	member, _, level, err := GenerateSmithyMember("aws", "aws", url, "AmazonSQS", ModeResource, "", config.Provider{BaseURL: "https://sqs.us-east-1.amazonaws.com"}, nil)
 	if err != nil {
-		t.Fatalf("GenerateSmithy: %v", err)
+		t.Fatalf("GenerateSmithyMember: %v", err)
 	}
-	if snap.Version != "1.0.0" {
-		t.Errorf("first-ever snapshot version = %q, want 1.0.0", snap.Version)
+	if level != Minor {
+		t.Errorf("first-ever member level = %s, want minor", level)
 	}
-	if snap.SchemaSource != SchemaSourceSmithy {
-		t.Errorf("SchemaSource = %q, want %q", snap.SchemaSource, SchemaSourceSmithy)
+	if member.SchemaSource != SchemaSourceSmithy {
+		t.Errorf("SchemaSource = %q, want %q", member.SchemaSource, SchemaSourceSmithy)
 	}
-	if snap.WireName != "aws" {
-		t.Errorf("WireName = %q, want %q (not stored on generate, or lost)", snap.WireName, "aws")
+	if member.WireName != "aws" {
+		t.Errorf("WireName = %q, want %q (not stored on generate, or lost)", member.WireName, "aws")
 	}
-	if snap.TargetPrefix != "AmazonSQS" {
-		t.Errorf("TargetPrefix = %q, want %q", snap.TargetPrefix, "AmazonSQS")
+	if member.TargetPrefix != "AmazonSQS" {
+		t.Errorf("TargetPrefix = %q, want %q", member.TargetPrefix, "AmazonSQS")
 	}
 
-	built, err := LoadSmithy(snap)
+	resources, dataSources, err := LoadSmithyMember("aws", member)
 	if err != nil {
-		t.Fatalf("LoadSmithy: %v", err)
+		t.Fatalf("LoadSmithyMember: %v", err)
 	}
-	if len(built) == 0 {
-		t.Fatal("LoadSmithy reconstructed zero resources from a real, resource-shaped SQS model")
+	if len(resources) == 0 {
+		t.Fatal("LoadSmithyMember reconstructed zero resources from a real, resource-shaped SQS model")
+	}
+	if len(dataSources) != 0 {
+		t.Errorf("a resource-mode member reloaded %d DATA SOURCES, want zero", len(dataSources))
 	}
 }
 
-func TestGenerateSmithy_WireNameFallsBackToProvider_WhenSnapshotPredatesTheField(t *testing.T) {
-	// A real format-1 snapshot (predates UBI-182's WireName field) would
-	// unmarshal WireName as "" -- LoadSmithy must fall back to Provider,
-	// matching config.Provider.WireName's own "defaults to name"
-	// convention, not fail outright on an old-shaped snapshot.
+func TestGenerateSmithyMember_DataSourceMode_RealDataSources(t *testing.T) {
 	url := serveBytes(t, realSQSSmithyModel(t))
-	snap, err := GenerateSmithy("aws", "aws", url, "AmazonSQS", config.Provider{BaseURL: "https://sqs.us-east-1.amazonaws.com"}, nil)
+	member, schemas, level, err := GenerateSmithyMember("aws_data_sqs", "aws", url, "AmazonSQS", ModeDataSource, "", config.Provider{BaseURL: "https://sqs.us-east-1.amazonaws.com"}, nil)
 	if err != nil {
-		t.Fatalf("GenerateSmithy: %v", err)
+		t.Fatalf("GenerateSmithyMember (data source): %v", err)
 	}
-	snap.WireName = "" // simulate a real, pre-UBI-182 snapshot
+	if level != Minor {
+		t.Errorf("first-ever data-source member level = %s, want minor", level)
+	}
+	if len(schemas) == 0 {
+		t.Fatal("zero translated data-source schemas from a real, resource-shaped SQS model -- SQS is real-live-confirmed to have real data-source candidates")
+	}
 
-	built, err := LoadSmithy(snap)
+	resources, dataSources, err := LoadSmithyMember("aws_data_sqs", member)
 	if err != nil {
-		t.Fatalf("LoadSmithy with empty WireName: %v", err)
+		t.Fatalf("LoadSmithyMember: %v", err)
 	}
-	if len(built) == 0 {
-		t.Fatal("LoadSmithy with empty WireName (fallback to Provider) reconstructed zero resources")
+	if len(resources) != 0 {
+		t.Errorf("a data-source-mode member reloaded %d RESOURCES, want zero", len(resources))
+	}
+	if len(dataSources) == 0 {
+		t.Fatal("a data-source-mode member reloaded zero data sources")
+	}
+}
+
+func TestGenerateSmithyMember_WireNameFallsBackToMemberName_WhenEmpty(t *testing.T) {
+	url := serveBytes(t, realSQSSmithyModel(t))
+	member, _, _, err := GenerateSmithyMember("aws", "aws", url, "AmazonSQS", ModeResource, "", config.Provider{BaseURL: "https://sqs.us-east-1.amazonaws.com"}, nil)
+	if err != nil {
+		t.Fatalf("GenerateSmithyMember: %v", err)
+	}
+	member.WireName = "" // simulate a real member with no explicit override
+
+	resources, _, err := LoadSmithyMember("aws", member)
+	if err != nil {
+		t.Fatalf("LoadSmithyMember with empty WireName: %v", err)
+	}
+	if len(resources) == 0 {
+		t.Fatal("LoadSmithyMember with empty WireName (fallback to member name) reconstructed zero resources")
 	}
 }
 
@@ -201,7 +256,15 @@ func TestGenerateSmithy_WireNameFallsBackToProvider_WhenSnapshotPredatesTheField
 // internal/discoverydoc's own tests already confirm live against Google
 // Cloud Pub/Sub (buildPubSubShapedDoc) -- the real "schemas"/"resources"/
 // "methods" wire vocabulary internal/discoverydoc.Document's own JSON
-// tags expect, not an invented shape.
+// tags expect, not an invented shape. Each also carries one real,
+// separate, GET-only resource NODE (widgetSummaries) with no create
+// method of its own -- discoverydoc.DiscoverDataSources claims a whole
+// NODE at a time (get present, create absent on that SAME node), unlike
+// resourcemap's own per-PATH claiming, so a "list" method living
+// alongside "get"+"create" on the SAME node (as widgets itself has)
+// would never be a real candidate no matter what it's named -- confirmed
+// live by this fixture's own first failing draft before landing on the
+// real, correct shape.
 const widgetDiscoveryDocV1 = `{
   "name": "widget",
   "schemas": {
@@ -218,6 +281,11 @@ const widgetDiscoveryDocV1 = `{
       "methods": {
         "get":    {"httpMethod": "GET",  "flatPath": "v1/widgets/{widgetsId}", "response": {"$ref": "Widget"}},
         "create": {"httpMethod": "POST", "flatPath": "v1/widgets",             "request": {"$ref": "Widget"}, "response": {"$ref": "Widget"}}
+      }
+    },
+    "widgetSummaries": {
+      "methods": {
+        "get": {"httpMethod": "GET", "flatPath": "v1/widgetSummaries", "response": {"$ref": "Widget"}}
       }
     }
   }
@@ -241,44 +309,74 @@ const widgetDiscoveryDocV2AddsField = `{
         "get":    {"httpMethod": "GET",  "flatPath": "v1/widgets/{widgetsId}", "response": {"$ref": "Widget"}},
         "create": {"httpMethod": "POST", "flatPath": "v1/widgets",             "request": {"$ref": "Widget"}, "response": {"$ref": "Widget"}}
       }
+    },
+    "widgetSummaries": {
+      "methods": {
+        "get": {"httpMethod": "GET", "flatPath": "v1/widgetSummaries", "response": {"$ref": "Widget"}}
+      }
     }
   }
 }`
 
-func TestGenerateDiscoveryDoc_FirstEverSnapshot_Real100(t *testing.T) {
+func TestGenerateDiscoveryDocMember_FirstEverMember_RealMinorLevel(t *testing.T) {
 	url := serveSpec(t, widgetDiscoveryDocV1)
-	snap, err := GenerateDiscoveryDoc("widget", url, "", config.Provider{BaseURL: "https://widget.googleapis.com"}, nil)
+	member, _, level, err := GenerateDiscoveryDocMember("widget", url, "", ModeResource, config.Provider{BaseURL: "https://widget.googleapis.com"}, nil)
 	if err != nil {
-		t.Fatalf("GenerateDiscoveryDoc: %v", err)
+		t.Fatalf("GenerateDiscoveryDocMember: %v", err)
 	}
-	if snap.Version != "1.0.0" {
-		t.Errorf("first-ever snapshot version = %q, want 1.0.0", snap.Version)
+	if level != Minor {
+		t.Errorf("first-ever member level = %s, want minor", level)
 	}
-	if snap.SchemaSource != SchemaSourceDiscoveryDoc {
-		t.Errorf("SchemaSource = %q, want %q", snap.SchemaSource, SchemaSourceDiscoveryDoc)
+	if member.SchemaSource != SchemaSourceDiscoveryDoc {
+		t.Errorf("SchemaSource = %q, want %q", member.SchemaSource, SchemaSourceDiscoveryDoc)
 	}
 
-	built, err := LoadDiscoveryDoc(snap)
+	built, _, err := LoadDiscoveryDocMember("widget", member)
 	if err != nil {
-		t.Fatalf("LoadDiscoveryDoc: %v", err)
+		t.Fatalf("LoadDiscoveryDocMember: %v", err)
 	}
 	if len(built) == 0 {
-		t.Fatal("LoadDiscoveryDoc reconstructed zero resources from a real, CRUD-shaped document")
+		t.Fatal("LoadDiscoveryDocMember reconstructed zero resources from a real, CRUD-shaped document")
 	}
 }
 
-func TestGenerateDiscoveryDoc_AdditiveChange_RealMinorBump(t *testing.T) {
+func TestGenerateDiscoveryDocMember_AdditiveChange_RealMinorLevel(t *testing.T) {
 	execCfg := config.Provider{BaseURL: "https://widget.googleapis.com"}
-	prev, err := GenerateDiscoveryDoc("widget", serveSpec(t, widgetDiscoveryDocV1), "", execCfg, nil)
+	prevMember, _, _, err := GenerateDiscoveryDocMember("widget", serveSpec(t, widgetDiscoveryDocV1), "", ModeResource, execCfg, nil)
 	if err != nil {
 		t.Fatalf("first generation: %v", err)
 	}
 
-	next, err := GenerateDiscoveryDoc("widget", serveSpec(t, widgetDiscoveryDocV2AddsField), "", execCfg, prev)
+	_, _, level, err := GenerateDiscoveryDocMember("widget", serveSpec(t, widgetDiscoveryDocV2AddsField), "", ModeResource, execCfg, prevMember)
 	if err != nil {
 		t.Fatalf("second generation: %v", err)
 	}
-	if next.Version != "1.1.0" {
-		t.Errorf("real minor bump: version = %q, want 1.1.0", next.Version)
+	if level != Minor {
+		t.Errorf("real additive change level = %s, want minor", level)
+	}
+}
+
+func TestGenerateDiscoveryDocMember_DataSourceMode_RealDataSources(t *testing.T) {
+	url := serveSpec(t, widgetDiscoveryDocV1)
+	member, schemas, level, err := GenerateDiscoveryDocMember("widget_ds", url, "", ModeDataSource, config.Provider{BaseURL: "https://widget.googleapis.com"}, nil)
+	if err != nil {
+		t.Fatalf("GenerateDiscoveryDocMember (data source): %v", err)
+	}
+	if level != Minor {
+		t.Errorf("first-ever data-source member level = %s, want minor", level)
+	}
+	if len(schemas) == 0 {
+		t.Fatal("zero translated data-source schemas -- the real, unclaimed list method should have been a real candidate")
+	}
+
+	resources, dataSources, err := LoadDiscoveryDocMember("widget_ds", member)
+	if err != nil {
+		t.Fatalf("LoadDiscoveryDocMember: %v", err)
+	}
+	if len(resources) != 0 {
+		t.Errorf("a data-source-mode member reloaded %d RESOURCES, want zero", len(resources))
+	}
+	if len(dataSources) == 0 {
+		t.Fatal("a data-source-mode member reloaded zero data sources")
 	}
 }
