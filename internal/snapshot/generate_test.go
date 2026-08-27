@@ -356,6 +356,58 @@ func TestAssembleGroup_StampsRealBinaryVersion(t *testing.T) {
 	}
 }
 
+// TestAssembleGroup_MinBinaryVersionOnlyChange_ForcesPatchBump is
+// UBI-194's own real, direct proof of the gap a live hash-watch.yml run
+// against Kubernetes' own real, unchanged swagger.json actually hit:
+// every member reports NoChange, but the group's own prior
+// MinBinaryVersion differs from this build's real BinaryVersion (the
+// live, common case -- absent, for every one of the six snapshots
+// published before this field existed). Without a forced bump, the
+// group's own Version stays byte-identical to what's already committed,
+// so every real hash-watch.yml's own "is this newer" gate sees no
+// change and silently discards the freshly-stamped MinBinaryVersion
+// instead of committing it.
+func TestAssembleGroup_MinBinaryVersionOnlyChange_ForcesPatchBump(t *testing.T) {
+	old := BinaryVersion
+	t.Cleanup(func() { BinaryVersion = old })
+
+	BinaryVersion = ""
+	resourceMember, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
+	if err != nil {
+		t.Fatalf("prev resource member: %v", err)
+	}
+	prevGroup, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": resourceMember}, map[string]ChangeLevel{"widgetco": Minor}, nil)
+	if err != nil {
+		t.Fatalf("AssembleGroup (prev): %v", err)
+	}
+	if prevGroup.MinBinaryVersion != "" {
+		t.Fatalf("test setup: prevGroup.MinBinaryVersion = %q, want empty (matching the six real, pre-UBI-194 snapshots)", prevGroup.MinBinaryVersion)
+	}
+
+	BinaryVersion = "1.0.0"
+	nextMember, _, level, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, config.Provider{BaseURL: "https://api.widgetco.example"}, resourceMember)
+	if err != nil {
+		t.Fatalf("next resource member: %v", err)
+	}
+	if level != NoChange {
+		t.Fatalf("member level = %s, want none (test setup -- identical spec)", level)
+	}
+
+	nextGroup, err := AssembleGroup("widgetco", prevGroup, map[string]*MemberSnapshot{"widgetco": nextMember}, map[string]ChangeLevel{"widgetco": level}, nil)
+	if err != nil {
+		t.Fatalf("AssembleGroup (next): %v", err)
+	}
+	if nextGroup.Version == prevGroup.Version {
+		t.Fatalf("group version stayed at %q despite a real MinBinaryVersion transition (%q -> %q) -- this is exactly the real, live gap that silently discarded a regeneration", nextGroup.Version, prevGroup.MinBinaryVersion, nextGroup.MinBinaryVersion)
+	}
+	if nextGroup.Version != "1.0.1" {
+		t.Fatalf("group version = %q, want a Patch-level bump (1.0.1) from a MinBinaryVersion-only transition", nextGroup.Version)
+	}
+	if nextGroup.MinBinaryVersion != "1.0.0" {
+		t.Fatalf("MinBinaryVersion = %q, want 1.0.0", nextGroup.MinBinaryVersion)
+	}
+}
+
 func TestAssembleGroup_OneMemberMajorChange_RealMajorGroupBump(t *testing.T) {
 	execCfg := config.Provider{BaseURL: "https://api.widgetco.example"}
 	prevResource, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, execCfg, nil)
