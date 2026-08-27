@@ -167,7 +167,8 @@ func buildTestServer(t *testing.T, baseURL string) (*Server, *ResourceType) {
 	if !ok {
 		t.Fatalf("expected test_repository, got %v", resources)
 	}
-	srv := &Server{ProviderName: "test", Resources: resources, Client: restexec.NewClient(baseURL, nil)}
+	rt.Client = restexec.NewClient(baseURL, nil)
+	srv := &Server{ProviderName: "test", Resources: resources}
 	return srv, rt
 }
 

@@ -28,8 +28,13 @@ func withOperationTimeout(ctx context.Context, d time.Duration) (context.Context
 
 // Server is the real tfprotov6.ProviderServer this binary serves over
 // tf6server.Serve -- the tfplugin server layer (layer 1), wired to the
-// resource types Build produced (layers 2-3) and a real restexec.Client
-// (layer 4/6).
+// resource types Build produced (layers 2-3), each carrying its own real
+// restexec.Client (layer 4/6) rather than the Server holding one shared
+// client for every resource type regardless of origin (UBI-193's own
+// real fix -- see ResourceType.Client's own doc comment for why a
+// single, Server-wide client cannot correctly serve a real group whose
+// members genuinely differ on BaseURL or Auth, which both Azure's and
+// Google's own real, live groups do).
 type Server struct {
 	ProviderName string
 	Resources    map[string]*ResourceType
@@ -43,9 +48,10 @@ type Server struct {
 	// zero-valued embedded resourcemap.Resource with only Schema set
 	// (mirroring how a real *ResourceType built for the RESOURCE branch
 	// already gets constructed the identical way, since that RPC reads
-	// ONLY .Schema, confirmed by direct inspection, nothing else).
+	// ONLY .Schema, confirmed by direct inspection, nothing else) -- its
+	// own .Client is always nil too, matching real openapi/discoverydoc
+	// data sources needing no real wire execution at all.
 	DataSources map[string]*ResourceType
-	Client      *restexec.Client
 
 	// PlannedPrivateMarker is echoed by PlanResourceChange and required
 	// (non-empty) by ApplyResourceChange on a destroy -- see
@@ -66,6 +72,21 @@ func (s *Server) resourceType(typeName string) (*ResourceType, error) {
 		return nil, fmt.Errorf("unknown resource type %q", typeName)
 	}
 	return rt, nil
+}
+
+// requireClient is UBI-193's own real, deliberate failure point: a
+// resource type with no resolvable real Client (a discoverydoc-sourced
+// type, real wire execution not built for that source yet; or a real
+// member whose own config genuinely can't authenticate, e.g. Azure's
+// real auth-less entries once someone actually tries to execute
+// against one) fails HERE, at the moment a real CRUD RPC is attempted
+// -- never earlier, never at schema-serve time, which never needed
+// this at all.
+func (rt *ResourceType) requireClient() (*restexec.Client, error) {
+	if rt.Client == nil {
+		return nil, fmt.Errorf("resource type %q has no real, resolvable execution config -- real wire execution against it was never configured (see config.Provider.Auth/BaseURL for the real member this type came from)", rt.TypeName)
+	}
+	return rt.Client, nil
 }
 
 func diagError(summary, detail string) []*tfprotov6.Diagnostic {
@@ -305,7 +326,11 @@ func (s *Server) readFromAPI(ctx context.Context, rt *ResourceType, params map[s
 	if err != nil {
 		return nil, diagError("build read request", err.Error()), nil
 	}
-	_, body, _, err := s.Client.Do(ctx, "GET", path, nil)
+	client, err := rt.requireClient()
+	if err != nil {
+		return nil, nil, err
+	}
+	_, body, _, err := client.Do(ctx, "GET", path, nil)
 	if err != nil {
 		if restexec.IsNotFound(err) {
 			return nil, nil, nil
@@ -386,7 +411,12 @@ func (s *Server) applyCreate(ctx context.Context, rt *ResourceType, req *tfproto
 	}
 
 	doCtx, cancel := withOperationTimeout(ctx, rt.Timeouts.Create)
-	_, respBody, respHeader, err := s.Client.Do(doCtx, rt.CreateMethod, path, body)
+	client, err := rt.requireClient()
+	if err != nil {
+		cancel()
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("create resource", err.Error())}, nil
+	}
+	_, respBody, respHeader, err := client.Do(doCtx, rt.CreateMethod, path, body)
 	cancel()
 	if err != nil {
 		diags, ambiguous := classifyRESTError("create resource", err)
@@ -462,7 +492,12 @@ func (s *Server) applyUpdate(ctx context.Context, rt *ResourceType, req *tfproto
 	}
 
 	doCtx, cancel := withOperationTimeout(ctx, rt.Timeouts.Update)
-	_, respBody, respHeader, err := s.Client.Do(doCtx, rt.UpdateMethod, path, body)
+	client, err := rt.requireClient()
+	if err != nil {
+		cancel()
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("update resource", err.Error())}, nil
+	}
+	_, respBody, respHeader, err := client.Do(doCtx, rt.UpdateMethod, path, body)
 	cancel()
 	if err != nil {
 		diags, ambiguous := classifyRESTError("update resource", err)
@@ -531,7 +566,12 @@ func (s *Server) applyDestroy(ctx context.Context, rt *ResourceType, req *tfprot
 	}
 
 	doCtx, cancel := withOperationTimeout(ctx, rt.Timeouts.Delete)
-	_, _, _, err = s.Client.Do(doCtx, "DELETE", path, nil)
+	client, err := rt.requireClient()
+	if err != nil {
+		cancel()
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: diagError("destroy resource", err.Error())}, nil
+	}
+	_, _, _, err = client.Do(doCtx, "DELETE", path, nil)
 	cancel()
 	if err != nil && !restexec.IsNotFound(err) {
 		// Already gone (IsNotFound) is a real, honest destroy, not a lie

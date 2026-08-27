@@ -35,6 +35,11 @@ import (
 // reconcile-by-query verifies ground truth rather than this provider
 // guessing.
 func (s *Server) awaitAsyncOperation(ctx context.Context, rt *ResourceType, initialBody any, initialHeader http.Header) ([]*tfprotov6.Diagnostic, error) {
+	client, err := rt.requireClient()
+	if err != nil {
+		return nil, err
+	}
+
 	opID, err := extractOperationID(rt.Async, initialBody, initialHeader)
 	if err != nil {
 		return nil, fmt.Errorf("async operation: resolve operation id: %w", err)
@@ -50,7 +55,7 @@ func (s *Server) awaitAsyncOperation(ctx context.Context, rt *ResourceType, init
 
 	for {
 		pollCtx, cancel := withOperationTimeout(ctx, rt.Timeouts.Read)
-		_, body, _, err := s.Client.Do(pollCtx, http.MethodGet, pollPath, nil)
+		_, body, _, err := client.Do(pollCtx, http.MethodGet, pollPath, nil)
 		cancel()
 		if err != nil {
 			diags, ambiguous := classifyRESTError("poll async operation "+opID, err)

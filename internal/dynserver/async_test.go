@@ -74,7 +74,8 @@ func buildAsyncTestServer(t *testing.T, baseURL string) (*Server, *ResourceType)
 	rt := resources["test_repository"]
 	client := restexec.NewClient(baseURL, nil)
 	client.Retry = restexec.RetryPolicy{MaxAttempts: 1}
-	return &Server{ProviderName: "test", Resources: resources, Client: client}, rt
+	rt.Client = client
+	return &Server{ProviderName: "test", Resources: resources}, rt
 }
 
 func TestApplyResourceChange_Create_AsyncPollsUntilSuccessThenReads(t *testing.T) {
@@ -190,7 +191,8 @@ func TestApplyResourceChange_Create_AsyncPollTimeout_ReturnsAmbiguousError(t *te
 	rt := resources["test_repository"]
 	client := restexec.NewClient(ts.URL, nil)
 	client.Retry = restexec.RetryPolicy{MaxAttempts: 1}
-	srv := &Server{ProviderName: "test", Resources: resources, Client: client}
+	rt.Client = client
+	srv := &Server{ProviderName: "test", Resources: resources}
 
 	planned := objValue(rt, map[string]tftypes.Value{
 		"org":   tftypes.NewValue(tftypes.String, "acme"),
