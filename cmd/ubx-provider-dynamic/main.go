@@ -770,16 +770,48 @@ func run() error {
 	client := restexec.NewClient(cfg.BaseURL, authenticator)
 	client.Retry = retryPolicy
 
+	// UBI-193: Client is now per-resource-type (dynserver.ResourceType's
+	// own field, not Server's) -- a live, non-pinned launch always
+	// serves exactly ONE [dynamic_providers.<name>] entry, so every
+	// real resource type here genuinely does share this one client,
+	// unlike a pinned GROUP's own real members, which may not.
+	for _, rt := range resources {
+		rt.Client = client
+	}
+
 	server := &dynserver.Server{
 		ProviderName: name,
 		Resources:    resources,
 		DataSources:  dataSourcesToResourceTypes(builtDS),
-		Client:       client,
 	}
 
 	return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
 		return server
 	})
+}
+
+// buildMemberClient is UBI-193's own real, per-member client
+// construction -- the exact same real steps runServeSnapshot used to
+// perform ONCE, group-wide, before this fix (auth.Build, resolve the
+// real retry policy, restexec.NewClient), now callable per real
+// member so each one's own real BaseURL/Auth is used, never a
+// different member's. A real member with Auth.Type == "" (Azure's own
+// real 301-of-302 case) builds a real, legitimate "no authentication"
+// client -- not an error; that member only fails for real once
+// something actually tries to execute against it without real
+// credentials, the correct, later failure point.
+func buildMemberClient(m *snapshot.MemberSnapshot) (*restexec.Client, error) {
+	authenticator, err := auth.Build(m.Auth.Type, m.Auth.Params)
+	if err != nil {
+		return nil, fmt.Errorf("build authenticator: %w", err)
+	}
+	retryPolicy, err := dynserver.ResolveRetryPolicy(m.Retry)
+	if err != nil {
+		return nil, fmt.Errorf("resolve retry policy: %w", err)
+	}
+	client := restexec.NewClient(m.BaseURL, authenticator)
+	client.Retry = retryPolicy
+	return client, nil
 }
 
 // runServeSnapshot is snapshotPathEnvVar's own real implementation -- the
@@ -819,21 +851,20 @@ func runServeSnapshot(name, snapPath string) error {
 		return fmt.Errorf("snapshot %s is for group %q, but %s is %q -- a pinned entry always serves the whole real group under its own published identity, not one internal member", snapPath, snap.Provider, nameEnvVar, name)
 	}
 
-	execCfg, err := snap.ExecConfig()
-	if err != nil {
-		return fmt.Errorf("snapshot %s: %w", snapPath, err)
-	}
-	authenticator, err := auth.Build(execCfg.Auth.Type, execCfg.Auth.Params)
-	if err != nil {
-		return fmt.Errorf("build authenticator: %w", err)
-	}
-	retryPolicy, err := dynserver.ResolveRetryPolicy(execCfg.Retry)
-	if err != nil {
-		return fmt.Errorf("resolve retry policy: %w", err)
-	}
-	restClient := restexec.NewClient(execCfg.BaseURL, authenticator)
-	restClient.Retry = retryPolicy
-
+	// UBI-193's own real fix: no group-wide exec config is resolved here,
+	// eagerly, before any RPC is even served -- GetProviderSchema (every
+	// RPC schema-fetch/pinning ever calls) never touches a REST client
+	// at all, so requiring one real, single, agreed-upon config across
+	// EVERY member before serving it was an artificial precondition, not
+	// a genuine requirement. Confirmed live: Google's own real 262 members
+	// span 163 distinct real base_urls (one shared control-plane endpoint
+	// is not a thing GCP has); Azure's own real 302 members have real
+	// auth on exactly 1 (the other 301 carry a real, legitimate "no
+	// authentication configured" state, not an error). Each real
+	// branch below resolves its own real member's own real exec config
+	// directly, per resource type where that's meaningful (openapi), at
+	// the point real wire execution is actually attempted -- never at
+	// schema-serve time.
 	src, err := snap.GroupSchemaSource()
 	if err != nil {
 		return fmt.Errorf("snapshot %s: %w", snapPath, err)
@@ -842,14 +873,33 @@ func runServeSnapshot(name, snapPath string) error {
 	var server tfprotov6.ProviderServer
 	switch src {
 	case snapshot.SchemaSourceOpenAPI:
-		resources, dataSources, err := snapshot.MergeOpenAPIGroup(snap)
+		resources, dataSources, resourceMemberOf, err := snapshot.MergeOpenAPIGroup(snap)
 		if err != nil {
 			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
 		}
 		if len(resources) == 0 && len(dataSources) == 0 {
 			return fmt.Errorf("no resources or data sources in group %q (snapshot %s) -- nothing to serve", name, snapPath)
 		}
-		server = &dynserver.Server{ProviderName: name, Resources: resources, DataSources: dataSourcesToResourceTypes(dataSources), Client: restClient}
+		// UBI-193: each real resource type resolves its own real
+		// client from its own real originating member -- never one
+		// client shared across a whole group whose real members may
+		// genuinely disagree on BaseURL/Auth (Azure/Google, confirmed
+		// live). clientCache avoids building the same real member's
+		// client twice when many resource types share one origin.
+		clientCache := map[string]*restexec.Client{}
+		for typeName, rt := range resources {
+			memberName := resourceMemberOf[typeName]
+			client, ok := clientCache[memberName]
+			if !ok {
+				client, err = buildMemberClient(snap.Members[memberName])
+				if err != nil {
+					return fmt.Errorf("member %q: %w", memberName, err)
+				}
+				clientCache[memberName] = client
+			}
+			rt.Client = client
+		}
+		server = &dynserver.Server{ProviderName: name, Resources: resources, DataSources: dataSourcesToResourceTypes(dataSources)}
 
 	case snapshot.SchemaSourceDiscoveryDoc:
 		// Schema-layer only, matching run()'s own real discoverydoc
@@ -887,7 +937,25 @@ func runServeSnapshot(name, snapPath string) error {
 		if len(resources) == 0 {
 			return fmt.Errorf("no resources in group %q (snapshot %s) -- nothing to serve", name, snapPath)
 		}
-		server = cfnserver.New(name, resources, &ccapi.Client{Rest: restClient})
+		// UBI-193: cfnserver.Server still carries one real CCAPI client
+		// for the whole group (unchanged) -- CloudFormation genuinely
+		// has no per-resource-type divergence TODAY, since every real
+		// CFN member is resource-mode (LoadCloudFormationMember already
+		// refuses ModeDataSource) and this org's own real config has
+		// never had more than one real CFN member. Resolved from the
+		// group's own real resource-mode member(s) directly, sorted,
+		// first -- NOT the removed group-wide ExecConfig, which used to
+		// scan every member indiscriminately. If a real group ever
+		// does carry more than one real CFN member with genuinely
+		// different exec config, this would need the same per-type
+		// treatment dynserver just got -- untested today, confirmed
+		// not assumed (UBI-193's own scope note).
+		cfnMemberNames := snap.MemberNamesByMode(snapshot.ModeResource)
+		cfnClient, err := buildMemberClient(snap.Members[cfnMemberNames[0]])
+		if err != nil {
+			return fmt.Errorf("member %q: %w", cfnMemberNames[0], err)
+		}
+		server = cfnserver.New(name, resources, &ccapi.Client{Rest: cfnClient})
 
 	case snapshot.SchemaSourceSmithy:
 		resources, dataSources, model, err := snapshot.MergeSmithyGroup(snap)
@@ -902,14 +970,23 @@ func runServeSnapshot(name, snapPath string) error {
 			if err != nil {
 				return fmt.Errorf("find Smithy service for group %q in snapshot %s: %w", name, snapPath, err)
 			}
-			// TargetPrefix comes from whichever member MergeSmithyGroup
-			// anchored its own single real resource-mode model to --
-			// snap.ExecConfig's own member may differ (it only verifies
-			// BaseURL/Auth agree, not TargetPrefix), so resolve it the
-			// same real way: the group's own sole resource-mode member.
+			// UBI-193: BaseURL/Auth/TargetPrefix all come from the SAME
+			// real member MergeSmithyGroup already anchored its own
+			// single real resource-mode model to -- MergeSmithyGroup
+			// itself refuses a group with more than one real
+			// resource-mode Smithy member, so there is never a real
+			// case where a different member's own config could apply
+			// here; using it directly (not the removed, group-wide
+			// ExecConfig, which could disagree with this member since
+			// it scanned every member indiscriminately) is both
+			// simpler and strictly more correct.
 			resourceMemberNames := snap.MemberNamesByMode(snapshot.ModeResource)
-			targetPrefix := snap.Members[resourceMemberNames[0]].TargetPrefix
-			wireClient := &wireexec.Client{Rest: restClient, Model: model, Service: svc, TargetPrefix: targetPrefix}
+			resourceMember := snap.Members[resourceMemberNames[0]]
+			smithyClient, err := buildMemberClient(resourceMember)
+			if err != nil {
+				return fmt.Errorf("member %q: %w", resourceMemberNames[0], err)
+			}
+			wireClient := &wireexec.Client{Rest: smithyClient, Model: model, Service: svc, TargetPrefix: resourceMember.TargetPrefix}
 			server = &smithyserver.Server{ProviderName: name, Resources: resources, DataSources: dataSources, Model: model, Wire: wireClient}
 		} else {
 			// Real, honest, named scope boundary: a smithy group with
@@ -980,7 +1057,7 @@ func runDumpSignalsFromSnapshot(name, snapPath string) error {
 	}
 
 	if src == snapshot.SchemaSourceOpenAPI {
-		resources, _, err := snapshot.MergeOpenAPIGroup(snap)
+		resources, _, _, err := snapshot.MergeOpenAPIGroup(snap)
 		if err != nil {
 			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
 		}

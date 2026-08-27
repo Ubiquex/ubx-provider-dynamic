@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
@@ -42,7 +43,7 @@ func realKubernetesLikeGroup(t *testing.T) *Snapshot {
 func TestMergeOpenAPIGroup_RealTwoMemberGroup_MergesCleanly(t *testing.T) {
 	group := realKubernetesLikeGroup(t)
 
-	resources, dataSources, err := MergeOpenAPIGroup(group)
+	resources, dataSources, _, err := MergeOpenAPIGroup(group)
 	if err != nil {
 		t.Fatalf("MergeOpenAPIGroup: %v", err)
 	}
@@ -53,6 +54,70 @@ func TestMergeOpenAPIGroup_RealTwoMemberGroup_MergesCleanly(t *testing.T) {
 		t.Fatal("merged group has zero data sources")
 	}
 	t.Logf("merged: %d resources, %d data sources", len(resources), len(dataSources))
+}
+
+// TestMergeOpenAPIGroup_ResourceMemberOf_MatchesRealDivergentOrigins is
+// UBI-193's own real, direct proof: resourceMemberOf correctly
+// attributes each real resource type to its own real originating
+// member, even when two real members genuinely disagree on BaseURL --
+// exactly Azure's and Google's own real, live shape (Snapshot.
+// ExecConfig's own former, removed strict-equality check would have
+// refused this group outright before any RPC could even be served).
+func TestMergeOpenAPIGroup_ResourceMemberOf_MatchesRealDivergentOrigins(t *testing.T) {
+	memberA, _, _, err := GenerateOpenAPIMember("widgetco_compute", "widgetco_compute", serveSpec(t, widgetSpecV1), ModeResource, config.Provider{BaseURL: "https://compute.widgetco.example"}, nil)
+	if err != nil {
+		t.Fatalf("generate member A: %v", err)
+	}
+	memberB, _, _, err := GenerateOpenAPIMember("widgetco_storage", "widgetco_storage", serveSpec(t, widgetSpecV1), ModeResource, config.Provider{BaseURL: "https://storage.widgetco.example"}, nil)
+	if err != nil {
+		t.Fatalf("generate member B: %v", err)
+	}
+	group, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco_compute": memberA, "widgetco_storage": memberB}, map[string]ChangeLevel{"widgetco_compute": Minor, "widgetco_storage": Minor}, nil)
+	if err != nil {
+		t.Fatalf("AssembleGroup: %v", err)
+	}
+
+	resources, _, resourceMemberOf, err := MergeOpenAPIGroup(group)
+	if err != nil {
+		t.Fatalf("MergeOpenAPIGroup on a group with genuinely different real member BaseURLs: %v", err)
+	}
+	if len(resources) == 0 {
+		t.Fatal("merged group has zero resources")
+	}
+
+	checked := 0
+	for typeName := range resources {
+		memberName, ok := resourceMemberOf[typeName]
+		if !ok {
+			t.Errorf("resourceMemberOf has no entry for real type %q", typeName)
+			continue
+		}
+		// Both real members share the identical real spec but distinct
+		// real wireNames, so every real type name's own prefix directly
+		// names which member it came from -- a real, independent check
+		// that resourceMemberOf's own attribution is correct, not just
+		// present.
+		var wantPrefix string
+		switch {
+		case strings.HasPrefix(typeName, "widgetco_compute_"):
+			wantPrefix = "widgetco_compute"
+		case strings.HasPrefix(typeName, "widgetco_storage_"):
+			wantPrefix = "widgetco_storage"
+		default:
+			t.Errorf("real type %q has neither expected real prefix", typeName)
+			continue
+		}
+		if memberName != wantPrefix {
+			t.Errorf("type %q: resourceMemberOf says member %q, but its own real wire prefix says %q", typeName, memberName, wantPrefix)
+		}
+		if got := group.Members[memberName].BaseURL; got == "" {
+			t.Errorf("member %q has no real BaseURL", memberName)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("no real resource types were actually checked")
+	}
 }
 
 // realDatadogLikeCollidingGroup builds a real, two-member group that
@@ -88,7 +153,7 @@ func realDatadogLikeCollidingGroup(t *testing.T, exclude map[string][]string) *S
 func TestMergeOpenAPIGroup_DuplicateResourceWireType_RealFailLoud(t *testing.T) {
 	group := realDatadogLikeCollidingGroup(t, nil)
 
-	_, _, err := MergeOpenAPIGroup(group)
+	_, _, _, err := MergeOpenAPIGroup(group)
 	if err == nil {
 		t.Fatal("expected a real error for two resource-mode members producing the identical wire type name with no Exclude entry")
 	}
@@ -108,7 +173,7 @@ func TestMergeOpenAPIGroup_DuplicateResourceWireType_ResolvedByExclude(t *testin
 		"widgetco_v2": {"widgetco_widget"},
 	})
 
-	resources, _, err := MergeOpenAPIGroup(group)
+	resources, _, _, err := MergeOpenAPIGroup(group)
 	if err != nil {
 		t.Fatalf("MergeOpenAPIGroup with a real Exclude entry resolving the collision: %v", err)
 	}
@@ -126,7 +191,7 @@ func TestMergeOpenAPIGroup_ExcludeOnWrongMember_StillFailsLoud(t *testing.T) {
 		"widgetco_v2": {"some_other_type_name_entirely"},
 	})
 
-	_, _, err := MergeOpenAPIGroup(group)
+	_, _, _, err := MergeOpenAPIGroup(group)
 	if err == nil {
 		t.Fatal("expected a real error -- the real Exclude entry names a different type name, not the one that actually collided")
 	}
@@ -156,7 +221,7 @@ func TestGroupSchemaSource_MixedSources_RealFailLoud(t *testing.T) {
 		t.Errorf("error doesn't wrap ErrMixedSchemaSourceGroup: %v", err)
 	}
 
-	if _, _, err := MergeOpenAPIGroup(group); !errors.Is(err, ErrMixedSchemaSourceGroup) {
+	if _, _, _, err := MergeOpenAPIGroup(group); !errors.Is(err, ErrMixedSchemaSourceGroup) {
 		t.Errorf("MergeOpenAPIGroup on a mixed-source group: got %v, want ErrMixedSchemaSourceGroup", err)
 	}
 }
@@ -178,7 +243,7 @@ func TestGroupSchemaSource_SingleSource_RealSuccess(t *testing.T) {
 // count -- and that it returns real numbers, never a member name.
 func TestSummarize_RealTwoMemberGroup_MatchesMergeOpenAPIGroup(t *testing.T) {
 	group := realKubernetesLikeGroup(t)
-	wantResources, wantDataSources, err := MergeOpenAPIGroup(group)
+	wantResources, wantDataSources, _, err := MergeOpenAPIGroup(group)
 	if err != nil {
 		t.Fatalf("MergeOpenAPIGroup: %v", err)
 	}
@@ -206,7 +271,7 @@ func TestSummarize_RealCollisionResolvedByExclude(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Summarize: %v", err)
 	}
-	want, _, err := MergeOpenAPIGroup(group)
+	want, _, _, err := MergeOpenAPIGroup(group)
 	if err != nil {
 		t.Fatalf("MergeOpenAPIGroup: %v", err)
 	}

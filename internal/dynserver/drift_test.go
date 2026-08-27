@@ -26,7 +26,8 @@ func buildDriftTestServer(t *testing.T, baseURL string, drift config.DriftConfig
 	rt := resources["test_repository"]
 	client := restexec.NewClient(baseURL, nil)
 	client.Retry = restexec.RetryPolicy{MaxAttempts: 1}
-	return &Server{ProviderName: "test", Resources: resources, Client: client}, rt
+	rt.Client = client
+	return &Server{ProviderName: "test", Resources: resources}, rt
 }
 
 // TestReadResource_DriftIgnore_NeverReportsConfiguredFields proves an

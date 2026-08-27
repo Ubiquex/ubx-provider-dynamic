@@ -14,6 +14,7 @@ import (
 
 	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/resourcemap"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/restexec"
 	uschema "github.com/ubiquex/ubx-provider-dynamic/internal/schema"
 )
 
@@ -33,6 +34,27 @@ type ResourceType struct {
 	Timeouts   Timeouts
 	Async      AsyncPolicy
 	Drift      DriftPolicy
+
+	// Client is UBI-193's own real fix: resolved PER RESOURCE TYPE, from
+	// that type's own real, originating group member -- never a single
+	// Server-wide client shared across every type regardless of origin.
+	// A real, live group can have real members with genuinely different
+	// BaseURL (Google: 163 distinct real hostnames across 262 real
+	// entries, one shared control-plane endpoint is not a thing that
+	// exists for GCP) or genuinely different Auth (Azure: 1 of 302 real
+	// entries carries real auth, the rest carry none, a real, legitimate
+	// "no authentication configured" state, not an error) -- requiring
+	// every member to agree before ANY RPC could be served (the prior
+	// design, Snapshot.ExecConfig, called unconditionally before
+	// GetProviderSchema even though that RPC never touches this field at
+	// all) turned real, ordinary per-service divergence into an
+	// artificial hard block at schema-serve time. Nil only for a
+	// discoverydoc-sourced ResourceType (real wire execution is not
+	// built for that source yet, matching run()'s own live-fetch
+	// branch); ReadResource/ApplyResourceChange fail loud, at the real
+	// point of use, if a real caller ever reaches one of those with Client
+	// nil -- the correct failure point, not schema-serve time.
+	Client *restexec.Client
 
 	// PathParamAttr/CreatePathParamAttr map a real URL template parameter
 	// name (Resource.PathParams/CreatePathParams' own entries, which MUST

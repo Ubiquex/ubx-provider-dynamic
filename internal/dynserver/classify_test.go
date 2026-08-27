@@ -29,7 +29,8 @@ func buildTestServerWithClient(t *testing.T, client *restexec.Client) (*Server, 
 		t.Fatalf("Build: %v (notes: %v)", err, notes)
 	}
 	rt := resources["test_repository"]
-	return &Server{ProviderName: "test", Resources: resources, Client: client}, rt
+	rt.Client = client
+	return &Server{ProviderName: "test", Resources: resources}, rt
 }
 
 // noRetryClient is a real restexec.Client with retries disabled -- these

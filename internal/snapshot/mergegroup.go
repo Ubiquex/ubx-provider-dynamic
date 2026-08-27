@@ -3,7 +3,6 @@ package snapshot
 import (
 	"encoding/json"
 	"fmt"
-	"reflect"
 	"sort"
 
 	"github.com/ubiquex/ubx-provider-dynamic/internal/cloudformation"
@@ -161,46 +160,6 @@ func (s *Snapshot) MemberNamesByMode(mode Mode) []string {
 	return names
 }
 
-// ErrInconsistentExecConfig is a real, named refusal -- a group whose
-// real members disagree on BaseURL or Auth cannot pick one to serve real
-// CRUD/wire execution with any real justification for preferring it
-// over another; every real group surveyed while building this (Kubernetes,
-// Datadog) has byte-identical BaseURL/Auth across every one of its own
-// real members, so this is a real, deliberate safety check against a
-// real misconfiguration, not a case any current real config actually
-// hits.
-var ErrInconsistentExecConfig = fmt.Errorf("group members disagree on real execution config (base_url or auth)")
-
-// ExecConfig returns the real BaseURL/Auth/Retry every member of a
-// well-formed group shares, verified, not assumed -- fails loud
-// (ErrInconsistentExecConfig) if any two real members actually disagree,
-// rather than silently picking one member's own config arbitrarily.
-// Deterministic (sorted member names) so which member's own Retry/
-// Timeouts values get used, on the rare case those two legitimately
-// differ, is at least stable across runs.
-func (s *Snapshot) ExecConfig() (*MemberSnapshot, error) {
-	var names []string
-	for name := range s.Members {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	if len(names) == 0 {
-		return nil, fmt.Errorf("group %q has no real members at all", s.Provider)
-	}
-
-	first := s.Members[names[0]]
-	for _, name := range names[1:] {
-		m := s.Members[name]
-		if m.BaseURL != first.BaseURL {
-			return nil, fmt.Errorf("%w: %q is %q, %q is %q", ErrInconsistentExecConfig, names[0], first.BaseURL, name, m.BaseURL)
-		}
-		if !reflect.DeepEqual(m.Auth, first.Auth) {
-			return nil, fmt.Errorf("%w: %q and %q have different auth config", ErrInconsistentExecConfig, names[0], name)
-		}
-	}
-	return first, nil
-}
-
 // MergeOpenAPIGroup merges every real member of an openapi-sourced group
 // into one real resource map and one real data-source map -- the SAME
 // two maps a single dynserver.Server already carries side by side
@@ -208,11 +167,22 @@ func (s *Snapshot) ExecConfig() (*MemberSnapshot, error) {
 // this file's own doc comment). Fails loud (ErrDuplicateWireType) on any
 // real wire-type collision within the SAME role, immediately, rather
 // than letting one silently overwrite the other.
-func MergeOpenAPIGroup(snap *Snapshot) (resources map[string]*dynserver.ResourceType, dataSources map[string]*resourcemap.BuiltDataSource, err error) {
+//
+// resourceMemberOf is UBI-193's own real addition: which real member
+// each resource type came from, the SAME real information
+// resourcePlacedBy already tracks internally for collision detection,
+// now surfaced rather than discarded once merging finishes. The caller
+// (runServeSnapshot) uses this to resolve each resource type's own real
+// execution config from ITS OWN originating member, instead of a single
+// group-wide config every member was previously required to agree on
+// (Snapshot.ExecConfig's own former, real, live-found failure mode --
+// see that function's own doc comment for the real, live groups, Azure
+// and Google, whose real members never actually agreed).
+func MergeOpenAPIGroup(snap *Snapshot) (resources map[string]*dynserver.ResourceType, dataSources map[string]*resourcemap.BuiltDataSource, resourceMemberOf map[string]string, err error) {
 	if src, err := snap.GroupSchemaSource(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	} else if src != SchemaSourceOpenAPI {
-		return nil, nil, fmt.Errorf("group %q is %q, not openapi", snap.Provider, src)
+		return nil, nil, nil, fmt.Errorf("group %q is %q, not openapi", snap.Provider, src)
 	}
 
 	resources = map[string]*dynserver.ResourceType{}
@@ -220,10 +190,10 @@ func MergeOpenAPIGroup(snap *Snapshot) (resources map[string]*dynserver.Resource
 	for _, name := range snap.MemberNamesByMode(ModeResource) {
 		built, _, err := LoadOpenAPIMember(name, snap.Members[name])
 		if err != nil {
-			return nil, nil, fmt.Errorf("member %q: %w", name, err)
+			return nil, nil, nil, fmt.Errorf("member %q: %w", name, err)
 		}
 		if err := mergeWithExclude(resources, resourcePlacedBy, built, name, snap.Exclude, "resource"); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 
@@ -232,13 +202,13 @@ func MergeOpenAPIGroup(snap *Snapshot) (resources map[string]*dynserver.Resource
 	for _, name := range snap.MemberNamesByMode(ModeDataSource) {
 		_, built, err := LoadOpenAPIMember(name, snap.Members[name])
 		if err != nil {
-			return nil, nil, fmt.Errorf("member %q: %w", name, err)
+			return nil, nil, nil, fmt.Errorf("member %q: %w", name, err)
 		}
 		if err := mergeWithExclude(dataSources, dataSourcePlacedBy, built, name, snap.Exclude, "data source"); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
-	return resources, dataSources, nil
+	return resources, dataSources, resourcePlacedBy, nil
 }
 
 // MergeDiscoveryDocGroup mirrors MergeOpenAPIGroup for discoverydoc-sourced
@@ -374,7 +344,7 @@ func Summarize(snap *Snapshot) (resources, dataSources int, err error) {
 	}
 	switch src {
 	case SchemaSourceOpenAPI:
-		r, d, err := MergeOpenAPIGroup(snap)
+		r, d, _, err := MergeOpenAPIGroup(snap)
 		if err != nil {
 			return 0, 0, err
 		}

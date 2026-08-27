@@ -50,7 +50,8 @@ func TestServer_AuthenticatedReadResource_RealAuthFlow(t *testing.T) {
 		t.Fatalf("Build: %v (notes: %v)", err, notes)
 	}
 	rt := resources["test_repository"]
-	srv := &Server{ProviderName: "test", Resources: resources, Client: restexec.NewClient(ts.URL, authenticator)}
+	rt.Client = restexec.NewClient(ts.URL, authenticator)
+	srv := &Server{ProviderName: "test", Resources: resources}
 
 	current := objValue(rt, map[string]tftypes.Value{
 		"owner": tftypes.NewValue(tftypes.String, "acme"),
@@ -82,7 +83,8 @@ func TestServer_UnauthenticatedReadResource_RealRejection(t *testing.T) {
 		t.Fatalf("Build: %v (notes: %v)", err, notes)
 	}
 	rt := resources["test_repository"]
-	srv := &Server{ProviderName: "test", Resources: resources, Client: restexec.NewClient(ts.URL, nil)} // no auth configured
+	rt.Client = restexec.NewClient(ts.URL, nil) // no auth configured
+	srv := &Server{ProviderName: "test", Resources: resources}
 
 	current := objValue(rt, map[string]tftypes.Value{
 		"owner": tftypes.NewValue(tftypes.String, "acme"),
