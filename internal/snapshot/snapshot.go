@@ -273,7 +273,48 @@ type Snapshot struct {
 	// defaulted, the exact real failure mode the wire_name bug produced
 	// before this existed).
 	Exclude map[string][]string `json:"exclude,omitempty"`
+
+	// MinBinaryVersion is UBI-194's own real answer to "which
+	// ubx-provider-dynamic binary can correctly SERVE this snapshot" --
+	// stamped by AssembleGroup at generation time from BinaryVersion
+	// (this exact build's own real, embedded release version), not
+	// inferred from SchemaFormat. Confirmed live, not assumed, why
+	// SchemaFormat alone can't answer this: AWS's own real mixed-source
+	// group needed internal/mixedserver (a real SERVING-time capability)
+	// before it could be served at all, but SchemaFormat never moved for
+	// that fix -- a snapshot generated the day before vs. the day after
+	// that fix both declare the identical SchemaFormat, yet only one can
+	// actually be served. The generating binary's own real version is
+	// exact by construction (it definitely can serve what it just
+	// wrote) where SchemaFormat is coarse and where a hand-maintained
+	// compatibility table would need updating in lockstep with every
+	// real serving-capability fix, forever, with no way to fix already-
+	// published snapshots retroactively either way -- this field
+	// doesn't need a table at all, and self-heals on every real
+	// regeneration (hash-watch.yml always builds ubx-provider-dynamic
+	// fresh), not just future ones.
+	//
+	// Empty for every snapshot generated before this field existed (all
+	// six real, already-published provider repos as of UBI-194) --
+	// resolution treats an empty value as a real, explicit, LOGGED
+	// bootstrap case, not a silent, permanent second meaning (see
+	// provider.AcquireDynamicProviderBinary's own doc comment in
+	// ubiquex).
+	MinBinaryVersion string `json:"min_binary_version,omitempty"`
 }
+
+// BinaryVersion is THIS BUILD's own real, released version -- set via
+// -ldflags "-X .../internal/snapshot.BinaryVersion=<version>" by the
+// real publish workflow that cuts a tagged ubx-provider-dynamic release
+// (UBI-194), left at its own real, honest "dev" default for any build
+// that didn't set it (a local `go build`, a worktree checkout used for
+// this arc's own live-proof verification, etc.) -- AssembleGroup stamps
+// whatever's here into every new snapshot's own real MinBinaryVersion,
+// unconditionally; "dev" is a real, deliberately-not-a-semver value a
+// caller resolving MinBinaryVersion must already treat as absent/
+// untrusted the same way it treats a genuinely empty string, so a local
+// build can never be mistaken for a real, fetchable release.
+var BinaryVersion = "dev"
 
 // CheckFormat refuses loudly, real and immediate, if the snapshot's own
 // SchemaFormat falls outside this build's declared
@@ -348,11 +389,12 @@ func Save(path string, snap *Snapshot) error {
 // problem at AWS's 430-member scale: one flat file would exceed
 // GitHub's own real 100MB commit limit by more than 2x).
 type manifest struct {
-	SchemaFormat int                 `json:"schema_format"`
-	Provider     string              `json:"provider"`
-	Version      string              `json:"version"`
-	Members      []string            `json:"members"`
-	Exclude      map[string][]string `json:"exclude,omitempty"`
+	SchemaFormat     int                 `json:"schema_format"`
+	Provider         string              `json:"provider"`
+	Version          string              `json:"version"`
+	Members          []string            `json:"members"`
+	Exclude          map[string][]string `json:"exclude,omitempty"`
+	MinBinaryVersion string              `json:"min_binary_version,omitempty"`
 }
 
 // SaveSplit writes snap as a real, committable directory tree:
@@ -371,11 +413,12 @@ func SaveSplit(dir string, snap *Snapshot) error {
 	names := memberNames(snap.Members)
 	sort.Strings(names)
 	man := manifest{
-		SchemaFormat: snap.SchemaFormat,
-		Provider:     snap.Provider,
-		Version:      snap.Version,
-		Members:      names,
-		Exclude:      snap.Exclude,
+		SchemaFormat:     snap.SchemaFormat,
+		Provider:         snap.Provider,
+		Version:          snap.Version,
+		Members:          names,
+		Exclude:          snap.Exclude,
+		MinBinaryVersion: snap.MinBinaryVersion,
 	}
 	manData, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
@@ -432,11 +475,12 @@ func LoadSplit(dir string) (*Snapshot, error) {
 	}
 
 	return &Snapshot{
-		SchemaFormat: man.SchemaFormat,
-		Provider:     man.Provider,
-		Version:      man.Version,
-		Members:      members,
-		Exclude:      man.Exclude,
+		SchemaFormat:     man.SchemaFormat,
+		Provider:         man.Provider,
+		Version:          man.Version,
+		Members:          members,
+		Exclude:          man.Exclude,
+		MinBinaryVersion: man.MinBinaryVersion,
 	}, nil
 }
 
