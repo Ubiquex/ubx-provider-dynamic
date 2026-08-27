@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
+
 	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
 )
 
@@ -277,5 +279,137 @@ func TestSummarize_RealCollisionResolvedByExclude(t *testing.T) {
 	}
 	if resources != len(want) {
 		t.Errorf("Summarize resources = %d, want %d", resources, len(want))
+	}
+}
+
+// realAWSLikeMixedGroup builds a group shaped exactly like AWS's own
+// real group (repo_name "aws"): one CloudFormation resource-mode
+// member, one Smithy data-source-mode member -- the only real mixed-
+// source shape among this org's six real providers, confirmed by
+// checking every real group's own member composition directly before
+// building UBI-193's own dispatch layer.
+func realAWSLikeMixedGroup(t *testing.T) *Snapshot {
+	t.Helper()
+	return &Snapshot{
+		Provider: "aws",
+		Version:  "1.0.0",
+		Members: map[string]*MemberSnapshot{
+			"aws":        {SchemaSource: SchemaSourceCloudFormation, Mode: ModeResource},
+			"aws_data_x": {SchemaSource: SchemaSourceSmithy, Mode: ModeDataSource},
+			"aws_data_y": {SchemaSource: SchemaSourceSmithy, Mode: ModeDataSource},
+		},
+	}
+}
+
+// TestDistinctSources_RealMixedGroup_ReturnsBothSourcesSorted proves
+// DistinctSources reports every real source present, sorted
+// deterministically -- the dispatch layer's own real entry point for
+// deciding how many per-source sub-servers a real mixed group needs.
+func TestDistinctSources_RealMixedGroup_ReturnsBothSourcesSorted(t *testing.T) {
+	group := realAWSLikeMixedGroup(t)
+	sources := group.DistinctSources()
+	want := []SchemaSource{SchemaSourceCloudFormation, SchemaSourceSmithy}
+	if len(sources) != len(want) {
+		t.Fatalf("DistinctSources = %v, want %v", sources, want)
+	}
+	for i := range want {
+		if sources[i] != want[i] {
+			t.Errorf("DistinctSources[%d] = %q, want %q", i, sources[i], want[i])
+		}
+	}
+}
+
+// TestDistinctSources_RealSingleSourceGroup_ReturnsOne proves a group
+// that ISN'T mixed reports exactly one source, matching
+// GroupSchemaSource's own real success case.
+func TestDistinctSources_RealSingleSourceGroup_ReturnsOne(t *testing.T) {
+	group := realKubernetesLikeGroup(t)
+	sources := group.DistinctSources()
+	if len(sources) != 1 || sources[0] != SchemaSourceOpenAPI {
+		t.Errorf("DistinctSources = %v, want [openapi]", sources)
+	}
+}
+
+// TestSubsetBySource_RealMixedGroup_SplitsCleanly proves SubsetBySource
+// partitions a real mixed group into real single-source subsets, each
+// one accepted by GroupSchemaSource without error -- the exact real
+// precondition every Merge<Source>Group function still requires,
+// unchanged, per UBI-193's own dispatch-layer design (SubsetBySource is
+// called BEFORE handing off to a Merge<Source>Group, never inside one).
+func TestSubsetBySource_RealMixedGroup_SplitsCleanly(t *testing.T) {
+	group := realAWSLikeMixedGroup(t)
+
+	cfnSubset := group.SubsetBySource(SchemaSourceCloudFormation)
+	if len(cfnSubset.Members) != 1 {
+		t.Fatalf("cfn subset has %d members, want 1", len(cfnSubset.Members))
+	}
+	if src, err := cfnSubset.GroupSchemaSource(); err != nil || src != SchemaSourceCloudFormation {
+		t.Errorf("cfn subset GroupSchemaSource = %q, %v, want cloudformation, nil", src, err)
+	}
+
+	smithySubset := group.SubsetBySource(SchemaSourceSmithy)
+	if len(smithySubset.Members) != 2 {
+		t.Fatalf("smithy subset has %d members, want 2", len(smithySubset.Members))
+	}
+	if src, err := smithySubset.GroupSchemaSource(); err != nil || src != SchemaSourceSmithy {
+		t.Errorf("smithy subset GroupSchemaSource = %q, %v, want smithy, nil", src, err)
+	}
+
+	if cfnSubset.Provider != group.Provider || smithySubset.Provider != group.Provider {
+		t.Error("SubsetBySource must preserve the real group's own Provider identity")
+	}
+}
+
+// TestMergeMixedSourceSchemas_RealTwoSourceGroup_MergesCleanly proves
+// two real sources' own contributions merge into one real schema map
+// when their type names don't collide -- the real, common AWS-shaped
+// case (CloudFormation's "aws_*" resource types never share a wire name
+// with Smithy's "aws_data_*" data-source types).
+func TestMergeMixedSourceSchemas_RealTwoSourceGroup_MergesCleanly(t *testing.T) {
+	dest := map[string]*tfprotov6.Schema{}
+	placedBy := map[string]string{}
+
+	cfnContribution := map[string]*tfprotov6.Schema{"aws_s3_bucket": {}}
+	if err := MergeMixedSourceSchemas(dest, placedBy, cfnContribution, "cloudformation", nil, "resource"); err != nil {
+		t.Fatalf("merge cloudformation contribution: %v", err)
+	}
+
+	smithyContribution := map[string]*tfprotov6.Schema{"aws_data_ec2_instance": {}}
+	if err := MergeMixedSourceSchemas(dest, placedBy, smithyContribution, "smithy", nil, "resource"); err != nil {
+		t.Fatalf("merge smithy contribution: %v", err)
+	}
+
+	if len(dest) != 2 {
+		t.Fatalf("merged dest has %d entries, want 2", len(dest))
+	}
+	if placedBy["aws_s3_bucket"] != "cloudformation" {
+		t.Errorf("aws_s3_bucket placedBy = %q, want cloudformation", placedBy["aws_s3_bucket"])
+	}
+	if placedBy["aws_data_ec2_instance"] != "smithy" {
+		t.Errorf("aws_data_ec2_instance placedBy = %q, want smithy", placedBy["aws_data_ec2_instance"])
+	}
+}
+
+// TestMergeMixedSourceSchemas_RealCollision_FailsLoud proves a type
+// name owned by two real sources fails loud (ErrDuplicateWireType),
+// identically to a same-source collision -- UBI-193's own explicit
+// instruction: "a type owned by two sources should fail loud, same as
+// today."
+func TestMergeMixedSourceSchemas_RealCollision_FailsLoud(t *testing.T) {
+	dest := map[string]*tfprotov6.Schema{}
+	placedBy := map[string]string{}
+
+	first := map[string]*tfprotov6.Schema{"aws_widget": {}}
+	if err := MergeMixedSourceSchemas(dest, placedBy, first, "cloudformation", nil, "resource"); err != nil {
+		t.Fatalf("merge first contribution: %v", err)
+	}
+
+	second := map[string]*tfprotov6.Schema{"aws_widget": {}}
+	err := MergeMixedSourceSchemas(dest, placedBy, second, "smithy", nil, "resource")
+	if err == nil {
+		t.Fatal("expected a real error for a type name owned by two real sources with no Exclude entry")
+	}
+	if !errors.Is(err, ErrDuplicateWireType) {
+		t.Errorf("error doesn't wrap ErrDuplicateWireType: %v", err)
 	}
 }

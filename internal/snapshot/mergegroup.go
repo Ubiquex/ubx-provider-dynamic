@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
+
 	"github.com/ubiquex/ubx-provider-dynamic/internal/cloudformation"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/discoverydoc"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/dynserver"
@@ -142,6 +144,70 @@ func (s *Snapshot) GroupSchemaSource() (SchemaSource, error) {
 		return "", fmt.Errorf("group %q has no real members at all", s.Provider)
 	}
 	return source, nil
+}
+
+// SubsetBySource returns a new *Snapshot containing only s's own real
+// members whose SchemaSource is src -- UBI-193's own real dispatch-layer
+// fix, built so a real MIXED-source group (AWS's own real shape: one
+// CloudFormation resource member, 429 Smithy data-source members) can
+// still reuse every existing, already-tested Merge<Source>Group
+// function UNCHANGED: each one already refuses (GroupSchemaSource/
+// ErrMixedSchemaSourceGroup) the moment it sees more than one real
+// source, so the caller (main.go's own mixed-source dispatch) calls
+// THIS first, once per real distinct source present, and hands each
+// resulting single-source subset to the matching Merge<Source>Group --
+// never modifying those functions to know about mixing at all. Exclude
+// is carried through unchanged (keyed by member name, still correct
+// within one source's own subset).
+func (s *Snapshot) SubsetBySource(src SchemaSource) *Snapshot {
+	members := make(map[string]*MemberSnapshot)
+	for name, m := range s.Members {
+		if m.SchemaSource == src {
+			members[name] = m
+		}
+	}
+	return &Snapshot{
+		SchemaFormat: s.SchemaFormat,
+		Provider:     s.Provider,
+		Version:      s.Version,
+		Members:      members,
+		Exclude:      s.Exclude,
+	}
+}
+
+// DistinctSources returns every real SchemaSource present across s's own
+// members, sorted for deterministic iteration -- UBI-193's own real
+// dispatch-layer fix uses this to know which per-source sub-server(s) a
+// real mixed group actually needs to build, without guessing or
+// hardcoding "CloudFormation + Smithy" as the only real shape (a future
+// real mixed group could combine any real sources).
+func (s *Snapshot) DistinctSources() []SchemaSource {
+	seen := map[SchemaSource]bool{}
+	for _, m := range s.Members {
+		seen[m.SchemaSource] = true
+	}
+	sources := make([]SchemaSource, 0, len(seen))
+	for src := range seen {
+		sources = append(sources, src)
+	}
+	sort.Slice(sources, func(i, j int) bool { return sources[i] < sources[j] })
+	return sources
+}
+
+// MergeMixedSourceSchemas merges one real source's own contribution of
+// resource-or-data-source SCHEMAS into dest, reusing the identical
+// collision discipline mergeWithExclude already provides for
+// within-source merging (UBI-193's own real dispatch-layer fix, applied
+// ACROSS real sources instead of within one). sourceName is whichever
+// real SchemaSource this contribution came from (e.g. "cloudformation",
+// "smithy") -- Exclude entries resolving a real cross-source collision
+// are keyed by SOURCE name for this real case, not member name, since
+// the real thing that collided is two sources, not two members of the
+// same one. A type owned by two real sources fails loud
+// (ErrDuplicateWireType), identically to a same-source collision --
+// never silently picked.
+func MergeMixedSourceSchemas(dest map[string]*tfprotov6.Schema, placedBy map[string]string, contributions map[string]*tfprotov6.Schema, sourceName string, exclude map[string][]string, role string) error {
+	return mergeWithExclude(dest, placedBy, contributions, sourceName, exclude, role)
 }
 
 // MemberNamesByMode returns s's own real member names whose Mode matches
