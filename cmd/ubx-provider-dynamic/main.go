@@ -305,6 +305,29 @@ func run() error {
 			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic:   %s (naming: %s)\n", hcName, res.NameStrategy)
 		}
 
+		// UBI-182's own real collapse: this entry's own data_sources was
+		// NOT set to restrict it to data-sources-only above, so build its
+		// real data sources too, from the SAME already-loaded model --
+		// see config.Provider.DataSources' own doc comment for the full
+		// real reasoning (every real source's own DiscoverDataSources
+		// already derives its "unclaimed" set independently, no second
+		// live fetch, nothing in the wire protocol ever required a
+		// second entry). Zero real, unclaimed read-shaped operations is
+		// a normal, expected outcome, matching the data-source-only
+		// branch's own identical real finding above -- not an error.
+		builtDS, dsNotes, err := smithy.BuildDataSources(smithyDoc, wireName, svc, cfg.DataSourceNamespace)
+		if err != nil {
+			return fmt.Errorf("build Smithy data source schemas: %w", err)
+		}
+		for _, n := range dsNotes {
+			fmt.Fprintln(os.Stderr, "ubx-provider-dynamic:", n)
+		}
+		if len(builtDS) == 0 {
+			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [smithy] no real, unclaimed read-shaped operations discovered in %s -- serving zero data sources, not an error\n", cfg.SchemaURL)
+		} else {
+			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [smithy] discovered %d data source(s) from %s (protocol: %s)\n", len(builtDS), cfg.SchemaURL, svc.Protocol)
+		}
+
 		if *dumpSignalsFlag {
 			// Real, honest, named gap: Smithy's own real trait system
 			// (smithy.api#length/#range/#pattern, its own enum trait) is
@@ -314,7 +337,10 @@ func run() error {
 			// an empty, real (not error) JSON object is the honest
 			// "no signal available for this source yet" answer, matching
 			// this whole file's own "skip, don't fail" discipline for a
-			// genuinely partial-coverage case.
+			// genuinely partial-coverage case. Unaffected by builtDS --
+			// data-source signal collection was never implemented either
+			// (the now-removed, data-sources-only branch's own identical
+			// stub above), so there is nothing real to fold in here.
 			fmt.Fprintln(os.Stderr, "ubx-provider-dynamic: --dump-signals: not yet implemented for schema_source = \"smithy\" -- emitting an empty, real result, not an error")
 			return json.NewEncoder(os.Stdout).Encode(map[string]map[string]*uschema.FieldSignal{})
 		}
@@ -328,10 +354,24 @@ func run() error {
 			// when EndpointPrefix is blank (93 of 430 real services,
 			// confirmed live) -- the identical real fallback
 			// DiscoverDataSources' own Namespace field uses, one shared
-			// implementation, not two that could drift apart.
-			out := make(map[string]string, len(built))
+			// implementation, not two that could drift apart. Data
+			// sources fold in their own real, already-sanitized
+			// RealNamespace (matching the data-sources-only branch's
+			// own identical logic above) -- a resource and a data
+			// source sharing the identical wire type name is real and
+			// expected (aws_instance is both, see DataSourceCandidate's
+			// own doc comment), so this only fails loud on a genuine
+			// disagreement between the two, never on the shared-key case
+			// itself.
+			out := make(map[string]string, len(built)+len(builtDS))
 			for hcName := range built {
 				out[hcName] = smithy.ServiceNamespace(svc)
+			}
+			for wireType, ds := range builtDS {
+				if existing, ok := out[wireType]; ok && existing != ds.RealNamespace {
+					return fmt.Errorf("wire type %q claimed by both a resource (namespace %q) and a data source (namespace %q) with disagreeing namespaces -- a real ambiguity, not resolved silently", wireType, existing, ds.RealNamespace)
+				}
+				out[wireType] = ds.RealNamespace
 			}
 			return json.NewEncoder(os.Stdout).Encode(out)
 		}
@@ -360,6 +400,7 @@ func run() error {
 		server := &smithyserver.Server{
 			ProviderName: name,
 			Resources:    built,
+			DataSources:  builtDS,
 			Model:        smithyDoc,
 			Wire:         wireClient,
 		}
@@ -469,7 +510,31 @@ func run() error {
 			return fmt.Errorf("no CRUD-shaped resources discovered in %s -- nothing to serve", cfg.SchemaURL)
 		}
 
+		// UBI-182's own real collapse -- see the Smithy branch's own
+		// identical comment above for the full real reasoning. wireName,
+		// not bare name -- matches the data-sources-only branch's own
+		// real, documented reason above (a data-source-mode build needs
+		// the SHARED identity, which this entry's own wireName already
+		// is now that no distinct sibling table exists to force a
+		// different TOML key).
+		builtDS, dsNotes, err := discoverydoc.BuildDataSources(ddoc, wireName, cfg.VersionQualifier)
+		if err != nil {
+			return fmt.Errorf("build discovery-doc data source schemas: %w", err)
+		}
+		for _, n := range dsNotes {
+			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [discoverydoc] %s: %s\n", n.Path, n.Detail)
+		}
+		if len(builtDS) == 0 {
+			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [discoverydoc] no real, unclaimed GET operations discovered in %s -- serving zero data sources, not an error\n", cfg.SchemaURL)
+		} else {
+			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [discoverydoc] discovered %d data source(s) from %s\n", len(builtDS), cfg.SchemaURL)
+		}
+
 		if *dumpSignalsFlag {
+			// Resource signals only -- data-source signal collection was
+			// never implemented for discoverydoc either (the now-removed,
+			// data-sources-only branch's own identical stub above), so
+			// there is nothing real to fold in from builtDS.
 			out := make(map[string]map[string]*uschema.FieldSignal, len(built))
 			for typeName, br := range built {
 				out[typeName] = br.Signals
@@ -486,7 +551,9 @@ func run() error {
 			// already recovers it correctly (zero true mismatches across
 			// all 1,543 real Google wire types, verified live). Nothing
 			// for this override to add here -- a real, honest empty
-			// result, not a guess dressed up as one.
+			// result, not a guess dressed up as one -- true for a
+			// data-source-mode wire type too (typename.Combine is the
+			// identical real construction on both sides).
 			return json.NewEncoder(os.Stdout).Encode(map[string]string{})
 		}
 
@@ -494,7 +561,11 @@ func run() error {
 		for typeName, br := range built {
 			resources[typeName] = &dynserver.ResourceType{Schema: br.Schema}
 		}
-		server := &dynserver.Server{ProviderName: name, Resources: resources}
+		dataSources := make(map[string]*dynserver.ResourceType, len(builtDS))
+		for typeName, ds := range builtDS {
+			dataSources[typeName] = &dynserver.ResourceType{Schema: ds.Schema}
+		}
+		server := &dynserver.Server{ProviderName: name, Resources: resources, DataSources: dataSources}
 		return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
 			return server
 		})
@@ -624,7 +695,26 @@ func run() error {
 		return fmt.Errorf("no CRUD-shaped resources discovered in %s -- nothing to serve", cfg.SchemaURL)
 	}
 
+	// UBI-182's own real collapse -- see the Smithy branch's own
+	// identical comment above for the full real reasoning.
+	builtDS, dsNotes, err := resourcemap.BuildDataSources(doc, wireName)
+	if err != nil {
+		return fmt.Errorf("build data source schemas: %w", err)
+	}
+	for _, n := range dsNotes {
+		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [openapi] %s: %s\n", n.Path, n.Detail)
+	}
+	if len(builtDS) == 0 {
+		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [openapi] no real, unclaimed GET operations discovered in %s -- serving zero data sources, not an error\n", cfg.SchemaURL)
+	} else {
+		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: [openapi] discovered %d data source(s) from %s\n", len(builtDS), cfg.SchemaURL)
+	}
+
 	if *dumpSignalsFlag {
+		// Resource signals only -- data-source signal collection was
+		// never implemented for openapi either (the now-removed,
+		// data-sources-only branch's own identical stub above), so
+		// there is nothing real to fold in from builtDS.
 		out := make(map[string]map[string]*uschema.FieldSignal, len(resources))
 		for typeName, rt := range resources {
 			out[typeName] = rt.Signals
@@ -638,7 +728,9 @@ func run() error {
 		// session against all 1,096 real Azure wire types (zero true
 		// mismatches) and structurally true for Kubernetes/GitHub/Datadog
 		// too (deriveNoun's own real, schema-qualified-name-derived
-		// service segment, not a re-split of a foreign legacy name).
+		// service segment, not a re-split of a foreign legacy name) --
+		// true for a data-source-mode wire type too (deriveNoun is the
+		// identical real construction on both sides).
 		return json.NewEncoder(os.Stdout).Encode(map[string]string{})
 	}
 
@@ -657,6 +749,7 @@ func run() error {
 	server := &dynserver.Server{
 		ProviderName: name,
 		Resources:    resources,
+		DataSources:  dataSourcesToResourceTypes(builtDS),
 		Client:       client,
 	}
 
@@ -1003,48 +1096,52 @@ func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJS
 	}
 
 	rawNames := strings.Split(membersCSV, ",")
-	members := make(map[string]*snapshot.MemberSnapshot, len(rawNames))
-	levels := make(map[string]snapshot.ChangeLevel, len(rawNames))
+	members := make(map[string]*snapshot.MemberSnapshot, len(rawNames)*2)
+	levels := make(map[string]snapshot.ChangeLevel, len(rawNames)*2)
 	for _, rawName := range rawNames {
 		memberName := strings.TrimSpace(rawName)
 		cfg, ok := allProviders[memberName]
 		if !ok {
 			return fmt.Errorf("--group-members: no [dynamic_providers.%s] table in this process's own .ubx/config", memberName)
 		}
-		mode := snapshot.ModeResource
-		if cfg.DataSources {
-			mode = snapshot.ModeDataSource
-		}
 		wireName := memberName
 		if cfg.WireName != "" {
 			wireName = cfg.WireName
 		}
-		var prevMember *snapshot.MemberSnapshot
-		if prev != nil {
-			prevMember = prev.Members[memberName]
-		}
 
-		var member *snapshot.MemberSnapshot
-		var level snapshot.ChangeLevel
-		var genErr error
-		switch cfg.SchemaSource {
-		case config.SchemaSourceOpenAPI:
-			member, _, level, genErr = snapshot.GenerateOpenAPIMember(memberName, wireName, cfg.SchemaURL, mode, cfg, prevMember)
-		case config.SchemaSourceCloudFormation:
-			member, _, level, genErr = snapshot.GenerateCloudFormationMember(memberName, cfg.SchemaURL, mode, cfg, prevMember)
-		case config.SchemaSourceSmithy:
-			member, _, level, genErr = snapshot.GenerateSmithyMember(memberName, wireName, cfg.SchemaURL, cfg.TargetPrefix, mode, cfg.DataSourceNamespace, cfg, prevMember)
-		case config.SchemaSourceDiscoveryDoc:
-			member, _, level, genErr = snapshot.GenerateDiscoveryDocMember(memberName, wireName, cfg.SchemaURL, cfg.VersionQualifier, mode, cfg, prevMember)
-		default:
-			genErr = fmt.Errorf("[dynamic_providers.%s]'s own schema_source %q is not a real, known schema source", memberName, cfg.SchemaSource)
+		// UBI-182's own real collapse -- see snapshot.ExpandMemberModes'
+		// own doc comment for the full real reasoning.
+		modes, memberNames := snapshot.ExpandMemberModes(memberName, cfg)
+
+		for i, mode := range modes {
+			mn := memberNames[i]
+			var prevMember *snapshot.MemberSnapshot
+			if prev != nil {
+				prevMember = prev.Members[mn]
+			}
+
+			var member *snapshot.MemberSnapshot
+			var level snapshot.ChangeLevel
+			var genErr error
+			switch cfg.SchemaSource {
+			case config.SchemaSourceOpenAPI:
+				member, _, level, genErr = snapshot.GenerateOpenAPIMember(mn, wireName, cfg.SchemaURL, mode, cfg, prevMember)
+			case config.SchemaSourceCloudFormation:
+				member, _, level, genErr = snapshot.GenerateCloudFormationMember(mn, cfg.SchemaURL, mode, cfg, prevMember)
+			case config.SchemaSourceSmithy:
+				member, _, level, genErr = snapshot.GenerateSmithyMember(mn, wireName, cfg.SchemaURL, cfg.TargetPrefix, mode, cfg.DataSourceNamespace, cfg, prevMember)
+			case config.SchemaSourceDiscoveryDoc:
+				member, _, level, genErr = snapshot.GenerateDiscoveryDocMember(mn, wireName, cfg.SchemaURL, cfg.VersionQualifier, mode, cfg, prevMember)
+			default:
+				genErr = fmt.Errorf("[dynamic_providers.%s]'s own schema_source %q is not a real, known schema source", memberName, cfg.SchemaSource)
+			}
+			if genErr != nil {
+				return fmt.Errorf("generate member %q: %w", mn, genErr)
+			}
+			members[mn] = member
+			levels[mn] = level
+			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: generated member %q (%s, %s), own change level: %s\n", mn, cfg.SchemaSource, mode, level)
 		}
-		if genErr != nil {
-			return fmt.Errorf("generate member %q: %w", memberName, genErr)
-		}
-		members[memberName] = member
-		levels[memberName] = level
-		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: generated member %q (%s, %s), own change level: %s\n", memberName, cfg.SchemaSource, mode, level)
 	}
 
 	group, err := snapshot.AssembleGroup(repoName, prev, members, levels, exclude)

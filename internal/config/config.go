@@ -181,15 +181,53 @@ type Provider struct {
 	// non-"v1"-baselined API grows a same-named secondary channel.
 	VersionQualifier string `toml:"version_qualifier"`
 
-	// DataSources is UBI-186's own real schema-serving switch: when true,
-	// this entry serves DATA SOURCES instead of resources -- built from
-	// DiscoverDataSources' own candidates (smithy.BuildDataSources),
-	// never smithy.Build's own resource-CRUD discovery. Only meaningful
-	// for schema_source = "smithy" today (the only source with a real
-	// candidate-discovery mechanism built yet); silently unused by every
-	// other schema source, the same "absent means today's exact
-	// behavior" default every other optional field here already
-	// establishes.
+	// DataSources restricts this entry to DATA SOURCES ONLY, built from
+	// DiscoverDataSources' own real candidates (resourcemap/smithy/
+	// discoverydoc's own BuildDataSources), never the resource-CRUD
+	// Build path.
+	//
+	// UBI-182's own real, deliberate meaning change, flagged here rather
+	// than silently reinterpreted: before this checkpoint, false/absent
+	// meant "resources only" and a second, sibling [dynamic_providers.
+	// <name>_ds] table (a distinct TOML key, wire_name recovering the
+	// shared identity -- see WireName's own doc comment) was the only
+	// way to get an entry's own data sources at all. Confirmed directly
+	// against every real source's own DiscoverDataSources
+	// (resourcemap.go/datasource.go, smithy/datasource.go, discoverydoc/
+	// datasource.go): each already derives its own "unclaimed" candidate
+	// set independently (a local per-node check, or an in-memory
+	// re-Discover -- never a second live fetch), and dynserver.Server/
+	// smithyserver.Server already carry BOTH Resources and DataSources
+	// fields, already merged into one GetProviderSchema response --
+	// nothing in the wire protocol or the discovery algorithms ever
+	// required two entries. Confirmed live: every real group in this
+	// org's own config split its members into an exact resource/
+	// data-source pair with zero leftover (kubernetes 2/1, github 2/1,
+	// datadog 4/2, google 524/262, azure 604/302) -- real, measured
+	// evidence the split was duplication, not a genuine second concern.
+	//
+	// So: false/absent (for schema_source = openapi/smithy/
+	// discovery_docs) now means "build BOTH resources and data sources
+	// from this one entry's one fetch" -- the new default, replacing
+	// the old resources-only default, since no real live entry today
+	// needs "resources only" as a deliberate restriction (every
+	// resource-mode entry already has, or is being merged with, a real
+	// data-source sibling). true keeps its EXACT prior meaning,
+	// unchanged, needing no migration: AWS's own real 429 Smithy
+	// data-source-only entries (schema_source = "smithy", each with no
+	// resource-mode sibling at all -- AWS's real resource surface comes
+	// from CloudFormation exclusively, a deliberately separate real
+	// mechanism, see cloudformation's own doc comment) still set
+	// data_sources = true and still get exactly what they got before:
+	// data sources only, zero resource-discovery attempted.
+	//
+	// schema_source = "cloudformation" has no data-source concept at
+	// all (confirmed directly: zero BuildDataSources/DataSource
+	// references anywhere in internal/cloudformation) -- validate()
+	// refuses data_sources = true on a CloudFormation entry outright,
+	// at config-load time, the earliest possible point, rather than
+	// silently ignoring it the way "meaningful for smithy only" once
+	// implied every other source would.
 	//
 	// A data-source-mode entry needs no real wire execution at all --
 	// GetProviderSchema is the only RPC `ubx sdk gen` ever calls, and a
@@ -256,6 +294,9 @@ func (p Provider) validate() error {
 	}
 	if p.SchemaSource == SchemaSourceCloudFormation && p.SchemaURL == "" {
 		return fmt.Errorf("dynamic_providers.%s: schema_url is required when schema_source is %q (the real CloudFormation registry zip URL)", p.Name, p.SchemaSource)
+	}
+	if p.SchemaSource == SchemaSourceCloudFormation && p.DataSources {
+		return fmt.Errorf("dynamic_providers.%s: data_sources = true is not valid when schema_source is %q -- CloudFormation has no real data-source concept at all, this entry can only ever serve resources", p.Name, p.SchemaSource)
 	}
 	if p.BaseURL == "" {
 		return fmt.Errorf("dynamic_providers.%s: base_url is required", p.Name)

@@ -149,6 +149,21 @@ base_url = "https://cloudcontrolapi.us-east-1.amazonaws.com"
 	}
 }
 
+func TestLoadNamed_CloudFormation_DataSourcesTrue_RealFailLoud(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[dynamic_providers.aws]
+schema_source = "cloudformation"
+schema_url = "https://schema.cloudformation.us-east-1.amazonaws.com/CloudformationSchema.zip"
+base_url = "https://cloudcontrolapi.us-east-1.amazonaws.com"
+data_sources = true
+`)
+	_, err := LoadNamed(dir, "aws")
+	if err == nil {
+		t.Fatal("expected a real validation error: CloudFormation has no data-source concept, data_sources = true must fail loud at config-load time, not be silently ignored")
+	}
+}
+
 func TestLoadNamed_NoConfigFile(t *testing.T) {
 	dir := t.TempDir()
 	_, err := LoadNamed(dir, "github")
