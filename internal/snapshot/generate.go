@@ -59,6 +59,25 @@ func AssembleGroup(repoName string, prev *Snapshot, members map[string]*MemberSn
 				level = Major
 			}
 		}
+		// UBI-194: a real MinBinaryVersion transition (the committed
+		// snapshot's own prior value differs from this build's real
+		// BinaryVersion -- most commonly absent -> present, for the six
+		// snapshots published before this field existed) must force at
+		// least a Patch-level bump even when no member's own translated
+		// content changed at all. Without this, NextVersion(prev.Version,
+		// NoChange) returns prev.Version unmodified, the caller's own
+		// "is this newer than what's committed" gate (every real
+		// hash-watch.yml in this org) sees no change, and the real,
+		// freshly-stamped MinBinaryVersion is silently discarded instead
+		// of committed -- the exact real, live failure this comment exists
+		// to prevent (confirmed against a genuine run: Kubernetes'
+		// swagger.json is unchanged, memberLevels reported "none" for
+		// both real members, and the assembled group was thrown away
+		// with no PR opened, even though it now carried a real
+		// MinBinaryVersion the committed manifest.json still lacks).
+		if level == NoChange && prev.MinBinaryVersion != BinaryVersion {
+			level = Patch
+		}
 		version, err = NextVersion(prev.Version, level)
 		if err != nil {
 			return nil, fmt.Errorf("derive next group version for %q: %w", repoName, err)
