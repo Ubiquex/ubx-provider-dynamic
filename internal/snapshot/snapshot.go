@@ -134,6 +134,42 @@ const (
 	ModeDataSource Mode = "data_source"
 )
 
+// ExpandMemberModes decides, for ONE real [dynamic_providers.<name>]
+// config entry, which real Mode(s) and member name(s) generation should
+// produce from it -- UBI-182's own real collapse of the resource/
+// data-source split (see config.Provider.DataSources' own doc comment
+// for the full real reasoning this rests on). Kept as a small, pure,
+// independently-tested function rather than inline in main.go's own
+// generation loop, since this decision is the crux of the whole
+// collapse -- get it wrong and either a real data-source-only entry
+// (AWS's own 429 real Smithy services) starts attempting resource
+// discovery it was never meant to, or CloudFormation attempts a
+// data-source build it structurally cannot do.
+//
+// cfg.DataSources = true keeps its exact prior meaning: this entry is
+// restricted to data sources only, one member, keyed by its own name --
+// unchanged, so AWS's real data-source-only entries need no migration.
+// schema_source = cloudformation always produces resources only, one
+// member -- validate() already refuses data_sources = true on it, so
+// this case is unconditional, not a fallback for a config mistake.
+// Every other case (the new default) produces TWO real members from
+// this one entry: resource-mode under the entry's own name, unchanged,
+// plus a data-source-mode member synthesized under "<name>_ds" --
+// deliberately reusing the exact naming convention the old, separate
+// sibling TOML table used to carry, so an already-published manifest's
+// own member list needs no format change, only its driving config
+// collapsing from two tables to one.
+func ExpandMemberModes(memberName string, cfg config.Provider) (modes []Mode, memberNames []string) {
+	switch {
+	case cfg.DataSources:
+		return []Mode{ModeDataSource}, []string{memberName}
+	case cfg.SchemaSource == config.SchemaSourceCloudFormation:
+		return []Mode{ModeResource}, []string{memberName}
+	default:
+		return []Mode{ModeResource, ModeDataSource}, []string{memberName, memberName + "_ds"}
+	}
+}
+
 // ErrUnsupportedMode is every Generate<Source>Member/Load<Source>Member
 // pair's own real, fail-loud sentinel for a Mode that source doesn't (or
 // doesn't yet) support -- wrapped, not returned bare, so a caller can
