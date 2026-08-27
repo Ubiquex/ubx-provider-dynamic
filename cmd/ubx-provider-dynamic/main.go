@@ -7,6 +7,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"github.com/ubiquex/ubx-provider-dynamic/internal/config"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/discoverydoc"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/dynserver"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/mixedserver"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/openapi"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/resourcemap"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/restexec"
@@ -860,160 +862,289 @@ func runServeSnapshot(name, snapPath string) error {
 	// span 163 distinct real base_urls (one shared control-plane endpoint
 	// is not a thing GCP has); Azure's own real 302 members have real
 	// auth on exactly 1 (the other 301 carry a real, legitimate "no
-	// authentication configured" state, not an error). Each real
-	// branch below resolves its own real member's own real exec config
+	// authentication configured" state, not an error). Each real source
+	// builder below resolves its own real member's own real exec config
 	// directly, per resource type where that's meaningful (openapi), at
 	// the point real wire execution is actually attempted -- never at
 	// schema-serve time.
+	//
+	// UBI-193's own second real fix: GroupSchemaSource's own refusal
+	// (ErrMixedSchemaSourceGroup) is still real and still correct -- it
+	// protects buildServerForSource/every Merge<Source>Group from ever
+	// needing to know about a real MIXED group (AWS's own real shape:
+	// one CloudFormation resource member, 429 Smithy data-source
+	// members -- confirmed the ONLY real group among this org's six real
+	// providers spanning more than one real source). A mixed group is
+	// served by internal/mixedserver's own real dispatch layer instead,
+	// built from one real sub-server PER real source present, routed by
+	// resource/data-source type.
 	src, err := snap.GroupSchemaSource()
-	if err != nil {
+	if err == nil {
+		server, _, _, err := buildServerForSource(name, snap, src)
+		if err != nil {
+			return fmt.Errorf("build server for group %q in snapshot %s: %w", name, snapPath, err)
+		}
+		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: serving %q (%s) from real group snapshot %s (version %s, schema_format %d), zero network at schema resolution time\n",
+			name, src, snapPath, snap.Version, snap.SchemaFormat)
+		return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
+			return server
+		})
+	}
+	if !errors.Is(err, snapshot.ErrMixedSchemaSourceGroup) {
 		return fmt.Errorf("snapshot %s: %w", snapPath, err)
 	}
 
-	var server tfprotov6.ProviderServer
-	switch src {
-	case snapshot.SchemaSourceOpenAPI:
-		resources, dataSources, resourceMemberOf, err := snapshot.MergeOpenAPIGroup(snap)
-		if err != nil {
-			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
-		}
-		if len(resources) == 0 && len(dataSources) == 0 {
-			return fmt.Errorf("no resources or data sources in group %q (snapshot %s) -- nothing to serve", name, snapPath)
-		}
-		// UBI-193: each real resource type resolves its own real
-		// client from its own real originating member -- never one
-		// client shared across a whole group whose real members may
-		// genuinely disagree on BaseURL/Auth (Azure/Google, confirmed
-		// live). clientCache avoids building the same real member's
-		// client twice when many resource types share one origin.
-		clientCache := map[string]*restexec.Client{}
-		for typeName, rt := range resources {
-			memberName := resourceMemberOf[typeName]
-			client, ok := clientCache[memberName]
-			if !ok {
-				client, err = buildMemberClient(snap.Members[memberName])
-				if err != nil {
-					return fmt.Errorf("member %q: %w", memberName, err)
-				}
-				clientCache[memberName] = client
-			}
-			rt.Client = client
-		}
-		server = &dynserver.Server{ProviderName: name, Resources: resources, DataSources: dataSourcesToResourceTypes(dataSources)}
-
-	case snapshot.SchemaSourceDiscoveryDoc:
-		// Schema-layer only, matching run()'s own real discoverydoc
-		// live-fetch branches exactly (that branch's own doc comment:
-		// dynserver.Server is reused UNCHANGED for GetProviderSchema,
-		// since that RPC reads only ResourceType.Schema -- real REST
-		// wire execution against a live GCP endpoint is a separate,
-		// deliberately-unattempted future checkpoint).
-		resources, dataSources, err := snapshot.MergeDiscoveryDocGroup(snap)
-		if err != nil {
-			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
-		}
-		if len(resources) == 0 && len(dataSources) == 0 {
-			return fmt.Errorf("no resources or data sources in group %q (snapshot %s) -- nothing to serve", name, snapPath)
-		}
-		built := make(map[string]*dynserver.ResourceType, len(resources))
-		for typeName, br := range resources {
-			built[typeName] = &dynserver.ResourceType{Schema: br.Schema}
-		}
-		out := make(map[string]*dynserver.ResourceType, len(dataSources))
-		for typeName, ds := range dataSources {
-			out[typeName] = &dynserver.ResourceType{Schema: ds.Schema}
-		}
-		server = &dynserver.Server{ProviderName: name, Resources: built, DataSources: out}
-
-	case snapshot.SchemaSourceCloudFormation:
-		// MergeCloudFormationGroup itself already refuses any
-		// ModeDataSource member (CloudFormation has no such concept) --
-		// nothing further to check here, just propagate that fail-loud
-		// error.
-		resources, err := snapshot.MergeCloudFormationGroup(snap)
-		if err != nil {
-			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
-		}
-		if len(resources) == 0 {
-			return fmt.Errorf("no resources in group %q (snapshot %s) -- nothing to serve", name, snapPath)
-		}
-		// UBI-193: cfnserver.Server still carries one real CCAPI client
-		// for the whole group (unchanged) -- CloudFormation genuinely
-		// has no per-resource-type divergence TODAY, since every real
-		// CFN member is resource-mode (LoadCloudFormationMember already
-		// refuses ModeDataSource) and this org's own real config has
-		// never had more than one real CFN member. Resolved from the
-		// group's own real resource-mode member(s) directly, sorted,
-		// first -- NOT the removed group-wide ExecConfig, which used to
-		// scan every member indiscriminately. If a real group ever
-		// does carry more than one real CFN member with genuinely
-		// different exec config, this would need the same per-type
-		// treatment dynserver just got -- untested today, confirmed
-		// not assumed (UBI-193's own scope note).
-		cfnMemberNames := snap.MemberNamesByMode(snapshot.ModeResource)
-		cfnClient, err := buildMemberClient(snap.Members[cfnMemberNames[0]])
-		if err != nil {
-			return fmt.Errorf("member %q: %w", cfnMemberNames[0], err)
-		}
-		server = cfnserver.New(name, resources, &ccapi.Client{Rest: cfnClient})
-
-	case snapshot.SchemaSourceSmithy:
-		resources, dataSources, model, err := snapshot.MergeSmithyGroup(snap)
-		if err != nil {
-			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
-		}
-		if len(resources) == 0 && len(dataSources) == 0 {
-			return fmt.Errorf("no resources or data sources in group %q (snapshot %s) -- nothing to serve", name, snapPath)
-		}
-		if len(resources) > 0 {
-			svc, err := smithy.FindService(model)
-			if err != nil {
-				return fmt.Errorf("find Smithy service for group %q in snapshot %s: %w", name, snapPath, err)
-			}
-			// UBI-193: BaseURL/Auth/TargetPrefix all come from the SAME
-			// real member MergeSmithyGroup already anchored its own
-			// single real resource-mode model to -- MergeSmithyGroup
-			// itself refuses a group with more than one real
-			// resource-mode Smithy member, so there is never a real
-			// case where a different member's own config could apply
-			// here; using it directly (not the removed, group-wide
-			// ExecConfig, which could disagree with this member since
-			// it scanned every member indiscriminately) is both
-			// simpler and strictly more correct.
-			resourceMemberNames := snap.MemberNamesByMode(snapshot.ModeResource)
-			resourceMember := snap.Members[resourceMemberNames[0]]
-			smithyClient, err := buildMemberClient(resourceMember)
-			if err != nil {
-				return fmt.Errorf("member %q: %w", resourceMemberNames[0], err)
-			}
-			wireClient := &wireexec.Client{Rest: smithyClient, Model: model, Service: svc, TargetPrefix: resourceMember.TargetPrefix}
-			server = &smithyserver.Server{ProviderName: name, Resources: resources, DataSources: dataSources, Model: model, Wire: wireClient}
-		} else {
-			// Real, honest, named scope boundary: a smithy group with
-			// ONLY data-source members has no single real Model to
-			// anchor GetProviderSchema's own construction to in this
-			// binary's own current smithyserver.Server shape (one real
-			// *smithy.Model field, and unlike openapi/discoverydoc,
-			// each real Smithy data-source member's own document is a
-			// genuinely separate real model, not shared) -- not reached
-			// by any real group configured in this org today (AWS's own
-			// smithy members are all data-source-mode, but AWS's own
-			// group is CloudFormation+Smithy mixed, already refused by
-			// GroupSchemaSource before this code path). Named here
-			// rather than silently constructing a Model-less server.
-			return fmt.Errorf("group %q (snapshot %s) has smithy data-source members but no real resource-mode member to anchor a Model to -- serving a smithy-sourced, data-source-only group is real, explicit, unstarted follow-up work, not a silent gap", name, snapPath)
-		}
-
-	default:
-		return fmt.Errorf("snapshot %s: group %q's own schema_source %q is not a real, known schema source", snapPath, name, src)
+	server, err := buildMixedSourceServer(name, snap)
+	if err != nil {
+		return fmt.Errorf("build mixed-source server for group %q in snapshot %s: %w", name, snapPath, err)
 	}
-
-	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: serving %q (%s) from real group snapshot %s (version %s, schema_format %d), zero network at schema resolution time\n",
-		name, src, snapPath, snap.Version, snap.SchemaFormat)
-
+	sources := snap.DistinctSources()
+	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: serving %q (mixed: %v) from real group snapshot %s (version %s, schema_format %d), zero network at schema resolution time\n",
+		name, sources, snapPath, snap.Version, snap.SchemaFormat)
 	return tf6server.Serve("registry.terraform.io/ubiquex/"+name, func() tfprotov6.ProviderServer {
 		return server
 	})
+}
+
+// buildServerForSource builds the real tfprotov6.ProviderServer for a
+// snapshot ALREADY confirmed single-source (either the whole real group
+// genuinely is, or it's SubsetBySource's own real single-source
+// subset), plus that source's own real resource/data-source schema
+// maps -- returned alongside the server so buildMixedSourceServer can
+// merge them across real sources without re-deriving anything.
+func buildServerForSource(name string, snap *snapshot.Snapshot, src snapshot.SchemaSource) (server tfprotov6.ProviderServer, resourceSchemas, dataSourceSchemas map[string]*tfprotov6.Schema, err error) {
+	switch src {
+	case snapshot.SchemaSourceOpenAPI:
+		return buildOpenAPIServer(name, snap)
+	case snapshot.SchemaSourceDiscoveryDoc:
+		return buildDiscoveryDocServer(name, snap)
+	case snapshot.SchemaSourceCloudFormation:
+		server, resourceSchemas, err := buildCloudFormationServer(name, snap)
+		return server, resourceSchemas, nil, err
+	case snapshot.SchemaSourceSmithy:
+		return buildSmithyServer(name, snap)
+	default:
+		return nil, nil, nil, fmt.Errorf("group %q's own schema_source %q is not a real, known schema source", name, src)
+	}
+}
+
+// buildOpenAPIServer builds a real dynserver.Server for an
+// openapi-sourced (sub)snapshot -- each real resource type resolves its
+// own real client from its own real originating member (UBI-193),
+// never one client shared across a whole group whose real members may
+// genuinely disagree on BaseURL/Auth (Azure/Google, confirmed live).
+// clientCache avoids building the same real member's client twice when
+// many resource types share one origin.
+func buildOpenAPIServer(name string, snap *snapshot.Snapshot) (tfprotov6.ProviderServer, map[string]*tfprotov6.Schema, map[string]*tfprotov6.Schema, error) {
+	resources, dataSources, resourceMemberOf, err := snapshot.MergeOpenAPIGroup(snap)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(resources) == 0 && len(dataSources) == 0 {
+		return nil, nil, nil, fmt.Errorf("no resources or data sources -- nothing to serve")
+	}
+	clientCache := map[string]*restexec.Client{}
+	for typeName, rt := range resources {
+		memberName := resourceMemberOf[typeName]
+		client, ok := clientCache[memberName]
+		if !ok {
+			client, err = buildMemberClient(snap.Members[memberName])
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("member %q: %w", memberName, err)
+			}
+			clientCache[memberName] = client
+		}
+		rt.Client = client
+	}
+	server := &dynserver.Server{ProviderName: name, Resources: resources, DataSources: dataSourcesToResourceTypes(dataSources)}
+	resourceSchemas := make(map[string]*tfprotov6.Schema, len(resources))
+	for typeName, rt := range resources {
+		resourceSchemas[typeName] = rt.Schema
+	}
+	dataSourceSchemas := make(map[string]*tfprotov6.Schema, len(dataSources))
+	for typeName, ds := range dataSources {
+		dataSourceSchemas[typeName] = ds.Schema
+	}
+	return server, resourceSchemas, dataSourceSchemas, nil
+}
+
+// buildDiscoveryDocServer builds a real dynserver.Server for a
+// discoverydoc-sourced (sub)snapshot -- schema-layer only, matching
+// run()'s own real discoverydoc live-fetch branch exactly (real REST
+// wire execution against a live GCP endpoint is a separate,
+// deliberately-unattempted future checkpoint).
+func buildDiscoveryDocServer(name string, snap *snapshot.Snapshot) (tfprotov6.ProviderServer, map[string]*tfprotov6.Schema, map[string]*tfprotov6.Schema, error) {
+	resources, dataSources, err := snapshot.MergeDiscoveryDocGroup(snap)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(resources) == 0 && len(dataSources) == 0 {
+		return nil, nil, nil, fmt.Errorf("no resources or data sources -- nothing to serve")
+	}
+	built := make(map[string]*dynserver.ResourceType, len(resources))
+	resourceSchemas := make(map[string]*tfprotov6.Schema, len(resources))
+	for typeName, br := range resources {
+		built[typeName] = &dynserver.ResourceType{Schema: br.Schema}
+		resourceSchemas[typeName] = br.Schema
+	}
+	out := make(map[string]*dynserver.ResourceType, len(dataSources))
+	dataSourceSchemas := make(map[string]*tfprotov6.Schema, len(dataSources))
+	for typeName, ds := range dataSources {
+		out[typeName] = &dynserver.ResourceType{Schema: ds.Schema}
+		dataSourceSchemas[typeName] = ds.Schema
+	}
+	server := &dynserver.Server{ProviderName: name, Resources: built, DataSources: out}
+	return server, resourceSchemas, dataSourceSchemas, nil
+}
+
+// buildCloudFormationServer builds a real cfnserver.Server for a
+// cloudformation-sourced (sub)snapshot. MergeCloudFormationGroup itself
+// already refuses any ModeDataSource member (CloudFormation has no such
+// concept) -- nothing further to check here.
+//
+// cfnserver.Server still carries one real CCAPI client for the whole
+// group (unchanged) -- CloudFormation genuinely has no per-resource-type
+// divergence TODAY, since every real CFN member is resource-mode and
+// this org's own real config has never had more than one real CFN
+// member. Resolved from the group's own real resource-mode member(s)
+// directly, sorted, first -- NOT the removed group-wide ExecConfig,
+// which used to scan every member indiscriminately. If a real group
+// ever does carry more than one real CFN member with genuinely
+// different exec config, this would need the same per-type treatment
+// dynserver already got -- untested today, confirmed not assumed
+// (UBI-193's own scope note).
+func buildCloudFormationServer(name string, snap *snapshot.Snapshot) (tfprotov6.ProviderServer, map[string]*tfprotov6.Schema, error) {
+	resources, err := snapshot.MergeCloudFormationGroup(snap)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(resources) == 0 {
+		return nil, nil, fmt.Errorf("no resources -- nothing to serve")
+	}
+	cfnMemberNames := snap.MemberNamesByMode(snapshot.ModeResource)
+	cfnClient, err := buildMemberClient(snap.Members[cfnMemberNames[0]])
+	if err != nil {
+		return nil, nil, fmt.Errorf("member %q: %w", cfnMemberNames[0], err)
+	}
+	server := cfnserver.New(name, resources, &ccapi.Client{Rest: cfnClient})
+	resourceSchemas := make(map[string]*tfprotov6.Schema, len(resources))
+	for typeName, br := range resources {
+		resourceSchemas[typeName] = br.Schema
+	}
+	return server, resourceSchemas, nil
+}
+
+// buildSmithyServer builds a real smithyserver.Server for a
+// smithy-sourced (sub)snapshot. BaseURL/Auth/TargetPrefix all come from
+// the SAME real member MergeSmithyGroup already anchored its own single
+// real resource-mode model to -- MergeSmithyGroup itself refuses a
+// group with more than one real resource-mode Smithy member, so there
+// is never a real case where a different member's own config could
+// apply here.
+//
+// UBI-193's own real relaxation: a data-source-ONLY Smithy group (AWS's
+// own real shape -- 429 real members, zero real resource-mode ones) has
+// no real Model to anchor a Wire client to, but doesn't need one
+// either -- GetProviderSchema only reads .Schema, and real wire
+// execution against a data source was never built for ANY real source
+// (openapi/discoverydoc/smithy all agree a data source needs no real
+// wire execution at all) -- Model/Wire simply stay nil rather than
+// refusing to serve schema-only content that's genuinely real.
+// smithyserver.Server.GetProviderSchema is confirmed, by direct
+// reading, to never touch Model/Wire -- safe.
+func buildSmithyServer(name string, snap *snapshot.Snapshot) (tfprotov6.ProviderServer, map[string]*tfprotov6.Schema, map[string]*tfprotov6.Schema, error) {
+	resources, dataSources, model, err := snapshot.MergeSmithyGroup(snap)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(resources) == 0 && len(dataSources) == 0 {
+		return nil, nil, nil, fmt.Errorf("no resources or data sources -- nothing to serve")
+	}
+	var wireClient *wireexec.Client
+	if len(resources) > 0 {
+		svc, err := smithy.FindService(model)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("find Smithy service: %w", err)
+		}
+		resourceMemberNames := snap.MemberNamesByMode(snapshot.ModeResource)
+		resourceMember := snap.Members[resourceMemberNames[0]]
+		smithyClient, err := buildMemberClient(resourceMember)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("member %q: %w", resourceMemberNames[0], err)
+		}
+		wireClient = &wireexec.Client{Rest: smithyClient, Model: model, Service: svc, TargetPrefix: resourceMember.TargetPrefix}
+	}
+	server := &smithyserver.Server{ProviderName: name, Resources: resources, DataSources: dataSources, Model: model, Wire: wireClient}
+	resourceSchemas := make(map[string]*tfprotov6.Schema, len(resources))
+	for typeName, br := range resources {
+		resourceSchemas[typeName] = br.Schema
+	}
+	dataSourceSchemas := make(map[string]*tfprotov6.Schema, len(dataSources))
+	for typeName, ds := range dataSources {
+		dataSourceSchemas[typeName] = ds.Schema
+	}
+	return server, resourceSchemas, dataSourceSchemas, nil
+}
+
+// buildMixedSourceServer is UBI-193's own real dispatch-layer
+// construction: for a real group whose own members span more than one
+// real SchemaSource (AWS's own real, and today only, shape), build one
+// real sub-server PER real source present (Snapshot.SubsetBySource +
+// buildServerForSource, completely unchanged, no knowledge of mixing
+// needed), then merge every sub-server's own real resource/data-source
+// schemas across sources using the identical collision discipline
+// mergeWithExclude already provides within one source
+// (snapshot.MergeMixedSourceSchemas) -- a type owned by two real
+// sources fails loud (ErrDuplicateWireType), exactly like a
+// same-source collision already does. The routing table
+// (mixedserver.Server.ResourceOwner/DataSourceOwner) is built from the
+// SAME real placement decisions, so a type can never be routed to a
+// different sub-server than the one whose schema was actually placed
+// for it.
+func buildMixedSourceServer(name string, snap *snapshot.Snapshot) (tfprotov6.ProviderServer, error) {
+	resourceSchemas := map[string]*tfprotov6.Schema{}
+	resourcePlacedBy := map[string]string{}
+	dataSourceSchemas := map[string]*tfprotov6.Schema{}
+	dataSourcePlacedBy := map[string]string{}
+	resourceOwner := map[string]tfprotov6.ProviderServer{}
+	dataSourceOwner := map[string]tfprotov6.ProviderServer{}
+
+	for _, src := range snap.DistinctSources() {
+		sourceName := string(src)
+		subSnap := snap.SubsetBySource(src)
+		subServer, subResourceSchemas, subDataSourceSchemas, err := buildServerForSource(name, subSnap, src)
+		if err != nil {
+			return nil, fmt.Errorf("source %q: %w", sourceName, err)
+		}
+		if err := snapshot.MergeMixedSourceSchemas(resourceSchemas, resourcePlacedBy, subResourceSchemas, sourceName, snap.Exclude, "resource"); err != nil {
+			return nil, err
+		}
+		if err := snapshot.MergeMixedSourceSchemas(dataSourceSchemas, dataSourcePlacedBy, subDataSourceSchemas, sourceName, snap.Exclude, "data source"); err != nil {
+			return nil, err
+		}
+		for typeName, placedSource := range resourcePlacedBy {
+			if placedSource == sourceName {
+				resourceOwner[typeName] = subServer
+			}
+		}
+		for typeName, placedSource := range dataSourcePlacedBy {
+			if placedSource == sourceName {
+				dataSourceOwner[typeName] = subServer
+			}
+		}
+	}
+
+	if len(resourceSchemas) == 0 && len(dataSourceSchemas) == 0 {
+		return nil, fmt.Errorf("no resources or data sources across any real source -- nothing to serve")
+	}
+
+	return &mixedserver.Server{
+		ProviderName:      name,
+		ResourceOwner:     resourceOwner,
+		DataSourceOwner:   dataSourceOwner,
+		ResourceSchemas:   resourceSchemas,
+		DataSourceSchemas: dataSourceSchemas,
+	}, nil
 }
 
 // dataSourcesToResourceTypes adapts resourcemap.BuiltDataSource's own
