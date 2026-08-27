@@ -390,6 +390,70 @@ func TestMergeMixedSourceSchemas_RealTwoSourceGroup_MergesCleanly(t *testing.T) 
 	}
 }
 
+// realAWSLikeGeneratedMixedGroup builds a group shaped exactly like
+// AWS's own real group, using REAL generated members (not the plain
+// struct literals realAWSLikeMixedGroup uses, which have empty
+// Resources maps unsuited to Summarize's own real
+// realTypeNamesForSource calls): one real CloudFormation resource
+// member (the same real widget fixture GenerateCloudFormationMember's
+// own tests use) and one real Smithy data-source member (the same
+// real, already-committed SQS fixture GenerateSmithyMember's own tests
+// use).
+func realAWSLikeGeneratedMixedGroup(t *testing.T) *Snapshot {
+	t.Helper()
+	cfnURL := serveCFNZip(t, map[string]string{"aws-widget-thing.json": widgetCFNSchemaV1})
+	cfnMember, _, cfnLevel, err := GenerateCloudFormationMember("aws", cfnURL, ModeResource, config.Provider{BaseURL: "https://cloudcontrolapi.us-east-1.amazonaws.com"}, nil)
+	if err != nil {
+		t.Fatalf("GenerateCloudFormationMember: %v", err)
+	}
+	smithyURL := serveBytes(t, realSQSSmithyModel(t))
+	smithyMember, _, smithyLevel, err := GenerateSmithyMember("aws_data_sqs", "aws", smithyURL, "AmazonSQS", ModeDataSource, "", config.Provider{BaseURL: "https://sqs.us-east-1.amazonaws.com"}, nil)
+	if err != nil {
+		t.Fatalf("GenerateSmithyMember: %v", err)
+	}
+	group, err := AssembleGroup("aws", nil,
+		map[string]*MemberSnapshot{"aws": cfnMember, "aws_data_sqs": smithyMember},
+		map[string]ChangeLevel{"aws": cfnLevel, "aws_data_sqs": smithyLevel},
+		nil)
+	if err != nil {
+		t.Fatalf("AssembleGroup: %v", err)
+	}
+	return group
+}
+
+// TestSummarize_RealMixedGroup_CountsAcrossBothSources proves
+// Summarize's own mixed-source path merges real type names across
+// CloudFormation and Smithy the same way buildMixedSourceServer does,
+// returning real, nonzero, collision-checked counts spanning both real
+// sources -- not refusing (ErrMixedSchemaSourceGroup), and not just
+// counting the first source it happens to see.
+func TestSummarize_RealMixedGroup_CountsAcrossBothSources(t *testing.T) {
+	group := realAWSLikeGeneratedMixedGroup(t)
+
+	cfnResources, err := MergeCloudFormationGroup(group.SubsetBySource(SchemaSourceCloudFormation))
+	if err != nil {
+		t.Fatalf("MergeCloudFormationGroup: %v", err)
+	}
+	_, smithyDataSources, _, err := MergeSmithyGroup(group.SubsetBySource(SchemaSourceSmithy))
+	if err != nil {
+		t.Fatalf("MergeSmithyGroup: %v", err)
+	}
+
+	resources, dataSources, err := Summarize(group)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if resources != len(cfnResources) {
+		t.Errorf("Summarize resources = %d, want %d (CloudFormation's own real count)", resources, len(cfnResources))
+	}
+	if dataSources != len(smithyDataSources) {
+		t.Errorf("Summarize data sources = %d, want %d (Smithy's own real count)", dataSources, len(smithyDataSources))
+	}
+	if resources == 0 || dataSources == 0 {
+		t.Fatalf("expected real, nonzero counts on both sides, got resources=%d dataSources=%d", resources, dataSources)
+	}
+}
+
 // TestMergeMixedSourceSchemas_RealCollision_FailsLoud proves a type
 // name owned by two real sources fails loud (ErrDuplicateWireType),
 // identically to a same-source collision -- UBI-193's own explicit

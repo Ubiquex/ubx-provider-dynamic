@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -392,6 +393,53 @@ func MergeSmithyGroup(snap *Snapshot) (resources map[string]*smithy.BuiltResourc
 	return resources, dataSources, resourceModel, nil
 }
 
+// realTypeNamesForSource returns the real resource and real data-source
+// type names a single-source (sub)snapshot contributes, via the SAME
+// real Merge<Source>Group function runServeSnapshot's own builders
+// use -- Summarize's own real per-source primitive, returning names
+// (not just counts) so its mixed-source path can detect a real
+// cross-source collision by name, the same way a same-source collision
+// is already detected, rather than silently adding two sources' own
+// counts together.
+func realTypeNamesForSource(snap *Snapshot, src SchemaSource) (resources, dataSources map[string]struct{}, err error) {
+	switch src {
+	case SchemaSourceOpenAPI:
+		r, d, _, err := MergeOpenAPIGroup(snap)
+		if err != nil {
+			return nil, nil, err
+		}
+		return typeNameSet(r), typeNameSet(d), nil
+	case SchemaSourceDiscoveryDoc:
+		r, d, err := MergeDiscoveryDocGroup(snap)
+		if err != nil {
+			return nil, nil, err
+		}
+		return typeNameSet(r), typeNameSet(d), nil
+	case SchemaSourceCloudFormation:
+		r, err := MergeCloudFormationGroup(snap)
+		if err != nil {
+			return nil, nil, err
+		}
+		return typeNameSet(r), map[string]struct{}{}, nil
+	case SchemaSourceSmithy:
+		r, d, _, err := MergeSmithyGroup(snap)
+		if err != nil {
+			return nil, nil, err
+		}
+		return typeNameSet(r), typeNameSet(d), nil
+	default:
+		return nil, nil, fmt.Errorf("group %q's own schema_source %q is not a real, known schema source", snap.Provider, src)
+	}
+}
+
+func typeNameSet[T any](m map[string]T) map[string]struct{} {
+	out := make(map[string]struct{}, len(m))
+	for name := range m {
+		out[name] = struct{}{}
+	}
+	return out
+}
+
 // Summarize merges snap the same way runServeSnapshot's own dispatch
 // does (the SAME real Merge<Source>Group functions, not a separate
 // count) and returns only real, mechanically-computed counts -- never
@@ -403,37 +451,45 @@ func MergeSmithyGroup(snap *Snapshot) (resources map[string]*smithy.BuiltResourc
 // data-source collapse exists to make unnecessary. Kept here, not
 // inlined into main.go, so the counting itself is hermetically
 // testable without a real snapshot directory on disk.
+//
+// UBI-193's own real mixed-source extension: a group spanning more
+// than one real SchemaSource (AWS's own real shape) reuses the
+// identical Snapshot.SubsetBySource + realTypeNamesForSource pattern
+// runServeSnapshot's own buildMixedSourceServer uses, merging real
+// type NAMES across sources with mergeWithExclude's own collision
+// discipline (a type owned by two sources fails loud, same as a
+// same-source collision) rather than summing per-source counts, which
+// would silently double-count or under-report a real cross-source
+// collision.
 func Summarize(snap *Snapshot) (resources, dataSources int, err error) {
-	src, err := snap.GroupSchemaSource()
-	if err != nil {
-		return 0, 0, err
+	src, srcErr := snap.GroupSchemaSource()
+	if srcErr == nil {
+		r, d, err := realTypeNamesForSource(snap, src)
+		if err != nil {
+			return 0, 0, err
+		}
+		return len(r), len(d), nil
 	}
-	switch src {
-	case SchemaSourceOpenAPI:
-		r, d, _, err := MergeOpenAPIGroup(snap)
-		if err != nil {
-			return 0, 0, err
-		}
-		return len(r), len(d), nil
-	case SchemaSourceDiscoveryDoc:
-		r, d, err := MergeDiscoveryDocGroup(snap)
-		if err != nil {
-			return 0, 0, err
-		}
-		return len(r), len(d), nil
-	case SchemaSourceCloudFormation:
-		r, err := MergeCloudFormationGroup(snap)
-		if err != nil {
-			return 0, 0, err
-		}
-		return len(r), 0, nil
-	case SchemaSourceSmithy:
-		r, d, _, err := MergeSmithyGroup(snap)
-		if err != nil {
-			return 0, 0, err
-		}
-		return len(r), len(d), nil
-	default:
-		return 0, 0, fmt.Errorf("group %q's own schema_source %q is not a real, known schema source", snap.Provider, src)
+	if !errors.Is(srcErr, ErrMixedSchemaSourceGroup) {
+		return 0, 0, srcErr
 	}
+
+	resourceNames := map[string]struct{}{}
+	resourcePlacedBy := map[string]string{}
+	dataSourceNames := map[string]struct{}{}
+	dataSourcePlacedBy := map[string]string{}
+	for _, s := range snap.DistinctSources() {
+		sourceName := string(s)
+		r, d, err := realTypeNamesForSource(snap.SubsetBySource(s), s)
+		if err != nil {
+			return 0, 0, fmt.Errorf("source %q: %w", sourceName, err)
+		}
+		if err := mergeWithExclude(resourceNames, resourcePlacedBy, r, sourceName, snap.Exclude, "resource"); err != nil {
+			return 0, 0, err
+		}
+		if err := mergeWithExclude(dataSourceNames, dataSourcePlacedBy, d, sourceName, snap.Exclude, "data source"); err != nil {
+			return 0, 0, err
+		}
+	}
+	return len(resourceNames), len(dataSourceNames), nil
 }
