@@ -171,3 +171,46 @@ func TestGroupSchemaSource_SingleSource_RealSuccess(t *testing.T) {
 		t.Errorf("GroupSchemaSource = %q, want openapi", src)
 	}
 }
+
+// TestSummarize_RealTwoMemberGroup_MatchesMergeOpenAPIGroup proves
+// Summarize's own counts come from the SAME real merge every pinned
+// resolution already goes through, not a separate, possibly-drifting
+// count -- and that it returns real numbers, never a member name.
+func TestSummarize_RealTwoMemberGroup_MatchesMergeOpenAPIGroup(t *testing.T) {
+	group := realKubernetesLikeGroup(t)
+	wantResources, wantDataSources, err := MergeOpenAPIGroup(group)
+	if err != nil {
+		t.Fatalf("MergeOpenAPIGroup: %v", err)
+	}
+
+	resources, dataSources, err := Summarize(group)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if resources != len(wantResources) {
+		t.Errorf("Summarize resources = %d, want %d (MergeOpenAPIGroup's own real count)", resources, len(wantResources))
+	}
+	if dataSources != len(wantDataSources) {
+		t.Errorf("Summarize data sources = %d, want %d (MergeOpenAPIGroup's own real count)", dataSources, len(wantDataSources))
+	}
+}
+
+// TestSummarize_RealCollisionResolvedByExclude proves Summarize counts
+// AFTER exclude resolution, not before -- the real, collision-losing
+// copy must not be double-counted.
+func TestSummarize_RealCollisionResolvedByExclude(t *testing.T) {
+	group := realDatadogLikeCollidingGroup(t, map[string][]string{
+		"widgetco_v2": {"widgetco_widget"},
+	})
+	resources, _, err := Summarize(group)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	want, _, err := MergeOpenAPIGroup(group)
+	if err != nil {
+		t.Fatalf("MergeOpenAPIGroup: %v", err)
+	}
+	if resources != len(want) {
+		t.Errorf("Summarize resources = %d, want %d", resources, len(want))
+	}
+}
