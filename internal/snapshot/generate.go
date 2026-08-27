@@ -66,11 +66,12 @@ func AssembleGroup(repoName string, prev *Snapshot, members map[string]*MemberSn
 	}
 
 	return &Snapshot{
-		SchemaFormat: CurrentSchemaFormat,
-		Provider:     repoName,
-		Version:      version,
-		Members:      members,
-		Exclude:      exclude,
+		SchemaFormat:     CurrentSchemaFormat,
+		Provider:         repoName,
+		Version:          version,
+		Members:          members,
+		Exclude:          exclude,
+		MinBinaryVersion: BinaryVersion,
 	}, nil
 }
 

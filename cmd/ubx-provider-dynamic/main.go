@@ -160,6 +160,14 @@ const nameEnvVar = "UBX_DYNAMIC_PROVIDER_NAME"
 // to the source-appropriate Load<Source> and server construction.
 const snapshotPathEnvVar = "UBX_SNAPSHOT_PATH"
 
+// versionFlag prints snapshot.BinaryVersion (this exact build's own
+// real, released version -- "dev" for a local, unreleased build) and
+// exits -- UBI-194's own real, minimal operational visibility: the same
+// real value every snapshot this build generates now stamps into its
+// own MinBinaryVersion, so a real release always has a way to confirm
+// what it actually is without decoding a snapshot's own manifest.json.
+var versionFlag = flag.Bool("version", false, "print this build's own real, released version (snapshot.BinaryVersion) and exit")
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "ubx-provider-dynamic:", err)
@@ -169,6 +177,11 @@ func main() {
 
 func run() error {
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println(snapshot.BinaryVersion)
+		return nil
+	}
 
 	// Group generation is checked BEFORE the single-name requirement
 	// below: it bundles MULTIPLE real [dynamic_providers.<name>] tables

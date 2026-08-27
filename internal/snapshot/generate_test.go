@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -309,6 +310,49 @@ func TestAssembleGroup_FirstEverGroup_RealVersion100(t *testing.T) {
 	}
 	if len(group.Members) != 2 {
 		t.Fatalf("group has %d members, want 2", len(group.Members))
+	}
+}
+
+// TestAssembleGroup_StampsRealBinaryVersion is UBI-194's own real,
+// direct proof: AssembleGroup stamps whatever BinaryVersion this build
+// carries into every new snapshot's own real MinBinaryVersion,
+// unconditionally -- and SaveSplit/LoadSplit round-trip it through the
+// real, committed manifest.json shape, not just the in-memory struct.
+func TestAssembleGroup_StampsRealBinaryVersion(t *testing.T) {
+	old := BinaryVersion
+	BinaryVersion = "1.2.3"
+	t.Cleanup(func() { BinaryVersion = old })
+
+	resourceMember, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
+	if err != nil {
+		t.Fatalf("generate resource member: %v", err)
+	}
+	group, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": resourceMember}, map[string]ChangeLevel{"widgetco": Minor}, nil)
+	if err != nil {
+		t.Fatalf("AssembleGroup: %v", err)
+	}
+	if group.MinBinaryVersion != "1.2.3" {
+		t.Fatalf("MinBinaryVersion = %q, want 1.2.3", group.MinBinaryVersion)
+	}
+
+	dir := t.TempDir()
+	if err := SaveSplit(dir, group); err != nil {
+		t.Fatalf("SaveSplit: %v", err)
+	}
+	reloaded, err := LoadSplit(dir)
+	if err != nil {
+		t.Fatalf("LoadSplit: %v", err)
+	}
+	if reloaded.MinBinaryVersion != "1.2.3" {
+		t.Fatalf("reloaded MinBinaryVersion = %q, want 1.2.3 (real round trip through manifest.json)", reloaded.MinBinaryVersion)
+	}
+
+	manifestRaw, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read manifest.json: %v", err)
+	}
+	if !strings.Contains(string(manifestRaw), `"min_binary_version": "1.2.3"`) {
+		t.Fatalf("manifest.json doesn't carry a real, readable min_binary_version field: %s", manifestRaw)
 	}
 }
 
