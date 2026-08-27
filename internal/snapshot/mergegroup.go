@@ -355,3 +355,49 @@ func MergeSmithyGroup(snap *Snapshot) (resources map[string]*smithy.BuiltResourc
 	}
 	return resources, dataSources, resourceModel, nil
 }
+
+// Summarize merges snap the same way runServeSnapshot's own dispatch
+// does (the SAME real Merge<Source>Group functions, not a separate
+// count) and returns only real, mechanically-computed counts -- never
+// a member name. Built for cmd/ubx-provider-dynamic's own
+// --dump-group-summary, itself built for a real, live finding: a
+// published release's own notes naming internal member names
+// (e.g. "kubernetes, kubernetes_ds") invites pinning one of them
+// directly, exactly the two-pin/four-pin shape the resource/
+// data-source collapse exists to make unnecessary. Kept here, not
+// inlined into main.go, so the counting itself is hermetically
+// testable without a real snapshot directory on disk.
+func Summarize(snap *Snapshot) (resources, dataSources int, err error) {
+	src, err := snap.GroupSchemaSource()
+	if err != nil {
+		return 0, 0, err
+	}
+	switch src {
+	case SchemaSourceOpenAPI:
+		r, d, err := MergeOpenAPIGroup(snap)
+		if err != nil {
+			return 0, 0, err
+		}
+		return len(r), len(d), nil
+	case SchemaSourceDiscoveryDoc:
+		r, d, err := MergeDiscoveryDocGroup(snap)
+		if err != nil {
+			return 0, 0, err
+		}
+		return len(r), len(d), nil
+	case SchemaSourceCloudFormation:
+		r, err := MergeCloudFormationGroup(snap)
+		if err != nil {
+			return 0, 0, err
+		}
+		return len(r), 0, nil
+	case SchemaSourceSmithy:
+		r, d, _, err := MergeSmithyGroup(snap)
+		if err != nil {
+			return 0, 0, err
+		}
+		return len(r), len(d), nil
+	default:
+		return 0, 0, fmt.Errorf("group %q's own schema_source %q is not a real, known schema source", snap.Provider, src)
+	}
+}

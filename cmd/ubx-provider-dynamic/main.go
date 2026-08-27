@@ -119,6 +119,23 @@ var groupExcludeFlag = flag.String("group-exclude", "", "JSON object of member n
 // left for a human to guess. Omit for a group's first-ever snapshot.
 var prevSnapshotFlag = flag.String("prev-snapshot", "", "DIRECTORY of the prior real GROUP snapshot (manifest.json plus members/) to diff against when deriving the new one's own version (omit for a group's first-ever snapshot)")
 
+// dumpGroupSummaryFlag is a real, plain CLI mode for one real, narrow
+// question: how many real resource/data-source types does this GROUP's
+// own real merge actually produce, right now, without ever printing a
+// single one of its own internal member names. Built for a real, live
+// finding, not speculatively: this org's own ubx-schema-* repos'
+// publish.yml workflows used to bake manifest.json's own member NAMES
+// (e.g. "kubernetes, kubernetes_ds") directly into a real, published
+// release's own notes -- inviting a reader to pin one of those internal
+// names directly (kubernetes_ds, datadog_v2_ds), exactly the two-pin/
+// four-pin shape the whole collapse exists to make unnecessary. Real
+// counts, mechanically computed from the SAME Merge<Source>Group
+// functions runServeSnapshot already uses, are the honest, correct
+// thing to publish instead -- this flag exists so a workflow can ask
+// for them without re-implementing any real translation logic in a
+// shell script.
+var dumpGroupSummaryFlag = flag.String("dump-group-summary", "", "print {\"provider\":..,\"version\":..,\"resources\":N,\"data_sources\":N} as JSON for the real GROUP snapshot at this DIRECTORY, and exit -- never names an internal member")
+
 // nameEnvVar is how a launched process learns which [dynamic_providers.<name>]
 // table in .ubx/config is its own -- see internal/config's own doc comment
 // for why this can't come from the ConfigureProvider RPC. provider.Launch's
@@ -157,6 +174,13 @@ func run() error {
 	// UBX_DYNAMIC_PROVIDER_NAME to require at all.
 	if *generateSnapshotGroupFlag != "" {
 		return runGenerateSnapshotGroup(*generateSnapshotGroupFlag, *groupRepoNameFlag, *groupMembersFlag, *prevSnapshotFlag, *groupExcludeFlag)
+	}
+
+	// Same real reason as group generation above -- a group summary
+	// inspects the WHOLE group container directly, no single active
+	// UBX_DYNAMIC_PROVIDER_NAME to require.
+	if *dumpGroupSummaryFlag != "" {
+		return runDumpGroupSummary(*dumpGroupSummaryFlag)
 	}
 
 	name := os.Getenv(nameEnvVar)
@@ -1051,6 +1075,41 @@ func runDumpNamespacesFromSnapshot(name, snapPath string) error {
 	default:
 		return fmt.Errorf("snapshot %s: group %q's own schema_source %q is not a real, known schema source", snapPath, name, src)
 	}
+}
+
+// groupSummary is dumpGroupSummaryFlag's own real output shape --
+// deliberately carries no internal member names at all, only the
+// group's own real published identity (Provider/Version) and real,
+// mechanically-computed counts. See dumpGroupSummaryFlag's own doc
+// comment for the real, live finding this exists to fix.
+type groupSummary struct {
+	Provider    string `json:"provider"`
+	Version     string `json:"version"`
+	Resources   int    `json:"resources"`
+	DataSources int    `json:"data_sources"`
+}
+
+// runDumpGroupSummary loads snapPath (no UBX_DYNAMIC_PROVIDER_NAME
+// needed -- this inspects the whole group directly, the same real
+// reason runGenerateSnapshotGroup needs none), dispatches to the
+// source-appropriate Merge<Source>Group (the SAME real merge every
+// pinned resolution already goes through, not a separate count), and
+// prints only Provider/Version/counts -- never a member name.
+func runDumpGroupSummary(snapPath string) error {
+	snap, err := snapshot.LoadSplit(snapPath)
+	if err != nil {
+		return fmt.Errorf("load snapshot %s: %w", snapPath, err)
+	}
+	resources, dataSources, err := snapshot.Summarize(snap)
+	if err != nil {
+		return fmt.Errorf("summarize group in snapshot %s: %w", snapPath, err)
+	}
+	return json.NewEncoder(os.Stdout).Encode(groupSummary{
+		Provider:    snap.Provider,
+		Version:     snap.Version,
+		Resources:   resources,
+		DataSources: dataSources,
+	})
 }
 
 // runGenerateSnapshotGroup is generateSnapshotGroupFlag's own real
