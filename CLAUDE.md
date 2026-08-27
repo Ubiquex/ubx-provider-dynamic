@@ -31,6 +31,10 @@ commits — see that repo's own `CLAUDE.md` for the generation side.
 
 - PR-only. Never self-merge — push a branch, open a PR, wait for the founder
   to review and merge, per this repo's own checkpoint-branch incident.
+- Before pushing more commits to a branch with an open PR, confirm it is
+  STILL open (`gh pr list --state open` or `gh pr view <n>`) — a merged PR's
+  branch looks identical to any other from `git status` alone, and a push
+  after merge lands nowhere near `main`, silently.
 - NO AI attribution anywhere: no Co-Authored-By trailers, no "Generated with"
   lines, not in commit messages, not in PR bodies.
 - Conventional, terse commit messages: `component: what changed`.
