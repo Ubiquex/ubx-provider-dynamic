@@ -281,10 +281,26 @@ func MatchesCreateVerb(name string) bool {
 // keys ("restore", "initiateBackup") and OpenAPI's own compound
 // operationIds ("SqlPoolVulnerabilityAssessmentScans_InitiateScan",
 // "repos/create-or-update-file-contents") match the identical way.
+// recreateFalseFriend is stripped from the cleaned name before matching
+// "create" -- a real, live-found false friend (generating this exact
+// batch's own real full-corpus run, UBI-181): GCP's own real
+// "downloadRecreateInstallScript" (networkMonitoringProviders'
+// monitoringPoints, whose own real methods are download/get/list-only,
+// genuinely no create operation exists at all) and "recreateInstances"
+// (Compute's own instanceGroupManagers, a real action re-imaging an
+// EXISTING group's members, not a new group) both contain "create" only
+// as a substring of "recreate" -- neither is a real create. Stripping
+// the whole "recreate" substring first (not just excluding an exact
+// match) means a genuine "create" occurring elsewhere in the same name
+// still matches normally; only the false-friend substring itself is
+// removed.
+const recreateFalseFriend = "recreate"
+
 func matchesAnyToken(name string, tokens []string) bool {
 	cleaned := cleanForVerbMatch(name)
+	cleanedWithoutFalseFriends := strings.ReplaceAll(cleaned, recreateFalseFriend, "")
 	for _, tok := range tokens {
-		if strings.Contains(cleaned, tok) {
+		if strings.Contains(cleanedWithoutFalseFriends, tok) {
 			return true
 		}
 	}
