@@ -281,40 +281,82 @@ func MatchesCreateVerb(name string) bool {
 // keys ("restore", "initiateBackup") and OpenAPI's own compound
 // operationIds ("SqlPoolVulnerabilityAssessmentScans_InitiateScan",
 // "repos/create-or-update-file-contents") match the identical way.
-// recreateFalseFriend is stripped from the cleaned name before matching
-// "create" -- a real, live-found false friend (generating this exact
-// batch's own real full-corpus run, UBI-181): GCP's own real
-// "downloadRecreateInstallScript" (networkMonitoringProviders'
-// monitoringPoints, whose own real methods are download/get/list-only,
-// genuinely no create operation exists at all) and "recreateInstances"
-// (Compute's own instanceGroupManagers, a real action re-imaging an
-// EXISTING group's members, not a new group) both contain "create" only
-// as a substring of "recreate" -- neither is a real create. Stripping
-// the whole "recreate" substring first (not just excluding an exact
-// match) means a genuine "create" occurring elsewhere in the same name
-// still matches normally; only the false-friend substring itself is
-// removed.
+// recreateFalseFriend is stripped from each real SEGMENT (see
+// verbSegments) before matching "create" -- a real, live-found false
+// friend (generating this exact batch's own real full-corpus run,
+// UBI-181): GCP's own real "downloadRecreateInstallScript"
+// (networkMonitoringProviders' monitoringPoints, whose own real methods
+// are download/get/list-only, genuinely no create operation exists at
+// all) and "recreateInstances" (Compute's own instanceGroupManagers, a
+// real action re-imaging an EXISTING group's members, not a new group)
+// both contain "create" only as a substring of "recreate" -- neither is
+// a real create.
+//
+// Stripping "recreate" from the WHOLE cleaned name (an earlier version
+// of this fix) was itself a real, live-found bug: Azure's own
+// "<Resource>_<Verb>" naming convention means the underscore separating
+// two genuinely unrelated words is exactly what a naive full-string
+// strip destroys -- "PrivateStore_CreateOrUpdate" (a real,
+// live-published operation, no "recreate" concept in it at all)
+// concatenates to "...store" + "create..." across that now-deleted
+// underscore, which itself spells "recreate" purely by accident (the
+// real word boundary was the only thing preventing the collision).
+// Segmenting first, on every real non-letter separator (verbSegments),
+// keeps that boundary intact -- the false-friend strip only ever runs
+// WITHIN one real, unbroken word run, never across two unrelated ones.
 const recreateFalseFriend = "recreate"
 
+// verbSegments splits name into its own real CONCEPT runs, on every
+// real structural separator (underscore, slash, colon, dot) --
+// deliberately NOT on hyphens or camelCase transitions, since this
+// corpus's own real compound verb names are each already one
+// intentional, continuous phrase this package depends on matching as a
+// single unit, whether joined by camelCase ("createOrUpdate",
+// "initiateBackup") or by kebab-case (GitHub's own real
+// "create-or-update-file-contents", "add-or-update-repo-permissions-
+// in-org" -- a live, found-in-review regression: an earlier version of
+// this function DID break on hyphens, which silently split
+// "add-or-update" into three separate words and stopped it matching
+// the "addorupdate" token at all). Structural separators genuinely
+// divide two UNRELATED concepts in this corpus's own real naming
+// conventions (Azure: "<Resource>_<Verb>"; GitHub: "<scope>/<verb-
+// phrase>"; GCP: "<namespace>.<method>"); a hyphen never does -- it is
+// this corpus's own kebab-case equivalent of camelCase, joining one
+// phrase, not separating two.
+func verbSegments(name string) []string {
+	var segments []string
+	var b strings.Builder
+	flush := func() {
+		if b.Len() > 0 {
+			segments = append(segments, b.String())
+			b.Reset()
+		}
+	}
+	for _, r := range strings.ToLower(name) {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r == '-':
+			// Kebab-case within one real compound phrase -- dropped,
+			// not a segment break (see doc comment above).
+		default:
+			flush()
+		}
+	}
+	flush()
+	return segments
+}
+
 func matchesAnyToken(name string, tokens []string) bool {
-	cleaned := cleanForVerbMatch(name)
-	cleanedWithoutFalseFriends := strings.ReplaceAll(cleaned, recreateFalseFriend, "")
-	for _, tok := range tokens {
-		if strings.Contains(cleanedWithoutFalseFriends, tok) {
-			return true
+	for _, segment := range verbSegments(name) {
+		cleaned := strings.ReplaceAll(segment, recreateFalseFriend, "")
+		for _, tok := range tokens {
+			if strings.Contains(cleaned, tok) {
+				return true
+			}
 		}
 	}
 	return false
-}
-
-func cleanForVerbMatch(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(s) {
-		if r >= 'a' && r <= 'z' {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
 }
 
 // SamePathAction reports whether opPath is genuinely the same resource

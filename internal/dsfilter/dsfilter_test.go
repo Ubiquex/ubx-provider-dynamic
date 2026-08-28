@@ -135,10 +135,57 @@ func TestMatchesCreateVerb(t *testing.T) {
 	}
 
 	// A genuine "create" occurring alongside a "recreate" false friend in
-	// the SAME name must still match -- only the false-friend substring
-	// is stripped, not every occurrence of "create".
+	// the SAME word run must still match -- only the false-friend
+	// substring is stripped, not every occurrence of "create".
 	if !MatchesCreateVerb("recreateOrCreateWidget") {
 		t.Error("MatchesCreateVerb(\"recreateOrCreateWidget\") = false, want true (a real \"create\" survives alongside a stripped \"recreate\")")
+	}
+
+	// Real, live-found regression this exact package introduced and then
+	// fixed, generating UBI-181's own first real batch: a naive
+	// whole-string "recreate" strip destroys a genuine "create" whenever
+	// an unrelated word ending in "...re" is immediately followed by
+	// "Create" across a real separator -- Azure's own real
+	// "<Resource>_<Verb>" convention concatenates "PrivateStore" +
+	// "CreateOrUpdate" into "...storeCREATEorupdate", where the "re" off
+	// "Store" plus "Create" spells "recreate" purely by accident. Real,
+	// live, currently-published operation -- must still match.
+	if !MatchesCreateVerb("PrivateStore_CreateOrUpdate") {
+		t.Error("MatchesCreateVerb(\"PrivateStore_CreateOrUpdate\") = false, want true (a real create, the underscore separator must protect it from the recreate false-friend strip)")
+	}
+
+	// Real, live-found regression from segmenting on hyphens (an
+	// intermediate version of this fix, caught before shipping): GitHub's
+	// own real kebab-case compound verbs must still match "addorupdate"
+	// as one phrase, not fragment into "add"/"or"/"update" and stop
+	// matching entirely.
+	if !MatchesCreateVerb("teams/add-or-update-repo-permissions-in-org") {
+		t.Error("MatchesCreateVerb(\"teams/add-or-update-repo-permissions-in-org\") = false, want true (kebab-case hyphens join one phrase, they are not a word boundary)")
+	}
+}
+
+func TestVerbSegments_SeparatorsPreserveRealWordBoundaries(t *testing.T) {
+	cases := []struct {
+		name string
+		want []string
+	}{
+		{"PrivateStore_CreateOrUpdate", []string{"privatestore", "createorupdate"}},
+		{"repos/create-or-update-file-contents", []string{"repos", "createorupdatefilecontents"}},
+		{"downloadRecreateInstallScript", []string{"downloadrecreateinstallscript"}},
+		{"teams/add-or-update-repo-permissions-in-org", []string{"teams", "addorupdaterepopermissionsinorg"}},
+	}
+	for _, c := range cases {
+		got := verbSegments(c.name)
+		if len(got) != len(c.want) {
+			t.Errorf("verbSegments(%q) = %v, want %v", c.name, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("verbSegments(%q) = %v, want %v", c.name, got, c.want)
+				break
+			}
+		}
 	}
 }
 
