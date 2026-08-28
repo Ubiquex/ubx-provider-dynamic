@@ -93,3 +93,59 @@ func TestHasPathSegment(t *testing.T) {
 		t.Fatal("expected an empty path to never match")
 	}
 }
+
+func TestMatchesCreateVerb(t *testing.T) {
+	genuine := []string{
+		"restore",
+		"initiateBackup",
+		"SqlPoolVulnerabilityAssessmentScans_InitiateScan",
+		"repos/create-or-update-file-contents",
+		"packages/restore-package-for-user",
+		"ragFiles.import",
+		"Databases_Create",
+	}
+	for _, name := range genuine {
+		if !MatchesCreateVerb(name) {
+			t.Errorf("MatchesCreateVerb(%q) = false, want true", name)
+		}
+	}
+
+	// Real, live-found action-on-an-existing-resource verbs -- deliberately
+	// NOT on the allowlist, on real evidence (see createVerbTokens' own
+	// doc comment): a naive "any non-standard verb" rule would treat all
+	// of these as hidden creates, which the corpus's own real sample
+	// found to be the majority failure mode, not the exception.
+	actions := []string{
+		"enable", "disable", "moveDisk", "setIamPolicy", "approve", "reject",
+		"calculateStats", "generateSignedAudio", "wipe", "PurgeDeleted",
+		"RestrictMovement", "ListExpressionTraces", "batchGet",
+	}
+	for _, name := range actions {
+		if MatchesCreateVerb(name) {
+			t.Errorf("MatchesCreateVerb(%q) = true, want false (real action verb, not a create)", name)
+		}
+	}
+}
+
+func TestSamePathAction(t *testing.T) {
+	cases := []struct {
+		candidate, op string
+		want          bool
+	}{
+		{"/sites/{name}/backups/{backupId}", "/sites/{name}/backups/{backupId}", true},
+		{"/sites/{name}/backups/{backupId}", "/sites/{name}/backups/{backupId}/restore", true},
+		{"/sites/{name}/backups/{backupId}", "/sites/{name}/backups/{backupId}:restore", true},
+		{
+			"/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/columns/{columnName}",
+			"/databases/{databaseName}/schemas/{schemaName}/tables/{tableName}/columns/{columnName}/sensitivityLabels/{sensitivityLabelSource}",
+			false,
+		},
+		{"/sites/{name}", "/sites/{name}/slots/{slot}", false},
+		{"/sites/{name}", "/other/{name}", false},
+	}
+	for _, c := range cases {
+		if got := SamePathAction(c.candidate, c.op); got != c.want {
+			t.Errorf("SamePathAction(%q, %q) = %v, want %v", c.candidate, c.op, got, c.want)
+		}
+	}
+}

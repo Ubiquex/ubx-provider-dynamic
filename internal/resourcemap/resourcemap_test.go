@@ -183,6 +183,85 @@ func TestDiscover_ARMShapedCreateIsPUTOnTheSameItemPath(t *testing.T) {
 	}
 }
 
+// TestDiscover_UBI181AllowlistedVerb_ActionSuffixOnSamePath mirrors this
+// corpus's own real, confirmed genuine case: Azure App Service's
+// "/sites/{name}/backups/{backupId}" (read, response type "Backup") has
+// no matching create at all (no POST/PUT anywhere returns a "Backup"),
+// but "/sites/{name}/backups/{backupId}/restore" -- the identical path
+// plus one real action suffix -- genuinely does recreate it. The narrow
+// create-verb allowlist (dsfilter.MatchesActionVerb, "restore") plus
+// SamePathAction's own single-action-suffix form is what promotes this
+// from a skip Note to a real resource; findCreate alone never would,
+// since the restore operation's own response type never matches the
+// read schema by construction (it just echoes it, not authoritative).
+func TestDiscover_UBI181AllowlistedVerb_ActionSuffixOnSamePath(t *testing.T) {
+	backupSchema := openapi3.NewObjectSchema().WithProperty("id", openapi3.NewStringSchema())
+	backupRef := openapi3.NewSchemaRef("#/components/schemas/Backup", backupSchema)
+
+	readOp := &openapi3.Operation{OperationID: "backups/get", Responses: responses200(backupRef)}
+	restoreOp := &openapi3.Operation{OperationID: "WebApps_RestoreSiteBackup", Responses: responses200(backupRef)}
+
+	doc := &openapi3.T{OpenAPI: "3.0.3", Info: &openapi3.Info{Title: "t", Version: "1"}}
+	doc.Paths = openapi3.NewPaths(
+		openapi3.WithPath("/sites/{name}/backups/{backupId}", &openapi3.PathItem{Get: readOp}),
+		openapi3.WithPath("/sites/{name}/backups/{backupId}/restore", &openapi3.PathItem{Post: restoreOp}),
+	)
+
+	resources, notes, err := Discover(doc, "azure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("expected the restore-shaped backup to be admitted as one real resource, got %d: %+v (notes: %+v)", len(resources), resources, notes)
+	}
+	r := resources[0]
+	if r.CreateMethod != "POST" || r.CreatePath != "/sites/{name}/backups/{backupId}/restore" {
+		t.Fatalf("expected create via the allowlisted restore operation, got %s %s", r.CreateMethod, r.CreatePath)
+	}
+}
+
+// TestDiscover_UBI181Allowlist_NeverCrossesIntoASiblingSubResource is the
+// real, confirmed misattribution case that first shipped broken: a
+// "create"-named operation living on a DEEPER, differently-parameterized
+// path than its own read candidate (a genuine, separate nested resource
+// -- Azure's own real SqlPoolSensitivityLabels_CreateOrUpdate, nested
+// two segments and a new path parameter below its own column) must
+// never be attributed to the shallower candidate. SamePathAction's own
+// exact-or-single-suffix rule is what keeps this excluded even with the
+// allowlist wired in.
+func TestDiscover_UBI181Allowlist_NeverCrossesIntoASiblingSubResource(t *testing.T) {
+	columnSchema := openapi3.NewObjectSchema().WithProperty("name", openapi3.NewStringSchema())
+	columnRef := openapi3.NewSchemaRef("#/components/schemas/DatabaseColumn", columnSchema)
+	labelSchema := openapi3.NewObjectSchema().WithProperty("labelName", openapi3.NewStringSchema())
+	labelRef := openapi3.NewSchemaRef("#/components/schemas/SensitivityLabel", labelSchema)
+
+	readOp := &openapi3.Operation{OperationID: "columns/get", Responses: responses200(columnRef)}
+	createLabelOp := &openapi3.Operation{OperationID: "SqlPoolSensitivityLabels_CreateOrUpdate", Responses: responses200(labelRef)}
+
+	doc := &openapi3.T{OpenAPI: "3.0.3", Info: &openapi3.Info{Title: "t", Version: "1"}}
+	doc.Paths = openapi3.NewPaths(
+		openapi3.WithPath("/databases/{databaseName}/columns/{columnName}", &openapi3.PathItem{Get: readOp}),
+		openapi3.WithPath("/databases/{databaseName}/columns/{columnName}/sensitivityLabels/{labelSource}", &openapi3.PathItem{Put: createLabelOp}),
+	)
+
+	resources, notes, err := Discover(doc, "azure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 0 {
+		t.Fatalf("expected zero resources -- the sibling sub-resource's create must never attribute to the shallower column candidate, got %+v", resources)
+	}
+	foundSkipNote := false
+	for _, n := range notes {
+		if n.Path == "/databases/{databaseName}/columns/{columnName}" {
+			foundSkipNote = true
+		}
+	}
+	if !foundSkipNote {
+		t.Fatalf("expected a skip note for the column candidate, got %+v", notes)
+	}
+}
+
 // TestFindCreate_PrefersPOSTOverPUTWhenBothMatch confirms the existing
 // fewest-path-params tiebreak still correctly favors a real
 // POST-to-collection create endpoint over an item-path PUT when a

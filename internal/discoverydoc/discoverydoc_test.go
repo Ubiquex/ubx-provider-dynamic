@@ -193,6 +193,41 @@ func TestDiscover_UnrelatedVerb_NotMatchedAsCreate(t *testing.T) {
 	}
 }
 
+// TestDiscover_UBI181AllowlistedVerb_RealBackupAndDRShape mirrors the
+// ticket's own real, named example: Google Backup and DR's "backups"
+// resource has get/list/patch/delete/restore/initiateBackup, no method
+// literally named "create"/"insert" or "create"/"insert"-prefixed --
+// UBI-181's own narrow create-verb allowlist (dsfilter.MatchesCreateVerb
+// matching "restore" here) is what promotes it to a real resource
+// instead of a permanent skip Note.
+func TestDiscover_UBI181AllowlistedVerb_RealBackupAndDRShape(t *testing.T) {
+	doc := &Document{
+		Name: "backupdr",
+		Resources: map[string]*rawResource{
+			"backups": {
+				Methods: map[string]*rawMethod{
+					"get":            {HTTPMethod: "GET", FlatPath: "v1/{name}", Response: &rawRef{Ref: "Backup"}},
+					"list":           {HTTPMethod: "GET", FlatPath: "v1/{parent}/backups", Response: &rawRef{Ref: "ListBackupsResponse"}},
+					"patch":          {HTTPMethod: "PATCH", FlatPath: "v1/{name}", Response: &rawRef{Ref: "Operation"}},
+					"delete":         {HTTPMethod: "DELETE", FlatPath: "v1/{name}", Response: &rawRef{Ref: "Operation"}},
+					"restore":        {HTTPMethod: "POST", FlatPath: "v1/{name}:restore", Response: &rawRef{Ref: "Operation"}},
+					"initiateBackup": {HTTPMethod: "POST", FlatPath: "v1/{name}:initiateBackup", Response: &rawRef{Ref: "Operation"}},
+				},
+			},
+		},
+	}
+	resources, notes, err := Discover(doc, "google", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("expected the allowlisted-verb backup to be admitted as one real resource, got %d: %+v (notes: %+v)", len(resources), resources, notes)
+	}
+	if resources[0].CreateMethod != "POST" {
+		t.Fatalf("expected create via the allowlisted restore/initiateBackup method, got %+v", resources[0])
+	}
+}
+
 func TestDiscover_ReadOnlyNode_SkippedWithNote(t *testing.T) {
 	doc := &Document{
 		Name: "example",
