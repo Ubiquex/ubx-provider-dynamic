@@ -17,7 +17,7 @@ func TestDiscoverDataSources_RealSQSModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidates, err := DiscoverDataSources(m, svc)
+	candidates, _, err := DiscoverDataSources(m, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestDiscoverDataSources_EmptyWhenEveryReadIsClaimed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidates, err := DiscoverDataSources(m, svc)
+	candidates, _, err := DiscoverDataSources(m, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestDiscoverDataSources_ReturnsUnclaimedAlongsideClaimed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidates, err := DiscoverDataSources(m, svc)
+	candidates, _, err := DiscoverDataSources(m, svc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,11 +142,11 @@ func TestDiscoverDataSources_NamespaceDisambiguatesRealCollision(t *testing.T) {
 	ec2Model, ec2Svc := newSvcModel("com.amazonaws.ec2#Svc", "ec2")
 	ssoModel, ssoSvc := newSvcModel("com.amazonaws.sso#Svc", "sso")
 
-	ec2Candidates, err := DiscoverDataSources(ec2Model, ec2Svc)
+	ec2Candidates, _, err := DiscoverDataSources(ec2Model, ec2Svc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ssoCandidates, err := DiscoverDataSources(ssoModel, ssoSvc)
+	ssoCandidates, _, err := DiscoverDataSources(ssoModel, ssoSvc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,5 +208,63 @@ func TestServiceNamespace_EmptyWhenBothMissing(t *testing.T) {
 	}
 	if got := ServiceNamespace(svc); got != "" {
 		t.Fatalf("ServiceNamespace with neither trait set = %q, want empty", got)
+	}
+}
+
+// TestDiscoverDataSources_UBI181Rules_ExcludeOperationAndExecution is the
+// real, live-shaped proof the five UBI-181 rules are wired into
+// smithy's own DiscoverDataSources: "DescribeOperations" (rule 2) and
+// "ListExecutions" (rule 3 -- AWS Step Functions' own real operation
+// name) are both excluded, using AWS's own real still-plural noun shape
+// at this point in the pipeline (Smithy has no singularization step of
+// its own, unlike discoverydoc/resourcemap -- hasToken's own trailing-
+// "s" fallback is what makes plural nouns match here), while a genuine,
+// unrelated List operation survives.
+func TestDiscoverDataSources_UBI181Rules_ExcludeOperationAndExecution(t *testing.T) {
+	m := &Model{Shapes: map[string]Shape{
+		"x#Svc": {
+			Type: "service",
+			Operations: []ShapeRef{
+				{Target: "x#ListWidgets"},
+				{Target: "x#DescribeOperations"},
+				{Target: "x#ListExecutions"},
+			},
+			Traits: map[string]json.RawMessage{
+				"aws.protocols#awsJson1_0": json.RawMessage(`{}`),
+				"aws.api#service":          json.RawMessage(`{"endpointPrefix":"x"}`),
+			},
+		},
+		"x#ListWidgets":        {Type: "operation", Output: &ShapeRef{Target: "x#ListWidgetsOutput"}},
+		"x#ListWidgetsOutput":  {Type: "structure"},
+		"x#DescribeOperations": {Type: "operation", Output: &ShapeRef{Target: "x#OperationsOutput"}},
+		"x#OperationsOutput":   {Type: "structure"},
+		"x#ListExecutions":     {Type: "operation", Output: &ShapeRef{Target: "x#ExecutionsOutput"}},
+		"x#ExecutionsOutput":   {Type: "structure"},
+	}}
+	svc, err := FindService(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, notes, err := DiscoverDataSources(m, svc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	byNoun := map[string]bool{}
+	for _, c := range candidates {
+		byNoun[c.Noun] = true
+	}
+
+	if !byNoun["Widgets"] {
+		t.Errorf("expected the genuine Widgets lookup to survive, got candidates: %+v", candidates)
+	}
+	if byNoun["Operations"] {
+		t.Error("expected DescribeOperations to be excluded (rule 2, operation-status shape, plural-noun form), but it was kept")
+	}
+	if byNoun["Executions"] {
+		t.Error("expected ListExecutions to be excluded (rule 3, execution/event record, plural-noun form), but it was kept")
+	}
+	if len(notes) != 2 {
+		t.Fatalf("expected exactly 2 exclusion notes, got %d: %v", len(notes), notes)
 	}
 }

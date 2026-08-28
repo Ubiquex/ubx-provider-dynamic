@@ -2,10 +2,12 @@ package resourcemap
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 
+	"github.com/ubiquex/ubx-provider-dynamic/internal/dsfilter"
 	uschema "github.com/ubiquex/ubx-provider-dynamic/internal/schema"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/typename"
 )
@@ -76,10 +78,46 @@ func DiscoverDataSources(doc *openapi3.T, providerName string) ([]DataSourceCand
 			notes = append(notes, Note{Path: o.path, Detail: "GET has no JSON response schema -- skipped, cannot derive a data source shape"})
 			continue
 		}
-		service, _, noun, nounNote := deriveNoun(refName, o.path)
+
+		// A real collection-listing GET's own response is usually not
+		// the item type itself but a wrapper around it (Azure's own
+		// real "TargetTypeListResult", Datadog's own real
+		// "MetricsListResponse", Kubernetes' own real "PodList") --
+		// deriveNoun, reused unchanged from resource discovery, has no
+		// reason to know that and takes the wrapper's own name
+		// verbatim, so a data source ends up named
+		// "chaos_target_type_list_result" instead of the real,
+		// meaningful "chaos_target_type". itemRefName, when found,
+		// substitutes the wrapper's own name with the real item type's
+		// -- SHAPE-based (a single array property whose items $ref a
+		// distinct named schema), not a name-suffix guess, so a real,
+		// unrelated domain type that merely ends in "List" (a security
+		// allow-list, say -- a flat array of strings, not a wrapper
+		// around another named type) is never mistakenly unwrapped.
+		nounSourceRefName := refName
+		if item, ok := collectionItemRefName(respSchema); ok {
+			nounSourceRefName = item
+		}
+
+		service, _, noun, nounNote := deriveNoun(nounSourceRefName, o.path)
 		if nounNote != "" {
 			notes = append(notes, Note{Path: o.path, Detail: nounNote})
 		}
+
+		operationName := ""
+		if o.sub != nil {
+			operationName = o.sub.OperationID
+		}
+		if reason, excluded := dsfilter.Excluded(dsfilter.Candidate{
+			Noun:             noun,
+			Path:             o.path,
+			OperationName:    operationName,
+			ResponseTypeName: refName,
+		}); excluded {
+			notes = append(notes, Note{Path: o.path, Detail: "excluded from data-source candidates: " + string(reason)})
+			continue
+		}
+
 		typeName := typename.Combine(providerName, service, noun)
 		if seenTypeNames[typeName] {
 			notes = append(notes, Note{Path: o.path, Detail: "data source type name \"" + typeName + "\" already claimed by another read-only path -- skipped rather than disambiguated"})
@@ -91,6 +129,67 @@ func DiscoverDataSources(doc *openapi3.T, providerName string) ([]DataSourceCand
 
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].TypeName < candidates[j].TypeName })
 	return candidates, notes, nil
+}
+
+// knownEnvelopeMetadataProperties are real, common pagination/metadata
+// property names a collection-envelope object carries alongside its own
+// real array-of-items property -- Azure ARM's own "nextLink", OData's
+// own "@odata.nextLink"/"@odata.count", Kubernetes' own
+// "metadata"/"kind"/"apiVersion"/"continue"/"resourceVersion", generic
+// "totalCount"/"count" pagination fields. Ignored when looking for the
+// ONE real item-array property, so their presence never prevents a
+// genuine collection wrapper from being recognized.
+var knownEnvelopeMetadataProperties = map[string]bool{
+	"nextLink":        true,
+	"@odata.nextLink": true,
+	"@odata.count":    true,
+	"metadata":        true,
+	"kind":            true,
+	"apiVersion":      true,
+	"continue":        true,
+	"resourceVersion": true,
+	"totalCount":      true,
+	"count":           true,
+	"self":            true,
+	"links":           true,
+}
+
+// collectionItemRefName reports the real item type a collection-envelope
+// response wraps, when schema is confidently shaped like one: exactly
+// one property (beyond knownEnvelopeMetadataProperties) that is an array
+// whose own items reference a distinct, named component schema. This is
+// a SHAPE test, not a name-suffix guess -- see DiscoverDataSources' own
+// call site for why that distinction matters (a real domain type that
+// merely ends in "List" -- a flat array of strings, no $ref -- never
+// matches here, so it's never mistakenly unwrapped).
+func collectionItemRefName(schema *openapi3.Schema) (string, bool) {
+	if schema == nil || len(schema.Properties) == 0 {
+		return "", false
+	}
+	var itemRef string
+	found := 0
+	for name, propRef := range schema.Properties {
+		if knownEnvelopeMetadataProperties[strings.ToLower(name)] {
+			continue
+		}
+		if propRef == nil || propRef.Value == nil {
+			continue
+		}
+		prop := propRef.Value
+		if !prop.Type.Is("array") || prop.Items == nil {
+			continue
+		}
+		ref := refString(prop.Items.Ref)
+		if ref == "" {
+			continue
+		}
+		found++
+		itemRef = ref
+	}
+	if found != 1 {
+		return "", false
+	}
+	return itemRef, true
 }
 
 // BuiltDataSource mirrors smithy.BuiltDataSource/discoverydoc.BuiltDataSource
