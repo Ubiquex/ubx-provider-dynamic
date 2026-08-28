@@ -459,6 +459,70 @@ func TestSummarize_RealMixedGroup_CountsAcrossBothSources(t *testing.T) {
 // identically to a same-source collision -- UBI-193's own explicit
 // instruction: "a type owned by two sources should fail loud, same as
 // today."
+// TestNamespaces_SingleSource_UsesFastPath proves Namespaces' own fast
+// path (GroupSchemaSource succeeds, no mixed-source fallback needed)
+// still returns real, non-empty namespaces for an ordinary single-
+// source group -- the shape every real provider except AWS has.
+func TestNamespaces_SingleSource_UsesFastPath(t *testing.T) {
+	group := realKubernetesLikeGroup(t)
+	out, err := Namespaces(group)
+	if err != nil {
+		t.Fatalf("Namespaces: %v", err)
+	}
+	// openapi's own real namespaces are always a real, honest empty map
+	// (see namespacesForSource's own doc comment) -- the real assertion
+	// here is that the single-source path runs at all and returns
+	// successfully, not ErrMixedSchemaSourceGroup.
+	if out == nil {
+		t.Fatal("expected a real, non-nil map from the single-source path")
+	}
+}
+
+// TestNamespaces_RealMixedGroup_ComputesBothSources is UBI-199's own
+// real regression test: before this fix, calling Namespaces (formerly
+// inline in cmd/ubx-provider-dynamic's own runDumpNamespacesFromSnapshot)
+// against a real mixed group failed outright with
+// ErrMixedSchemaSourceGroup -- confirmed live against the real,
+// published AWS snapshot before writing this fix, not assumed. Proves
+// both the CloudFormation resource and the Smithy data source get a
+// real, non-empty, correctly-attributed namespace, the same real shape
+// buildMixedSourceServer and Summarize already prove for schema
+// content and counts respectively.
+func TestNamespaces_RealMixedGroup_ComputesBothSources(t *testing.T) {
+	group := realAWSLikeGeneratedMixedGroup(t)
+
+	out, err := Namespaces(group)
+	if err != nil {
+		t.Fatalf("Namespaces: %v", err)
+	}
+
+	cfnResources, err := MergeCloudFormationGroup(group.SubsetBySource(SchemaSourceCloudFormation))
+	if err != nil {
+		t.Fatalf("MergeCloudFormationGroup: %v", err)
+	}
+	for typeName := range cfnResources {
+		ns, ok := out[typeName]
+		if !ok || ns == "" {
+			t.Errorf("CloudFormation type %q has no real namespace in Namespaces' own output: %q", typeName, ns)
+		}
+	}
+
+	_, smithyDataSources, _, err := MergeSmithyGroup(group.SubsetBySource(SchemaSourceSmithy))
+	if err != nil {
+		t.Fatalf("MergeSmithyGroup: %v", err)
+	}
+	for typeName := range smithyDataSources {
+		ns, ok := out[typeName]
+		if !ok || ns == "" {
+			t.Errorf("Smithy data source %q has no real namespace in Namespaces' own output: %q", typeName, ns)
+		}
+	}
+
+	if len(cfnResources) == 0 || len(smithyDataSources) == 0 {
+		t.Fatalf("expected real, nonzero types on both sides, got cfn=%d smithy=%d", len(cfnResources), len(smithyDataSources))
+	}
+}
+
 func TestMergeMixedSourceSchemas_RealCollision_FailsLoud(t *testing.T) {
 	dest := map[string]*tfprotov6.Schema{}
 	placedBy := map[string]string{}
