@@ -8,6 +8,35 @@ Launched by `ubx` exactly like any HashiCorp provider binary
 (`provider.Acquire` / `provider.Launch`, same subprocess-launch mechanism,
 same tfplugin gRPC handshake) — zero special-casing in `ubx` core.
 
+## Where this sits
+
+Launched by [ubiquex](https://github.com/Ubiquex/ubiquex) as a real
+subprocess for every provider not hand-written directly against a real
+HashiCorp binary, currently all six real providers this org maintains
+(`aws`, `azure`, `google`, `kubernetes`, `github`, `datadog`). Nothing
+depends on this repo; it is a binary `ubx` launches, not a library
+anything imports.
+
+## What it contains, top level
+
+- `cmd/ubx-provider-dynamic/`: the real binary entry point
+- `internal/dynserver/`, `internal/smithy/server/`,
+  `internal/cloudformation/server/`: the real tfplugin gRPC surfaces,
+  one per execution model (see the numbered list below for why there
+  is more than one)
+- `internal/schema/`, `internal/smithy/`, `internal/discoverydoc/`,
+  `internal/cloudformation/`: real schema translation, one package per
+  real schema source
+- `internal/resourcemap/`: OpenAPI paths and operations into CRUD
+  resources
+- `internal/auth/`: pluggable authentication
+- `internal/restexec/`, `internal/wire/`: real HTTP execution and
+  wire-format glue a Dynamic Provider needs that a real, hand-written
+  provider never does
+
+The numbered list below walks the same layout in real architectural
+depth.
+
 ## Status: Phase 5 (the conformance gate)
 
 All five UBI-158 phases now real and live-verified. Phases 1-4 built the
@@ -345,3 +374,11 @@ UBX_LIVE_VALIDATION=1 go test ./internal/dynserver/... -run TestLive -v
 - Real tests, no transport-level mocking.
 - Every claim verified against real, current source and real specs, not
   memory.
+
+<!-- README-GEN:BEGIN -->
+## Links
+
+- Docs: https://docs.ubiquex.io
+- Internals (architecture and design): https://github.com/Ubiquex/ubiquex-internals
+- Linear board: https://linear.app/ubiquex
+<!-- README-GEN:END -->
