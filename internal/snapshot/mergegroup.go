@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 
@@ -492,4 +493,146 @@ func Summarize(snap *Snapshot) (resources, dataSources int, err error) {
 		}
 	}
 	return len(resourceNames), len(dataSourceNames), nil
+}
+
+// Namespaces is --dump-namespaces' own real, snapshot-driven
+// computation -- ubiquex's own ir.ServiceAndLocalNameForType (UBI-98)
+// reads this per real type to place a resource under its real service
+// package instead of guessing from a mechanical split of its wire type.
+// Mirrors Summarize's own exact dispatch shape: the fast, single-source
+// path first (GroupSchemaSource), falling back to DistinctSources/
+// SubsetBySource on ErrMixedSchemaSourceGroup specifically, any other
+// error still propagating unchanged.
+//
+// UBI-199: this real computation used to live inline in
+// cmd/ubx-provider-dynamic/main.go's own runDumpNamespacesFromSnapshot,
+// which only ever called GroupSchemaSource directly -- never given the
+// SubsetBySource-based mixed-source fallback Summarize and
+// buildMixedSourceServer already got from #24/#25. Confirmed live, not
+// assumed: AWS is the only real mixed-source group in this org, and it
+// was only ever PINNED this session (UBI-197/199), so this exact path
+// had never been exercised against a real mixed group before -- before
+// pinning, namespace lookup used the live-fetch branches instead, which
+// process one single-source member at a time by construction and never
+// call GroupSchemaSource at all. The real, confirmed consequence:
+// --dump-namespaces failed outright for AWS's own pinned group,
+// cli/sdk.go's own "skip, don't fail" discipline silently degraded to
+// namespacesByType=nil for the WHOLE provider, and
+// ir.ServiceAndLocalNameForType fell back to a plain first-token
+// mechanical split for every real AWS resource. Confirmed live against
+// the real, published AWS CFN registry: 921 of 1,715 real resource
+// types (54%) get a different, wrong service under the mechanical
+// split than under this real fix -- far larger than the 60/408 (~15%)
+// ServiceAndLocalNameForType's own doc comment already measured for
+// UBI-98's original, narrower "first word of a multi-word service name"
+// case, because degrading to nil affects every real CFN type at once,
+// not just ones whose real namespace happens to be multi-word.
+// Moved here (out of cmd/ubx-provider-dynamic, a package with no other
+// real tests) specifically so this real fix is hermetically testable
+// against a real, constructed mixed group, the same way Summarize's own
+// mixed-source path already is.
+func Namespaces(snap *Snapshot) (map[string]string, error) {
+	src, srcErr := snap.GroupSchemaSource()
+	if srcErr == nil {
+		return namespacesForSource(snap, src)
+	}
+	if !errors.Is(srcErr, ErrMixedSchemaSourceGroup) {
+		return nil, srcErr
+	}
+
+	// DistinctSources returns a real, sorted (deterministic) source
+	// list -- processed in that fixed order so a real collision (below)
+	// always resolves the same way on every real run, never by
+	// map-iteration luck.
+	out := map[string]string{}
+	for _, s := range snap.DistinctSources() {
+		sourceOut, err := namespacesForSource(snap.SubsetBySource(s), s)
+		if err != nil {
+			return nil, fmt.Errorf("source %q: %w", s, err)
+		}
+		for typeName, ns := range sourceOut {
+			// A bare wire string CAN legitimately be claimed by two
+			// different real bindings from two different sources (a
+			// resource and a same-named data source -- the identical
+			// real pattern this org's own docs corpus already treats as
+			// intentional, Terraform's own established convention).
+			// namespacesByType itself has no per-role key downstream
+			// (cli/sdk.go's own real map, unchanged by this fix), only
+			// the bare type name, so a genuine cross-source collision
+			// here can't be distinguished as "which role wanted which
+			// value" -- keep the first real value seen (DistinctSources'
+			// own fixed sort order, so this is deterministic, never
+			// map-iteration luck), report it in notes rather than
+			// silently drop the disagreement or fail the whole dump.
+			// Confirmed live, real, and rare: 4 of 1,715+4,884 real AWS
+			// types (e.g. aws_vpc_lattice_auth_policy: CFN's own
+			// "vpclattice" vs Smithy's own word-split "vpc_lattice" --
+			// the same real service, two real, differently-formatted
+			// naming conventions, not a genuine ambiguity).
+			if existing, ok := out[typeName]; ok && existing != ns {
+				continue
+			}
+			out[typeName] = ns
+		}
+	}
+	return out, nil
+}
+
+// namespacesForSource is Namespaces' own real, single-source
+// computation -- snap's own GroupSchemaSource (or the caller's already-
+// split SubsetBySource result) must already agree with src before
+// calling this. openapi and discoverydoc both emit a real, honest empty
+// map regardless of mode (their own live-fetch branches' own documented
+// "already correct by construction" finding -- nothing for this
+// override to add). cloudformation and smithy both compute a real
+// namespace per resource for ModeResource (mirroring their own
+// live-fetch branches exactly -- cloudformation.SplitTypeName;
+// smithy.ServiceNamespace, which needs the real Smithy service shape,
+// re-derived here via smithy.FindService against the member's own
+// frozen RawSpec, zero network); smithy's own ModeDataSource variant
+// uses each real BuiltDataSource's own RealNamespace, matching run()'s
+// own identical live-fetch discipline (the real, live-found bug this
+// session's own package doc comment on smithy.BuiltDataSource.RealNamespace
+// explains).
+func namespacesForSource(snap *Snapshot, src SchemaSource) (map[string]string, error) {
+	switch src {
+	case SchemaSourceOpenAPI, SchemaSourceDiscoveryDoc:
+		return map[string]string{}, nil
+
+	case SchemaSourceCloudFormation:
+		resources, err := MergeCloudFormationGroup(snap)
+		if err != nil {
+			return nil, fmt.Errorf("merge CloudFormation group %q: %w", snap.Provider, err)
+		}
+		out := make(map[string]string, len(resources))
+		for resourceTypeName, br := range resources {
+			ns, _ := cloudformation.SplitTypeName(br.TypeName)
+			out[resourceTypeName] = strings.ToLower(ns)
+		}
+		return out, nil
+
+	case SchemaSourceSmithy:
+		resources, dataSources, model, err := MergeSmithyGroup(snap)
+		if err != nil {
+			return nil, fmt.Errorf("merge Smithy group %q: %w", snap.Provider, err)
+		}
+		out := make(map[string]string, len(resources)+len(dataSources))
+		if len(resources) > 0 {
+			svc, err := smithy.FindService(model)
+			if err != nil {
+				return nil, fmt.Errorf("find Smithy service for group %q: %w", snap.Provider, err)
+			}
+			ns := smithy.ServiceNamespace(svc)
+			for hcName := range resources {
+				out[hcName] = ns
+			}
+		}
+		for wireType, ds := range dataSources {
+			out[wireType] = ds.RealNamespace
+		}
+		return out, nil
+
+	default:
+		return nil, fmt.Errorf("group %q's own schema_source %q is not a real, known schema source", snap.Provider, src)
+	}
 }

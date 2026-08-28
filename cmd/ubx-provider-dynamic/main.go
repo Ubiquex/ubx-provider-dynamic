@@ -1229,20 +1229,12 @@ func runDumpSignalsFromSnapshot(name, snapPath string) error {
 }
 
 // runDumpNamespacesFromSnapshot is --dump-namespaces' own real,
-// snapshot-driven counterpart -- same real reasoning as
-// runDumpSignalsFromSnapshot, picking name's own member out of the group
-// container first. openapi and discoverydoc both emit a real, honest
-// empty map regardless of mode (their own live-fetch branches' own
-// documented "already correct by construction" finding -- nothing for
-// this override to add). cloudformation and smithy both compute a real
-// namespace per resource for ModeResource (mirroring their own live-fetch
-// branches exactly -- cloudformation.SplitTypeName; smithy.ServiceNamespace,
-// which needs the real Smithy service shape, re-derived here via
-// smithy.FindService against the member's own frozen RawSpec, zero
-// network); smithy's own ModeDataSource variant uses each real
-// BuiltDataSource's own RealNamespace, matching run()'s own identical
-// live-fetch discipline (the real, live-found bug this session's own
-// package doc comment on smithy.BuiltDataSource.RealNamespace explains).
+// snapshot-driven entry point -- picks name's own member out of the
+// group container, then defers the real per-source (and, for a real
+// mixed group like AWS, cross-source) computation to
+// snapshot.Namespaces, the same real function Namespaces' own doc
+// comment explains, moved there specifically so it's hermetically
+// testable (see UBI-199).
 func runDumpNamespacesFromSnapshot(name, snapPath string) error {
 	snap, err := snapshot.LoadSplit(snapPath)
 	if err != nil {
@@ -1251,51 +1243,11 @@ func runDumpNamespacesFromSnapshot(name, snapPath string) error {
 	if name != snap.Provider {
 		return fmt.Errorf("snapshot %s is for group %q, but %s is %q -- a pinned entry always serves the whole real group under its own published identity, not one internal member", snapPath, snap.Provider, nameEnvVar, name)
 	}
-	src, err := snap.GroupSchemaSource()
+	out, err := snapshot.Namespaces(snap)
 	if err != nil {
 		return fmt.Errorf("snapshot %s: %w", snapPath, err)
 	}
-
-	switch src {
-	case snapshot.SchemaSourceOpenAPI, snapshot.SchemaSourceDiscoveryDoc:
-		return json.NewEncoder(os.Stdout).Encode(map[string]string{})
-
-	case snapshot.SchemaSourceCloudFormation:
-		resources, err := snapshot.MergeCloudFormationGroup(snap)
-		if err != nil {
-			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
-		}
-		out := make(map[string]string, len(resources))
-		for resourceTypeName, br := range resources {
-			ns, _ := cloudformation.SplitTypeName(br.TypeName)
-			out[resourceTypeName] = strings.ToLower(ns)
-		}
-		return json.NewEncoder(os.Stdout).Encode(out)
-
-	case snapshot.SchemaSourceSmithy:
-		resources, dataSources, model, err := snapshot.MergeSmithyGroup(snap)
-		if err != nil {
-			return fmt.Errorf("merge group %q in snapshot %s: %w", name, snapPath, err)
-		}
-		out := make(map[string]string, len(resources)+len(dataSources))
-		if len(resources) > 0 {
-			svc, err := smithy.FindService(model)
-			if err != nil {
-				return fmt.Errorf("find Smithy service for group %q in snapshot %s: %w", name, snapPath, err)
-			}
-			ns := smithy.ServiceNamespace(svc)
-			for hcName := range resources {
-				out[hcName] = ns
-			}
-		}
-		for wireType, ds := range dataSources {
-			out[wireType] = ds.RealNamespace
-		}
-		return json.NewEncoder(os.Stdout).Encode(out)
-
-	default:
-		return fmt.Errorf("snapshot %s: group %q's own schema_source %q is not a real, known schema source", snapPath, name, src)
-	}
+	return json.NewEncoder(os.Stdout).Encode(out)
 }
 
 // groupSummary is dumpGroupSummaryFlag's own real output shape --
