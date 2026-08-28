@@ -119,11 +119,26 @@ func TestMatchesCreateVerb(t *testing.T) {
 		"enable", "disable", "moveDisk", "setIamPolicy", "approve", "reject",
 		"calculateStats", "generateSignedAudio", "wipe", "PurgeDeleted",
 		"RestrictMovement", "ListExpressionTraces", "batchGet",
+		// Real, live-found false friends (this exact batch's own real
+		// full-corpus run): "recreate" contains "create" as a bare
+		// substring, but neither of these is a real create -- both are
+		// actions on an EXISTING resource, confirmed against their own
+		// real sibling methods (monitoringPoints has no create method
+		// at all, only download/get/list; instanceGroupManagers already
+		// has its own real "insert").
+		"downloadRecreateInstallScript", "recreateInstances",
 	}
 	for _, name := range actions {
 		if MatchesCreateVerb(name) {
 			t.Errorf("MatchesCreateVerb(%q) = true, want false (real action verb, not a create)", name)
 		}
+	}
+
+	// A genuine "create" occurring alongside a "recreate" false friend in
+	// the SAME name must still match -- only the false-friend substring
+	// is stripped, not every occurrence of "create".
+	if !MatchesCreateVerb("recreateOrCreateWidget") {
+		t.Error("MatchesCreateVerb(\"recreateOrCreateWidget\") = false, want true (a real \"create\" survives alongside a stripped \"recreate\")")
 	}
 }
 
