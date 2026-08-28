@@ -69,13 +69,13 @@ type BuiltDataSource struct {
 // has the full account), which would otherwise collide at the
 // dynamic-provider-group merge layer.
 func BuildDataSources(doc *Model, providerName string, svc *Service, namespaceOverride string) (map[string]*BuiltDataSource, []string, error) {
-	candidates, err := DiscoverDataSources(doc, svc)
+	candidates, discoveryNotes, err := DiscoverDataSources(doc, svc)
 	if err != nil {
 		return nil, nil, fmt.Errorf("discover data sources: %w", err)
 	}
 
 	out := make(map[string]*BuiltDataSource, len(candidates))
-	var notes []string
+	notes := append([]string{}, discoveryNotes...)
 	for _, cand := range candidates {
 		conv := NewConverter(doc)
 		op := doc.Shapes[cand.OperationID]

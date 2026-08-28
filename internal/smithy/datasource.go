@@ -10,7 +10,12 @@
 // a path/response-schema pairing.
 package smithy
 
-import "sort"
+import (
+	"sort"
+
+	"github.com/ubiquex/ubx-provider-dynamic/internal/dsfilter"
+	uschema "github.com/ubiquex/ubx-provider-dynamic/internal/schema"
+)
 
 // DataSourceCandidate is one real, unclaimed read-shaped Smithy
 // operation -- discovery, plus the real namespace UBI-98 established
@@ -78,10 +83,10 @@ func ServiceNamespace(svc *Service) string {
 // separate data source -- the same "already accounted for" boundary
 // UBI-181's own filter rules draw for the other five providers' own skip
 // corpora.
-func DiscoverDataSources(doc *Model, svc *Service) ([]DataSourceCandidate, error) {
+func DiscoverDataSources(doc *Model, svc *Service) ([]DataSourceCandidate, []string, error) {
 	resources, _, err := Discover(doc, svc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	claimedReads := make(map[string]bool, len(resources))
 	for _, r := range resources {
@@ -98,6 +103,7 @@ func DiscoverDataSources(doc *Model, svc *Service) ([]DataSourceCandidate, error
 	sort.Strings(opNames)
 
 	var candidates []DataSourceCandidate
+	var notes []string
 	for _, name := range opNames {
 		noun, ok := stripVerb(name, readVerbs)
 		if !ok || noun == "" {
@@ -107,7 +113,21 @@ func DiscoverDataSources(doc *Model, svc *Service) ([]DataSourceCandidate, error
 		if claimedReads[full] {
 			continue
 		}
+
+		responseTypeName := ""
+		if op, ok := doc.Shapes[full]; ok && op.Output != nil {
+			responseTypeName = bareName(op.Output.Target)
+		}
+		if reason, excluded := dsfilter.Excluded(dsfilter.Candidate{
+			Noun:             uschema.ToSnakeCase(noun),
+			OperationName:    name,
+			ResponseTypeName: responseTypeName,
+		}); excluded {
+			notes = append(notes, "excluded from data-source candidates: "+full+": "+string(reason))
+			continue
+		}
+
 		candidates = append(candidates, DataSourceCandidate{Noun: noun, OperationID: full, Namespace: ServiceNamespace(svc)})
 	}
-	return candidates, nil
+	return candidates, notes, nil
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 
+	"github.com/ubiquex/ubx-provider-dynamic/internal/dsfilter"
 	uschema "github.com/ubiquex/ubx-provider-dynamic/internal/schema"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/typename"
 )
@@ -63,16 +64,30 @@ func DiscoverDataSources(doc *Document, providerName string, versionQualifier st
 				}
 				if !createFound {
 					noun := singularize(uschema.ToSnakeCase(name))
-					service := uschema.ToSnakeCase(doc.Name)
-					if versionQualifier != "" {
-						service += "_" + versionQualifier
+
+					responseTypeName := ""
+					if get.Response != nil {
+						responseTypeName = get.Response.Ref
 					}
-					typeName := typename.Combine(providerName, service, noun)
-					if seenTypeNames[typeName] {
-						notes = append(notes, Note{Path: pathStr, Detail: "data source type name \"" + typeName + "\" already claimed by another read-only path -- skipped rather than disambiguated"})
+					if reason, excluded := dsfilter.Excluded(dsfilter.Candidate{
+						Noun:             noun,
+						Path:             pathStr,
+						OperationName:    "get",
+						ResponseTypeName: responseTypeName,
+					}); excluded {
+						notes = append(notes, Note{Path: pathStr, Detail: "excluded from data-source candidates: " + string(reason)})
 					} else {
-						seenTypeNames[typeName] = true
-						candidates = append(candidates, DataSourceCandidate{TypeName: typeName, Namespace: service, ReadMethod: get})
+						service := uschema.ToSnakeCase(doc.Name)
+						if versionQualifier != "" {
+							service += "_" + versionQualifier
+						}
+						typeName := typename.Combine(providerName, service, noun)
+						if seenTypeNames[typeName] {
+							notes = append(notes, Note{Path: pathStr, Detail: "data source type name \"" + typeName + "\" already claimed by another read-only path -- skipped rather than disambiguated"})
+						} else {
+							seenTypeNames[typeName] = true
+							candidates = append(candidates, DataSourceCandidate{TypeName: typeName, Namespace: service, ReadMethod: get})
+						}
 					}
 				}
 			}
