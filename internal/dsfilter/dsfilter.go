@@ -191,3 +191,144 @@ func hasPathSegment(path, segment string) bool {
 	}
 	return false
 }
+
+// actionVerbTokens are UBI-181's own narrowest, unambiguous tokens: a
+// real, hand-classified 55-item sample (drawn from this exact corpus,
+// against the wider "any non-standard verb" candidate pool) confirmed
+// each one is used, in practice, for an action ON an existing item, not
+// a sibling collection's own separate create -- restore/undelete
+// (recreating something that existed: a real Google Backup and DR
+// `backups.restore`, GitHub's own `packages/restore-package-for-user`),
+// import/initiate* (starting a new tracked entity: a real Azure
+// `..._InitiateScan`, a real GCP `ragFiles.import`), provision (a real,
+// common infra-instantiation verb). Safe to match via SamePathAction's
+// own single-action-suffix form ("/id:restore"/"/id/restore"), not just
+// an exact path -- unlike createFamilyTokens below, none of these
+// plausibly names a genuine sibling collection's own create.
+//
+// "deploy" was in an earlier draft of this list and is deliberately NOT
+// here: a live, full-corpus check found 494 real Azure operationIds
+// containing the substring "deploy", virtually all of them the noun
+// "Deployment"/"DeploymentScripts"/"DeploymentStacks" (real ARM resource
+// families), not the verb -- zero genuine matches found anywhere in this
+// corpus, against real, confirmed false positives (GitHub's own
+// "review-pending-deployments-for-run", an approval action, not a
+// create; Datadog's own "CancelFleetDeploymentV2", explicitly a
+// cancellation). If real evidence for "deploy" as a verb ever surfaces,
+// it needs a narrower match than a bare substring (this whole corpus's
+// own "provisioningState"-style false-friend risk applies here too, not
+// just deploy -- watched for, not yet found live).
+//
+// Deliberately NOT the ticket's own original broader list: "enable" and
+// "subscribe" were both named there but are dropped here, on real
+// evidence -- the same sample found them overwhelmingly used for an
+// action on an ALREADY-modeled resource (GCP's own
+// `secrets.versions.enable`/`.disable`, `projects.enableXpnHost`/
+// `.enableXpnResource`), never a hidden create. Broadening this list
+// again needs the identical real evidence this one was built from, not
+// a guess.
+var actionVerbTokens = []string{
+	"restore", "undelete", "import", "provision", "initiate",
+}
+
+// createFamilyTokens are UBI-181's own create-shaped tokens, genuinely
+// ambiguous with a sibling collection's own create when matched via a
+// path SUFFIX -- a real, live-found case confirmed this: GitHub's own
+// real "/orgs/{org}/repos" (POST, creating a NEW repository under an
+// org) has the exact same one-extra-static-segment shape as a genuine
+// action suffix, and its own operationId ("repos/create-in-org")
+// contains "create" -- matching it against the "/orgs/{org}" read
+// candidate would misattribute repos' own create to organization,
+// exactly the wrong-resource-modeling risk this whole allowlist exists
+// to avoid, not just added noise. Callers restrict these to an EXACT
+// path match only (see findAllowlistedCreate, resourcemap.go) -- the
+// real, confirmed case this still legitimately catches is
+// `Databases_Create`, which sits on the identical path as its own GET
+// (the real ARM PUT-on-same-path convention), never a suffix. "create"
+// itself is included even though it is already the standard verb:
+// resourcemap's own findCreate never checks verb NAMING at all, only
+// response-schema or parent-collection-path match, so a real,
+// live-confirmed miss (Databases_Create's async response never
+// structurally matched its own read schema) needs the verb name itself
+// as a third, independent signal. addorupdate is GitHub's own real
+// add-or-update-shaped naming with no "create" substring at all.
+var createFamilyTokens = []string{"create", "addorupdate"}
+
+// MatchesActionVerb reports whether name (an operation name, operation
+// ID, or discoverydoc method key) matches one of actionVerbTokens --
+// safe against SamePathAction's suffix form, see that function's own
+// doc comment.
+func MatchesActionVerb(name string) bool {
+	return matchesAnyToken(name, actionVerbTokens)
+}
+
+// MatchesCreateVerb reports whether name matches actionVerbTokens OR
+// createFamilyTokens -- the full combined allowlist, safe wherever
+// SamePathAction's ambiguous suffix case cannot arise at all: GCP's own
+// discoverydoc method keys are matched by same-node key lookup, never a
+// path suffix, so createFamilyTokens' own exact-path-only restriction
+// is a non-issue there.
+func MatchesCreateVerb(name string) bool {
+	return matchesAnyToken(name, actionVerbTokens) || matchesAnyToken(name, createFamilyTokens)
+}
+
+// matchesAnyToken is the real, shared substring check both exported
+// functions above use: name (an operation name, operation ID, or
+// discoverydoc method key, from any of the three real schema sources),
+// once separators are stripped and case is normalized to a bare
+// lowercase letter run, contains one of tokens as a substring -- not a
+// prefix- or suffix-only test, so GCP's own clean, single-word method
+// keys ("restore", "initiateBackup") and OpenAPI's own compound
+// operationIds ("SqlPoolVulnerabilityAssessmentScans_InitiateScan",
+// "repos/create-or-update-file-contents") match the identical way.
+func matchesAnyToken(name string, tokens []string) bool {
+	cleaned := cleanForVerbMatch(name)
+	for _, tok := range tokens {
+		if strings.Contains(cleaned, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+func cleanForVerbMatch(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if r >= 'a' && r <= 'z' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// SamePathAction reports whether opPath is genuinely the same resource
+// as candidatePath -- either byte-identical, or candidatePath with
+// exactly one trailing static action segment appended (REST's own
+// common ":action"/"/action" convention for an operation on an existing
+// item, confirmed against this corpus's own real Azure App Service
+// spec: "/sites/{name}/backups/{backupId}" ->
+// "/sites/{name}/backups/{backupId}/restore"). Deliberately excludes
+// anything that introduces a NEW path parameter or more than one extra
+// static segment -- that shape is a genuinely separate, nested child
+// resource, not an action on candidatePath's own resource, confirmed
+// live against this exact corpus's own real misattribution case: Azure's
+// SqlPoolSensitivityLabels_CreateOrUpdate lives at
+// ".../columns/{columnName}/sensitivityLabels/{sensitivityLabelSource}"
+// -- two extra segments AND a new path parameter beyond
+// ".../columns/{columnName}" -- attributing that create operation to
+// the "column" candidate would misattribute a real, separate resource's
+// create to the wrong noun entirely, not just add noise.
+func SamePathAction(candidatePath, opPath string) bool {
+	if candidatePath == opPath {
+		return true
+	}
+	if !strings.HasPrefix(opPath, candidatePath) {
+		return false
+	}
+	suffix := strings.TrimPrefix(opPath[len(candidatePath):], ":")
+	suffix = strings.TrimPrefix(suffix, "/")
+	if suffix == "" || strings.ContainsAny(suffix, "/{") {
+		return false
+	}
+	return true
+}

@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/ubiquex/ubx-provider-dynamic/internal/dsfilter"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/typename"
 )
 
@@ -134,15 +135,25 @@ func Discover(doc *openapi3.T, providerName string) ([]Resource, []Note, error) 
 			continue
 		}
 
-		create, createOp := findCreate(ops, rc.path, refName, respSchema)
-		if create == nil {
-			notes = append(notes, Note{Path: rc.path, Detail: "no matching create (POST or PUT) operation found by response-schema or parent-collection-path match -- read-only, modeled as a data source concern, not a resource (out of Phase 1 scope)"})
-			continue
-		}
-
 		service, version, noun, nounNote := deriveNoun(refName, rc.path)
 		if nounNote != "" {
 			notes = append(notes, Note{Path: rc.path, Detail: nounNote})
+		}
+
+		create, createOp := findCreate(ops, rc.path, refName, respSchema)
+		if create == nil {
+			var excludedOpID string
+			var excludedReason dsfilter.Reason
+			create, createOp, excludedOpID, excludedReason = findAllowlistedCreate(ops, rc.path, noun, refName)
+			if create == nil {
+				if excludedOpID != "" {
+					notes = append(notes, Note{Path: rc.path, Detail: fmt.Sprintf("an alternate create-verb operation (%s) exists but is excluded by the five-rule filter (%s) -- read-only, modeled as a data source concern, not a resource", excludedOpID, excludedReason)})
+				} else {
+					notes = append(notes, Note{Path: rc.path, Detail: "no matching create (POST or PUT) operation found by response-schema, parent-collection-path, or UBI-181's narrow create-verb allowlist -- read-only, modeled as a data source concern, not a resource (out of Phase 1 scope)"})
+				}
+				continue
+			}
+			notes = append(notes, Note{Path: rc.path, Detail: fmt.Sprintf("matched via UBI-181's narrow create-verb allowlist (%s), not a standard create/insert operation", createOp.sub.OperationID)})
 		}
 		baseTypeName := typename.Combine(providerName, service, noun)
 		cands = append(cands, candidate{
@@ -388,6 +399,63 @@ func findCreate(ops []op, readPath, refName string, readSchema *openapi3.Schema)
 		}
 	}
 	return nil, nil
+}
+
+// findAllowlistedCreate is Phase 1's own third, narrowest create
+// signal, tried only after findCreate's real schema-match and parent-
+// collection-path checks both come back empty: a same-path
+// (dsfilter.SamePathAction, never a prefix/sibling match -- see its own
+// doc comment for the real misattribution this closes, found live in
+// this exact corpus: Azure's SqlPoolSensitivityLabels_CreateOrUpdate
+// lives two segments and a new path parameter below its own read
+// candidate, a genuinely separate nested resource, not an action on it)
+// POST/PUT whose own operation ID matches UBI-181's narrow create-verb
+// allowlist (dsfilter.MatchesCreateVerb), gated through the five-rule
+// filter (dsfilter.Excluded) on the candidate's own noun so a
+// genuinely non-resource pattern (a watch path, an operation-status
+// shape, ...) that happens to carry an allowlisted-sounding verb
+// nearby is never promoted.
+//
+// excludedOpID/excludedReason are set (with a nil match) when an
+// allowlisted verb was found at the right path but the noun itself was
+// excluded -- the caller surfaces this as its own real, specific Note
+// rather than the generic "no matching create" one, the same "skip,
+// don't silently drop" discipline this whole file already follows.
+func findAllowlistedCreate(ops []op, readPath, noun, refName string) (matchOp *openapi3.Operation, matched *op, excludedOpID string, excludedReason dsfilter.Reason) {
+	for i := range ops {
+		o := ops[i]
+		if o.method != "POST" && o.method != "PUT" {
+			continue
+		}
+		if o.sub == nil || o.sub.OperationID == "" {
+			continue
+		}
+		// createFamilyTokens (bare "create"/"addorupdate") are
+		// genuinely ambiguous with a sibling collection's own create
+		// when matched via a path suffix (dsfilter.MatchesCreateVerb's
+		// own doc comment has the real, live-found case this guards --
+		// GitHub's "/orgs/{org}/repos" POST, misattributed to
+		// "/orgs/{org}" otherwise) -- restricted to an exact path
+		// match. actionVerbTokens (restore/initiate/...) are safe
+		// against SamePathAction's own single-action-suffix form too.
+		switch {
+		case o.path == readPath && dsfilter.MatchesCreateVerb(o.sub.OperationID):
+		case o.path != readPath && dsfilter.SamePathAction(readPath, o.path) && dsfilter.MatchesActionVerb(o.sub.OperationID):
+		default:
+			continue
+		}
+		reason, excluded := dsfilter.Excluded(dsfilter.Candidate{
+			Noun: noun, Path: readPath, OperationName: o.sub.OperationID, ResponseTypeName: refName,
+		})
+		if excluded {
+			if excludedOpID == "" {
+				excludedOpID, excludedReason = o.sub.OperationID, reason
+			}
+			continue
+		}
+		return o.sub, &ops[i], "", ""
+	}
+	return nil, nil, excludedOpID, excludedReason
 }
 
 func parentCollectionPath(path string) string {

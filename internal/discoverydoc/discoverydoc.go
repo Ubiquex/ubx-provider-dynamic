@@ -49,6 +49,7 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 
+	"github.com/ubiquex/ubx-provider-dynamic/internal/dsfilter"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/fetchcache"
 	uschema "github.com/ubiquex/ubx-provider-dynamic/internal/schema"
 	"github.com/ubiquex/ubx-provider-dynamic/internal/typename"
@@ -249,27 +250,89 @@ func Discover(doc *Document, providerName string, versionQualifier string) ([]Re
 			pathStr := strings.Join(nodePath, ".")
 
 			if get, ok := r.Methods["get"]; ok && get != nil {
+				// Real, live-confirmed finding: a Discovery Document's
+				// own resource-tree keys are camelCase
+				// ("backendBuckets", "targetHttpProxies", ...), unlike
+				// OpenAPI's own ref names (already snake_case by the
+				// time deriveNoun sees them) -- caught only by
+				// actually generating Go code against the real,
+				// live, configured GCP Compute document (95 real
+				// resources), which rejected a raw camelCase wire
+				// name outright. uschema.ToSnakeCase is the identical
+				// real conversion internal/schema.translate.go's own
+				// ToSnakeCase already applies to every OpenAPI
+				// property name, reused here for the resource noun
+				// itself, not invented separately. Derived here, before
+				// the create check, so UBI-181's own narrow allowlist
+				// fallback below can gate on it through the five-rule
+				// filter without a second, duplicate derivation.
+				noun := singularize(uschema.ToSnakeCase(name))
+
 				create, createFound := firstMethod(r.Methods, "create", "insert")
 				if !createFound {
 					create, createFound = firstPrefixedMethod(r.Methods, "create", "insert")
 				}
+				var allowlistedVerb string
 				if !createFound {
-					notes = append(notes, Note{Path: pathStr, Detail: "no matching create (\"create\"/\"insert\", or a \"create\"/\"insert\"-prefixed method key) -- read-only, modeled as a data source concern, not a resource"})
+					// UBI-181's own narrow create-verb allowlist, tried
+					// only after the standard "create"/"insert" match
+					// fails: any OTHER real method key on this exact
+					// same resource-tree node whose name matches
+					// dsfilter.MatchesCreateVerb (restore, undelete,
+					// import, initiate*, ...). Safe to use the full
+					// combined allowlist (including the create-family
+					// tokens resourcemap.go restricts to an exact path
+					// match) -- a Discovery Document's own method keys
+					// are always same-node, same-resource by construction,
+					// never a sibling collection's own separate path, so
+					// the misattribution risk that restriction guards
+					// against there cannot arise here.
+					methodKeys := make([]string, 0, len(r.Methods))
+					for key := range r.Methods {
+						methodKeys = append(methodKeys, key)
+					}
+					sort.Strings(methodKeys)
+					for _, key := range methodKeys {
+						if key == "get" || key == "list" || key == "patch" || key == "update" || key == "delete" {
+							continue
+						}
+						if !dsfilter.MatchesCreateVerb(key) {
+							continue
+						}
+						// respType is the CANDIDATE's own read shape (get's
+						// response), never the matched alt-verb method's
+						// own response -- a real, found-in-review bug
+						// fixed here before it ever shipped: restore/
+						// initiateBackup-shaped operations routinely
+						// return an "Operation" (LRO) object, which is
+						// completely normal and says nothing about
+						// whether the CANDIDATE ITSELF is an
+						// operation-status resource, but isOperationStatus
+						// checks ResponseTypeName for exactly that
+						// substring -- passing the alt-verb method's own
+						// response there would exclude every real
+						// LRO-backed restore, the single most common
+						// shape this allowlist exists to catch.
+						respType := ""
+						if get.Response != nil {
+							respType = get.Response.Ref
+						}
+						if reason, excluded := dsfilter.Excluded(dsfilter.Candidate{
+							Noun: noun, Path: pathStr, OperationName: key, ResponseTypeName: respType,
+						}); excluded {
+							notes = append(notes, Note{Path: pathStr, Detail: fmt.Sprintf("an alternate create-verb method (%q) exists but is excluded by the five-rule filter (%s) -- read-only, modeled as a data source concern, not a resource", key, reason)})
+							continue
+						}
+						create, createFound, allowlistedVerb = r.Methods[key], true, key
+						break
+					}
+				}
+				if !createFound {
+					notes = append(notes, Note{Path: pathStr, Detail: "no matching create (\"create\"/\"insert\", a \"create\"/\"insert\"-prefixed method key, or UBI-181's narrow create-verb allowlist) -- read-only, modeled as a data source concern, not a resource"})
 				} else {
-					// Real, live-confirmed finding: a Discovery Document's
-					// own resource-tree keys are camelCase
-					// ("backendBuckets", "targetHttpProxies", ...), unlike
-					// OpenAPI's own ref names (already snake_case by the
-					// time deriveNoun sees them) -- caught only by
-					// actually generating Go code against the real,
-					// live, configured GCP Compute document (95 real
-					// resources), which rejected a raw camelCase wire
-					// name outright. uschema.ToSnakeCase is the identical
-					// real conversion internal/schema.translate.go's own
-					// ToSnakeCase already applies to every OpenAPI
-					// property name, reused here for the resource noun
-					// itself, not invented separately.
-					noun := singularize(uschema.ToSnakeCase(name))
+					if allowlistedVerb != "" {
+						notes = append(notes, Note{Path: pathStr, Detail: fmt.Sprintf("matched via UBI-181's narrow create-verb allowlist (%q), not a standard create/insert method", allowlistedVerb)})
+					}
 					// UBI-180: doc.Name -- the Discovery Document's own
 					// top-level API name field -- gets the identical
 					// ToSnakeCase treatment as the resource noun above,
