@@ -59,3 +59,13 @@ commits — see that repo's own `CLAUDE.md` for the generation side.
 
 - `ubiquex`'s own `docs/architecture.md`/`docs/schema.md` — how this binary's
   output (a served/frozen schema) fits the wider proposal-ledger model.
+
+## Architecture documentation
+
+A change here that's architectural — a new schema source, a change to
+the mixed-source dispatch layer, a change to namespace/naming
+computation, a new snapshot mechanism, a change to what a snapshot
+records — gets its `ubiquex-internals` page (the developer
+documentation site) written or updated in the SAME PR, never a
+follow-up. A bug fix inside an already-documented mechanism doesn't
+qualify. Matches `ubiquex` CLAUDE.md rule 10.
