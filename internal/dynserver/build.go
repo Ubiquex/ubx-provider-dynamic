@@ -227,9 +227,27 @@ func ensurePathParamsPresent(attrs *[]*tfprotov6.SchemaAttribute, pathParams []s
 			if existing.Type != nil && (existing.Type.Is(tftypes.String) || existing.Type.Is(tftypes.Number)) {
 				continue
 			}
+			// UBI-206: a trailing "_" (this loop's own original collision
+			// suffix) is real, live-found unsafe here -- ubiquex's own
+			// codegen (sdk/codegen/templates/go/go.go's splitWireName)
+			// deliberately tolerates and DROPS a trailing/doubled
+			// underscore ("to tolerate a leading/trailing/doubled
+			// underscore rather than hard-failing on it"), so "owner_path"
+			// and "owner_path_" both PascalCase to the identical Go
+			// identifier "OwnerPath" -- two real, distinct wire attribute
+			// names silently collapsing into one redeclared Go struct
+			// field, confirmed live: GitHub's own real
+			// teams/add-or-update-repo-permissions-in-org (Create and Read
+			// sharing one path, both needing "owner" renamed) is the first
+			// real resource ever shaped this way. A numeric suffix
+			// survives every real wire-name splitter this project has
+			// (splitWireName keeps embedded digits as part of the
+			// preceding segment, never treats them as their own token),
+			// so "owner_path2" stays genuinely distinct from "owner_path"
+			// after PascalCase, not just at the wire-name string level.
 			newName := p + "_path"
-			for have[newName] != nil {
-				newName += "_"
+			for n := 2; have[newName] != nil; n++ {
+				newName = fmt.Sprintf("%s_path%d", p, n)
 			}
 			synthetic := &tfprotov6.SchemaAttribute{
 				Name:     newName,
