@@ -219,6 +219,13 @@ type MemberSnapshot struct {
 	TargetPrefix        string `json:"target_prefix,omitempty"`
 	DataSourceNamespace string `json:"data_source_namespace,omitempty"`
 
+	// NamespaceFromTags carries config.Provider.NamespaceFromTags
+	// through to the frozen artifact -- see that field's own doc
+	// comment (UBI-222). namespacesForSource (mergegroup.go) reads this
+	// per member, not a live config table, since a pinned resolution has
+	// no live [dynamic_providers.<name>] table left to consult.
+	NamespaceFromTags bool `json:"namespace_from_tags,omitempty"`
+
 	// RawSpec is the real, verbatim, already-fetched provider spec this
 	// member was generated from (SchemaSource says which real format).
 	// See the package doc comment (prior, single-member version) for why

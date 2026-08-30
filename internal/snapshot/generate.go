@@ -203,15 +203,16 @@ func GenerateOpenAPIMember(name, wireName, schemaURL string, mode Mode, execCfg 
 	}
 
 	member := &MemberSnapshot{
-		SchemaSource: SchemaSourceOpenAPI,
-		Mode:         mode,
-		Auth:         execCfg.Auth,
-		BaseURL:      execCfg.BaseURL,
-		Retry:        execCfg.Retry,
-		Timeouts:     execCfg.Timeouts,
-		Resources:    execCfg.Resources,
-		WireName:     wireName,
-		RawSpec:      rawSpec,
+		SchemaSource:      SchemaSourceOpenAPI,
+		Mode:              mode,
+		Auth:              execCfg.Auth,
+		BaseURL:           execCfg.BaseURL,
+		Retry:             execCfg.Retry,
+		Timeouts:          execCfg.Timeouts,
+		Resources:         execCfg.Resources,
+		WireName:          wireName,
+		NamespaceFromTags: execCfg.NamespaceFromTags,
+		RawSpec:           rawSpec,
 	}
 
 	var oldSchemas map[string]*tfprotov6.Schema

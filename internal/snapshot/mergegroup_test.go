@@ -469,12 +469,73 @@ func TestNamespaces_SingleSource_UsesFastPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Namespaces: %v", err)
 	}
-	// openapi's own real namespaces are always a real, honest empty map
-	// (see namespacesForSource's own doc comment) -- the real assertion
-	// here is that the single-source path runs at all and returns
-	// successfully, not ErrMixedSchemaSourceGroup.
+	// realKubernetesLikeGroup's own members never set
+	// NamespaceFromTags, so openapi's real namespaces stay a real,
+	// honest empty map here (UBI-222's own namespacesFromTags,
+	// unopted-in) -- the real assertion is that the single-source path
+	// runs at all and returns successfully, not ErrMixedSchemaSourceGroup.
 	if out == nil {
 		t.Fatal("expected a real, non-nil map from the single-source path")
+	}
+	if len(out) != 0 {
+		t.Errorf("expected an empty map (NamespaceFromTags unset on every member), got %v", out)
+	}
+}
+
+// TestNamespacesForSource_OpenAPI_TagsOptIn is UBI-222's own real, direct
+// proof: a member with NamespaceFromTags set derives a real namespace
+// from its own operations' first real OpenAPI Tag -- for both a
+// resource (ReadOperation.Tags) and a data source (Operation.Tags) --
+// where before this existed namespacesForSource returned a real, honest
+// empty map for every openapi-sourced member unconditionally.
+func TestNamespacesForSource_OpenAPI_TagsOptIn(t *testing.T) {
+	execCfg := config.Provider{BaseURL: "https://api.widgetco.example", NamespaceFromTags: true}
+	resourceMember, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecWithTags), ModeResource, execCfg, nil)
+	if err != nil {
+		t.Fatalf("generate resource member: %v", err)
+	}
+	dsMember, _, _, err := GenerateOpenAPIMember("widgetco_ds", "widgetco", serveSpec(t, widgetSpecWithTags), ModeDataSource, execCfg, nil)
+	if err != nil {
+		t.Fatalf("generate data-source member: %v", err)
+	}
+	group, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": resourceMember, "widgetco_ds": dsMember}, map[string]ChangeLevel{"widgetco": Minor, "widgetco_ds": Minor}, nil)
+	if err != nil {
+		t.Fatalf("AssembleGroup: %v", err)
+	}
+
+	out, err := Namespaces(group)
+	if err != nil {
+		t.Fatalf("Namespaces: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("expected exactly 2 real namespace entries (one resource, one data source), got %d: %v", len(out), out)
+	}
+	values := map[string]bool{}
+	for _, ns := range out {
+		values[ns] = true
+	}
+	if !values["widgetstorage"] {
+		t.Errorf(`expected a real entry with namespace "widgetstorage" (from the resource's own "Widget Storage" tag), got %v`, out)
+	}
+	if !values["reports"] {
+		t.Errorf(`expected a real entry with namespace "reports" (from the data source's own "Reports" tag), got %v`, out)
+	}
+}
+
+// TestTagToNamespace proves the real normalization tagToNamespace
+// applies to a raw OpenAPI Tag name -- lowercased, separator-free --
+// against real, representative DigitalOcean tag names (UBI-222).
+func TestTagToNamespace(t *testing.T) {
+	cases := map[string]string{
+		"BYOIP Prefixes":       "byoipprefixes",
+		"1-Click Applications": "1clickapplications",
+		"Block Storage":        "blockstorage",
+		"Container Registry":   "containerregistry",
+	}
+	for tag, want := range cases {
+		if got := tagToNamespace(tag); got != want {
+			t.Errorf("tagToNamespace(%q) = %q, want %q", tag, got, want)
+		}
 	}
 }
 
