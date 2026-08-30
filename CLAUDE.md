@@ -29,8 +29,17 @@ commits — see that repo's own `CLAUDE.md` for the generation side.
 
 ## Git rules (strict)
 
-- PR-only. Never self-merge — push a branch, open a PR, wait for the founder
-  to review and merge, per this repo's own checkpoint-branch incident.
+- PR-only. Never self-merge a PR whose diff has content to judge --
+  schema changes, generated output, description or page content,
+  anything that changes what ships. Push a branch, open a PR, wait for
+  the founder to review and merge, per this repo's own checkpoint-branch incident.
+- Self-merge is allowed only when a PR is purely mechanical: the
+  identical file copied verbatim across repos (confirmed byte-for-byte
+  before merging), a branch rebase or merge-in with no new content, or
+  a version bump with no content change. A diff that mixes a
+  mechanical change with anything else, even one line, needs review
+  as a whole. When it is unclear which category a PR falls into, it
+  needs review.
 - Before pushing more commits to a branch with an open PR, confirm it is
   STILL open (`gh pr list --state open` or `gh pr view <n>`) — a merged PR's
   branch looks identical to any other from `git status` alone, and a push
