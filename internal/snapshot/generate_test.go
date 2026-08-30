@@ -121,6 +121,38 @@ const widgetSpecWithTags = `{
   }}
 }`
 
+// widgetSpecWithTagCollision reproduces UBI-222's own real, live-found
+// DigitalOcean collision: a real resource and a real, genuinely
+// unrelated data source that happen to derive the identical bare wire
+// type name (both real GET operations respond with the SAME $ref
+// component schema, "Widget" -- deriveNoun's own real behavior when a
+// response IS a $ref uses the ref name alone, ignoring the path, so two
+// operations sharing a response ref always collide on noun regardless
+// of how different their own real paths/tags are). Each carries its own
+// distinct real tag so a test can tell which one namespacesFromTags
+// actually kept.
+const widgetSpecWithTagCollision = `{
+  "openapi": "3.0.0",
+  "info": {"title": "widgetco", "version": "1"},
+  "paths": {
+    "/widgets/{id}": {
+      "get": {"operationId": "getWidget", "tags": ["Widget Storage"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "ok", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Widget"}}}}}}
+    },
+    "/widgets": {
+      "post": {"operationId": "createWidget",
+        "requestBody": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/Widget"}}}},
+        "responses": {"201": {"description": "created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Widget"}}}}}}
+    },
+    "/widget-alias": {
+      "get": {"operationId": "listWidgetAlias", "tags": ["Widget Aliases"],
+        "responses": {"200": {"description": "ok", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Widget"}}}}}}
+    }
+  },
+  "components": {"schemas": {"Widget": {"type": "object", "required": ["name"],
+    "properties": {"id": {"type": "string", "readOnly": true}, "name": {"type": "string"}}}}}
+}`
+
 func serveSpec(t *testing.T, body string) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
