@@ -315,6 +315,39 @@ type Provider struct {
 	// it outright for any other schema_source, the same way data_sources
 	// is refused for cloudformation.
 	RedoclyBundle bool `toml:"redocly_bundle"`
+
+	// NamespaceFromTags derives this entry's own real per-resource
+	// namespace from its spec's own OpenAPI Tag Objects (each
+	// operation's own first real tag), instead of the plain empty map
+	// namespacesForSource (internal/snapshot/mergegroup.go) has always
+	// returned for every openapi-sourced provider.
+	//
+	// UBI-222: DigitalOcean's real service/namespace grouping is
+	// mechanically broken without this -- ir.ServiceAndLocalNameForType
+	// (ubiquex) falls back to a plain first-token mechanical split of
+	// the wire type when no real namespace is supplied, which fragments
+	// DigitalOcean's real ~195 resource/data-source types into roughly
+	// 55 near-single-resource "services" (e.g. digitalocean_droplet and
+	// digitalocean_droplet_backup landing in two different fabricated
+	// packages). DigitalOcean's own real, public spec carries clean,
+	// usable operation tags that already match its real product
+	// taxonomy ("Databases", "Block Storage", "BYOIP Prefixes", ...) --
+	// this flag is what makes namespacesForSource actually read them.
+	//
+	// Deliberately opt-in per entry, the same real reasoning
+	// RedoclyBundle already establishes just above: a genuine, permanent
+	// property of how THIS provider's own spec is tagged, diagnosed
+	// once, never guessed or attempted automatically for every
+	// openapi-sourced provider regardless of whether its own tags are
+	// usable. Kubernetes/GitHub/Datadog/Azure -- the four openapi-sourced
+	// providers already published before this flag existed -- never set
+	// it, so namespacesForSource's own prior, empty-map return for their
+	// four real entries is completely unchanged; this flag adds a new
+	// path, it does not alter the existing one.
+	//
+	// Only meaningful for schema_source = "openapi"; validate() refuses
+	// it outright for any other schema_source, mirroring RedoclyBundle.
+	NamespaceFromTags bool `toml:"namespace_from_tags"`
 }
 
 func (p Provider) validate() error {
@@ -340,6 +373,9 @@ func (p Provider) validate() error {
 	}
 	if p.RedoclyBundle && p.SchemaSource != SchemaSourceOpenAPI {
 		return fmt.Errorf("dynamic_providers.%s: redocly_bundle = true is not valid when schema_source is %q -- only a real openapi source can need Redocly's own bundler", p.Name, p.SchemaSource)
+	}
+	if p.NamespaceFromTags && p.SchemaSource != SchemaSourceOpenAPI {
+		return fmt.Errorf("dynamic_providers.%s: namespace_from_tags = true is not valid when schema_source is %q -- only a real openapi source carries OpenAPI Tag Objects to derive a namespace from", p.Name, p.SchemaSource)
 	}
 	if p.BaseURL == "" {
 		return fmt.Errorf("dynamic_providers.%s: base_url is required", p.Name)

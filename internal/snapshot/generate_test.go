@@ -89,6 +89,38 @@ const widgetSpecV3RemovesRequiredField = `{
     "properties": {"id": {"type": "string", "readOnly": true}}}}}
 }`
 
+// widgetSpecWithTags mirrors widgetSpecV1 exactly, adding one real
+// OpenAPI Tag per operation -- UBI-222's own fixture for
+// namespace_from_tags, mirroring DigitalOcean's real shape (a resource's
+// own ReadOperation carries a tag; a data source's own unclaimed GET
+// carries a different one) closely enough to prove the real dispatch,
+// without needing DigitalOcean's own real, much larger spec.
+const widgetSpecWithTags = `{
+  "openapi": "3.0.0",
+  "info": {"title": "widgetco", "version": "1"},
+  "paths": {
+    "/widgets/{id}": {
+      "get": {"operationId": "getWidget", "tags": ["Widget Storage"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "ok", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Widget"}}}}}}
+    },
+    "/widgets": {
+      "post": {"operationId": "createWidget",
+        "requestBody": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/Widget"}}}},
+        "responses": {"201": {"description": "created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Widget"}}}}}}
+    },
+    "/widget-summary": {
+      "get": {"operationId": "listWidgetSummary", "tags": ["Reports"],
+        "responses": {"200": {"description": "ok", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/WidgetSummary"}}}}}}
+    }
+  },
+  "components": {"schemas": {
+    "Widget": {"type": "object", "required": ["name"],
+      "properties": {"id": {"type": "string", "readOnly": true}, "name": {"type": "string"}}},
+    "WidgetSummary": {"type": "object",
+      "properties": {"total": {"type": "integer"}}}
+  }}
+}`
+
 func serveSpec(t *testing.T, body string) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

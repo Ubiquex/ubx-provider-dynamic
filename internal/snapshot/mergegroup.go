@@ -596,7 +596,10 @@ func Namespaces(snap *Snapshot) (map[string]string, error) {
 // explains).
 func namespacesForSource(snap *Snapshot, src SchemaSource) (map[string]string, error) {
 	switch src {
-	case SchemaSourceOpenAPI, SchemaSourceDiscoveryDoc:
+	case SchemaSourceOpenAPI:
+		return namespacesFromTags(snap)
+
+	case SchemaSourceDiscoveryDoc:
 		return map[string]string{}, nil
 
 	case SchemaSourceCloudFormation:
@@ -635,4 +638,89 @@ func namespacesForSource(snap *Snapshot, src SchemaSource) (map[string]string, e
 	default:
 		return nil, fmt.Errorf("group %q's own schema_source %q is not a real, known schema source", snap.Provider, src)
 	}
+}
+
+// namespacesFromTags is namespacesForSource's own real openapi
+// computation (UBI-222). Deliberately per-member, not per-group: only a
+// member whose own config.Provider.NamespaceFromTags was set at
+// generation time (MemberSnapshot.NamespaceFromTags, stamped by
+// GenerateOpenAPIMember) contributes a real entry here -- a member that
+// never set it contributes nothing, the exact same real, empty
+// contribution namespacesForSource's prior, unconditional
+// map[string]string{} already gave every openapi-sourced member before
+// this existed. Kubernetes/GitHub/Datadog/Azure never set the flag, so
+// their own real output is byte-identical to before this function
+// existed (see mergegroup_test.go's own direct proof).
+//
+// Reads each real type's own first OpenAPI Tag (ReadOperation.Tags for
+// a resource, Operation.Tags for a data source) rather than reusing
+// resourcemap.Resource/DataSourceCandidate's own path-derived Namespace
+// field -- that field is the SAME mechanical first-path-segment split
+// this whole fix exists to route around, not an independent signal.
+// A real operation with no tags at all contributes no entry (falls back
+// to ir.ServiceAndLocalNameForType's own plain mechanical split, the
+// same real degradation an unset RealNamespace already produces for
+// every other source) rather than guessing.
+func namespacesFromTags(snap *Snapshot) (map[string]string, error) {
+	out := map[string]string{}
+
+	for _, name := range snap.MemberNamesByMode(ModeResource) {
+		member := snap.Members[name]
+		if !member.NamespaceFromTags {
+			continue
+		}
+		resources, _, err := LoadOpenAPIMember(name, member)
+		if err != nil {
+			return nil, fmt.Errorf("member %q: %w", name, err)
+		}
+		for typeName, r := range resources {
+			if r.ReadOperation == nil || len(r.ReadOperation.Tags) == 0 {
+				continue
+			}
+			out[typeName] = tagToNamespace(r.ReadOperation.Tags[0])
+		}
+	}
+
+	for _, name := range snap.MemberNamesByMode(ModeDataSource) {
+		member := snap.Members[name]
+		if !member.NamespaceFromTags {
+			continue
+		}
+		_, dataSources, err := LoadOpenAPIMember(name, member)
+		if err != nil {
+			return nil, fmt.Errorf("member %q: %w", name, err)
+		}
+		for typeName, ds := range dataSources {
+			if ds.Operation == nil || len(ds.Operation.Tags) == 0 {
+				continue
+			}
+			out[typeName] = tagToNamespace(ds.Operation.Tags[0])
+		}
+	}
+
+	return out, nil
+}
+
+// tagToNamespace normalizes one real OpenAPI Tag Object's own name
+// ("BYOIP Prefixes", "1-Click Applications") into a namespace string
+// shaped the same way every other real source's own namespace already
+// is (CloudFormation's SplitTypeName, Smithy's ServiceNamespace): a
+// bare, lowercase, separator-free slug -- ir.ServiceAndLocalNameForType
+// (ubiquex) matches this, lowercased, against consecutive concatenated
+// wire-type tokens to decide how much of a resource's own local name is
+// redundant with its namespace; a tag that doesn't line up token-for-
+// token with the wire type it labels (real and common -- a human tag
+// phrase has no obligation to match a mechanically-derived wire name)
+// simply fails that match and falls back to the full wire-type
+// remainder as the local name, exactly the same real, safe degradation
+// CloudFormation's own namespace already has whenever ITS split doesn't
+// line up either -- never a hard failure either way.
+func tagToNamespace(tag string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(tag) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
