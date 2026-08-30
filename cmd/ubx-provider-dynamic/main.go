@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6/tf6server"
 
@@ -678,7 +679,12 @@ func run() error {
 		})
 	}
 
-	doc, err := openapi.Load(cfg.SchemaURL)
+	var doc *openapi3.T
+	if cfg.RedoclyBundle {
+		doc, err = openapi.LoadWithRedoclyBundle(cfg.SchemaURL, cfg.Name)
+	} else {
+		doc, err = openapi.Load(cfg.SchemaURL)
+	}
 	if err != nil {
 		return fmt.Errorf("load OpenAPI spec: %w", err)
 	}

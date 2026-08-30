@@ -164,6 +164,39 @@ data_sources = true
 	}
 }
 
+func TestLoadNamed_RedoclyBundle(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[dynamic_providers.digitalocean]
+schema_source = "openapi"
+schema_url = "https://raw.githubusercontent.com/digitalocean/openapi/main/specification/DigitalOcean-public.v2.yaml"
+base_url = "https://api.digitalocean.com"
+redocly_bundle = true
+`)
+	p, err := LoadNamed(dir, "digitalocean")
+	if err != nil {
+		t.Fatalf("LoadNamed: %v", err)
+	}
+	if !p.RedoclyBundle {
+		t.Fatal("expected RedoclyBundle = true")
+	}
+}
+
+func TestLoadNamed_RedoclyBundleTrue_NonOpenAPISource_RealFailLoud(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[dynamic_providers.kubernetes]
+schema_source = "discovery_docs"
+schema_url = "https://raw.githubusercontent.com/kubernetes/kubernetes/release-1.37/api/openapi-spec/swagger.json"
+base_url = "https://kubernetes.example.invalid"
+redocly_bundle = true
+`)
+	_, err := LoadNamed(dir, "kubernetes")
+	if err == nil {
+		t.Fatal("expected a real validation error: redocly_bundle is only meaningful for schema_source = openapi, must fail loud at config-load time, not be silently ignored")
+	}
+}
+
 func TestLoadNamed_NoConfigFile(t *testing.T) {
 	dir := t.TempDir()
 	_, err := LoadNamed(dir, "github")

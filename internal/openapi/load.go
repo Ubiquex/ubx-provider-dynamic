@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -68,7 +69,35 @@ type versionProbe struct {
 // honest about real-world OpenAPI, not more, so parsing and $ref resolution
 // succeeding is the real bar, not full spec-conformance validation.
 func Load(source string) (*openapi3.T, error) {
-	raw, err := fetch(source)
+	return load(source, "", false)
+}
+
+// LoadWithRedoclyBundle is Load's own real counterpart for a provider
+// whose [dynamic_providers.<name>] table sets redocly_bundle = true
+// (config.Provider.RedoclyBundle's own doc comment has the full real
+// reason, UBI-217). Runs source through the real, already-correct
+// `npx @redocly/cli bundle` first, resolving Redocly-only $ref
+// conventions real OpenAPI 3.0 does not define before kin-openapi's own
+// Load ever sees the bytes.
+//
+// providerName is used only to name the exact [dynamic_providers.<name>]
+// entry in the error this produces if npx is not found in PATH, so
+// someone hitting it locally (Node.js is not guaranteed present the way
+// a CI runner image guarantees it) knows immediately why Node is needed
+// and which config entry asked for it, rather than a bare "npx: command
+// not found" with no link back to the real cause.
+func LoadWithRedoclyBundle(source, providerName string) (*openapi3.T, error) {
+	return load(source, providerName, true)
+}
+
+func load(source, providerName string, redoclyBundle bool) (*openapi3.T, error) {
+	var raw []byte
+	var err error
+	if redoclyBundle {
+		raw, err = bundleViaRedocly(source, providerName)
+	} else {
+		raw, err = fetch(source)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("load OpenAPI spec from %s: %w", source, err)
 	}
@@ -77,6 +106,51 @@ func Load(source string) (*openapi3.T, error) {
 		return nil, fmt.Errorf("load OpenAPI spec from %s: %w", source, err)
 	}
 	return doc, nil
+}
+
+// bundleViaRedocly shells out to the real, already-correct
+// `npx @redocly/cli bundle` rather than reimplementing a bundler in Go
+// (UBI-217's own real finding: path rewriting during content hoisting is
+// exactly what makes a bundler non-trivial, and a partial Go
+// reimplementation risks silently mishandling a real relative $ref a
+// substituted file itself contains). Passes source straight through
+// (an http(s) URL or local file path, the identical two real shapes
+// Load itself accepts) -- Redocly's own bundler does its own fetching
+// for a URL, so this package's own fetch() is never called for a
+// bundled source at all.
+//
+// Bundles to JSON explicitly (--ext json), not source's own original
+// format, so the result is always valid JSON -- Parse's own json.Valid
+// check then skips oasdiff/yaml entirely for it, the identical fast
+// path a genuinely JSON source already takes (UBI-217's own Linode fix).
+func bundleViaRedocly(source, providerName string) ([]byte, error) {
+	npx, err := exec.LookPath("npx")
+	if err != nil {
+		return nil, fmt.Errorf(
+			"dynamic_providers.%s sets redocly_bundle = true (its own real, published spec needs Redocly's bundler to resolve non-standard $ref conventions kin-openapi cannot follow), but \"npx\" was not found in PATH -- install Node.js (https://nodejs.org) to onboard or regenerate this provider",
+			providerName,
+		)
+	}
+
+	tmp, err := os.CreateTemp("", "ubx-redocly-bundle-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("bundle %s via @redocly/cli: create temp file: %w", source, err)
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	cmd := exec.Command(npx, "--yes", "@redocly/cli", "bundle", source, "--output", tmpPath, "--ext", "json")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("bundle %s via @redocly/cli: %w: %s", source, err, output)
+	}
+
+	bundled, err := os.ReadFile(tmpPath)
+	if err != nil {
+		return nil, fmt.Errorf("bundle %s via @redocly/cli: read bundled output: %w", source, err)
+	}
+	return bundled, nil
 }
 
 // location derives Parse's own loc argument from source (an http(s) URL or
