@@ -1,0 +1,47 @@
+name: stale-base-check
+
+# UBI-222: real, mechanical guard for TRAPS.md's own "a stacked PR is
+# only safe while its base is unmerged" trap -- documented, still fired
+# five times in one real day (ubx-provider-dynamic#42 the most recent,
+# confirmed real: at the moment it merged, git merge-base --is-ancestor
+# against its own real base branch tip and main's own real tip at that
+# exact moment returned true, and nothing in GitHub's own UI showed any
+# warning). Converts a silent, mechanically-valid-but-semantically-
+# pointless merge into a loud, blocking, visible one -- documentation
+# alone cannot catch this, since the git mechanics succeed cleanly with
+# zero external signal at the one moment (clicking merge) the trap
+# actually fires.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  stale-base-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Confirm this PR's own base branch has not already been merged into the default branch
+        run: |
+          set -euo pipefail
+          base_ref="${{ github.event.pull_request.base.ref }}"
+          default_branch="${{ github.event.repository.default_branch }}"
+          if [ "$base_ref" = "$default_branch" ]; then
+            echo "base is the default branch itself -- nothing to check"
+            exit 0
+          fi
+          git fetch origin "$base_ref" "$default_branch"
+          base_sha="$(git rev-parse "origin/$base_ref")"
+          default_sha="$(git rev-parse "origin/$default_branch")"
+          if git merge-base --is-ancestor "$base_sha" "$default_sha"; then
+            echo "::error::This PR's own base branch ('$base_ref') has already been merged into '$default_branch'. Merging this PR will land nowhere near '$default_branch', silently. Retarget this PR's base (gh pr edit <n> --base $default_branch) or close it and reopen from a fresh, unmerged branch."
+            exit 1
+          fi
+          echo "base branch ('$base_ref') is not yet merged into '$default_branch' -- a real stack, safe to proceed."
