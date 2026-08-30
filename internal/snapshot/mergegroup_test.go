@@ -522,6 +522,45 @@ func TestNamespacesForSource_OpenAPI_TagsOptIn(t *testing.T) {
 	}
 }
 
+// TestNamespacesForSource_OpenAPI_BareNameCollision_ResourceWinsDeterministically
+// is UBI-222's own real regression test for a real, live bug: the first
+// version of namespacesFromTags assigned both loops' own contributions
+// via unsorted Go map iteration, so a real bare-name collision between a
+// resource and an unrelated data source (DigitalOcean's own real
+// digitalocean_droplet: a real Droplet resource AND a real, different
+// Droplet Autoscale Pools data source both derive that identical bare
+// type name) resolved to whichever one Go's own randomized map order
+// happened to visit last -- a real violation of this project's own
+// determinism rule (CLAUDE.md), caught only by running the fix against
+// DigitalOcean's own real spec, not by any test at the time. Runs the
+// real fix repeatedly to prove the sorted, first-wins resolution is
+// actually deterministic, not merely correct on one lucky run.
+func TestNamespacesForSource_OpenAPI_BareNameCollision_ResourceWinsDeterministically(t *testing.T) {
+	execCfg := config.Provider{BaseURL: "https://api.widgetco.example", NamespaceFromTags: true}
+	resourceMember, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecWithTagCollision), ModeResource, execCfg, nil)
+	if err != nil {
+		t.Fatalf("generate resource member: %v", err)
+	}
+	dsMember, _, _, err := GenerateOpenAPIMember("widgetco_ds", "widgetco", serveSpec(t, widgetSpecWithTagCollision), ModeDataSource, execCfg, nil)
+	if err != nil {
+		t.Fatalf("generate data-source member: %v", err)
+	}
+	group, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": resourceMember, "widgetco_ds": dsMember}, map[string]ChangeLevel{"widgetco": Minor, "widgetco_ds": Minor}, nil)
+	if err != nil {
+		t.Fatalf("AssembleGroup: %v", err)
+	}
+
+	for i := 0; i < 20; i++ {
+		out, err := Namespaces(group)
+		if err != nil {
+			t.Fatalf("Namespaces (run %d): %v", i, err)
+		}
+		if got, want := out["widgetco_widget"], "widgetstorage"; got != want {
+			t.Fatalf("run %d: widgetco_widget namespace = %q, want %q (the resource's own tag -- the colliding data source's own \"Widget Aliases\" tag must never win)", i, got, want)
+		}
+	}
+}
+
 // TestTagToNamespace proves the real normalization tagToNamespace
 // applies to a raw OpenAPI Tag name -- lowercased, separator-free --
 // against real, representative DigitalOcean tag names (UBI-222).

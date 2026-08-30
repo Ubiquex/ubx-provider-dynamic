@@ -661,6 +661,20 @@ func namespacesForSource(snap *Snapshot, src SchemaSource) (map[string]string, e
 // to ir.ServiceAndLocalNameForType's own plain mechanical split, the
 // same real degradation an unset RealNamespace already produces for
 // every other source) rather than guessing.
+//
+// Both loops below walk their own real type-name set in sorted order,
+// and never overwrite an entry already placed in out -- CLAUDE.md's own
+// determinism rule (no map-iteration ordering feeding a real, committed
+// result) plus Namespaces' own identical precedent just above ("keep
+// the first real value seen... deterministic, never map-iteration
+// luck") for the real, confirmed case a bare wire type name is shared
+// by two genuinely different real bindings. Confirmed live and real for
+// DigitalOcean specifically, not hypothetical: digitalocean_droplet is
+// both a real resource (ReadOperation tagged "Droplets") and a real,
+// unrelated data source (an autoscale-pool listing operation tagged
+// "Droplet Autoscale Pools") that happens to derive the identical bare
+// type name -- resources are processed first, so a genuine collision
+// like this one keeps the resource's own real namespace.
 func namespacesFromTags(snap *Snapshot) (map[string]string, error) {
 	out := map[string]string{}
 
@@ -673,8 +687,17 @@ func namespacesFromTags(snap *Snapshot) (map[string]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("member %q: %w", name, err)
 		}
-		for typeName, r := range resources {
+		typeNames := make([]string, 0, len(resources))
+		for typeName := range resources {
+			typeNames = append(typeNames, typeName)
+		}
+		sort.Strings(typeNames)
+		for _, typeName := range typeNames {
+			r := resources[typeName]
 			if r.ReadOperation == nil || len(r.ReadOperation.Tags) == 0 {
+				continue
+			}
+			if _, exists := out[typeName]; exists {
 				continue
 			}
 			out[typeName] = tagToNamespace(r.ReadOperation.Tags[0])
@@ -690,8 +713,17 @@ func namespacesFromTags(snap *Snapshot) (map[string]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("member %q: %w", name, err)
 		}
-		for typeName, ds := range dataSources {
+		typeNames := make([]string, 0, len(dataSources))
+		for typeName := range dataSources {
+			typeNames = append(typeNames, typeName)
+		}
+		sort.Strings(typeNames)
+		for _, typeName := range typeNames {
+			ds := dataSources[typeName]
 			if ds.Operation == nil || len(ds.Operation.Tags) == 0 {
+				continue
+			}
+			if _, exists := out[typeName]; exists {
 				continue
 			}
 			out[typeName] = tagToNamespace(ds.Operation.Tags[0])
