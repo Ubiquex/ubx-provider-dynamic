@@ -175,7 +175,13 @@ func memberChangeLevel(prevMember *MemberSnapshot, oldSchemas, newSchemas map[st
 // the already-generated kubernetes_ds member before landing this fix,
 // not assumed).
 func GenerateOpenAPIMember(name, wireName, schemaURL string, mode Mode, execCfg config.Provider, prevMember *MemberSnapshot) (*MemberSnapshot, map[string]*tfprotov6.Schema, ChangeLevel, error) {
-	doc, err := openapi.Load(schemaURL)
+	var doc *openapi3.T
+	var err error
+	if execCfg.RedoclyBundle {
+		doc, err = openapi.LoadWithRedoclyBundle(schemaURL, execCfg.Name)
+	} else {
+		doc, err = openapi.Load(schemaURL)
+	}
 	if err != nil {
 		return nil, nil, NoChange, fmt.Errorf("fetch %s: %w", schemaURL, err)
 	}

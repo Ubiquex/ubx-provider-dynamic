@@ -3,8 +3,65 @@ package openapi
 import (
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
+	"strings"
 	"testing"
 )
+
+// TestLoadWithRedoclyBundle_MissingNpx_NamesFlagAndProvider proves UBI-217's
+// own real requirement: a human hitting this locally (Node.js is not
+// guaranteed present the way a CI runner image guarantees it) needs to
+// know immediately why Node is needed and which config entry asked for
+// it, not a bare "npx: command not found" with no link back to the real
+// cause. Forces the real "npx not found" path by pointing PATH at an
+// empty directory rather than mocking exec.LookPath -- this package's
+// own "real tests, no transport mocking" discipline.
+func TestLoadWithRedoclyBundle_MissingNpx_NamesFlagAndProvider(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	if _, err := exec.LookPath("npx"); err == nil {
+		t.Fatal("test setup broken: npx still resolves with PATH cleared")
+	}
+
+	_, err := LoadWithRedoclyBundle("https://example.invalid/spec.yaml", "digitalocean")
+	if err == nil {
+		t.Fatal("expected an error when npx is not in PATH")
+	}
+	for _, want := range []string{"digitalocean", "redocly_bundle", "npx", "PATH", "nodejs.org"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not mention %q -- should name both the flag and the provider so someone hitting this locally knows immediately why Node is needed", err.Error(), want)
+		}
+	}
+}
+
+// TestLoadWithRedoclyBundle_RealBundle proves the real, live bundling path
+// end to end against DigitalOcean's own real, published spec -- the exact
+// real document UBI-217 was filed against, confirmed live: kin-openapi's
+// own plain Load fails outright on this document (a Tag Object's own
+// "description" field expressed as $ref, which kin-openapi refuses to
+// unmarshal into Tag.description's own plain string field), and
+// LoadWithRedoclyBundle resolves it correctly. Gated behind
+// UBX_LIVE_VALIDATION like this package's other live tests, since it
+// needs both real network access and a real Node.js install.
+func TestLoadWithRedoclyBundle_RealBundle(t *testing.T) {
+	requireLive(t)
+	if _, err := exec.LookPath("npx"); err != nil {
+		t.Skip("npx not found in PATH, skipping the real bundling test")
+	}
+	const url = "https://raw.githubusercontent.com/digitalocean/openapi/main/specification/DigitalOcean-public.v2.yaml"
+
+	if _, plainErr := Load(url); plainErr == nil {
+		t.Fatal("expected the real, unbundled Load to fail (a Tag Object's own \"description\" field expressed as $ref, which kin-openapi cannot unmarshal into a plain string) -- UBI-217's own real finding may no longer hold")
+	}
+
+	doc, err := LoadWithRedoclyBundle(url, "digitalocean")
+	if err != nil {
+		t.Fatalf("LoadWithRedoclyBundle: %v", err)
+	}
+	if doc.Paths == nil || doc.Paths.Len() == 0 {
+		t.Fatal("expected real paths to survive bundling, got none")
+	}
+	t.Logf("real DigitalOcean spec, bundled: %d paths", doc.Paths.Len())
+}
 
 // TestLoad_JSONSurrogatePairEscapeSurvives proves UBI-217's own real,
 // live-found bug stays fixed: Linode's real, published OpenAPI 3.0.1 spec
