@@ -554,13 +554,10 @@ func refString(ref string) string {
 // -- further split into (service, version, noun) when that name itself
 // carries a real, structural service/group qualifier (see
 // splitQualifiedRefName) -- falling back to the read path's own last
-// non-parameter segment, naively singularized (trailing "s" stripped, real
-// English-plural-only heuristic -- documented as approximate, not a real
-// inflection engine, since pulling one in for this fallback path alone
-// isn't proportionate to how rarely real specs leave a response schema
-// unnamed) when no response schema name exists at all. service and version
-// are always "" in the fallback case -- a bare path segment carries no
-// real service/version signal to extract.
+// non-parameter segment, singularized via singularize below, when no
+// response schema name exists at all. service and version are always
+// "" in the fallback case -- a bare path segment carries no real
+// service/version signal to extract.
 func deriveNoun(refName, readPath string) (service, version, noun string, note string) {
 	if refName != "" {
 		if svc, v, n, ok := splitQualifiedRefName(refName); ok {
@@ -579,8 +576,45 @@ func deriveNoun(refName, readPath string) (service, version, noun string, note s
 	if last == "" {
 		last = "resource"
 	}
-	singular := strings.TrimSuffix(last, "s")
+	singular := singularize(last)
 	return "", "", toSnakeCase(singular), fmt.Sprintf("response schema has no component name (inline schema) -- resource noun %q derived from the read path itself instead, a weaker heuristic than the usual response-schema-name match", singular)
+}
+
+// singularize is internal/discoverydoc's own real, twice-fixed
+// heuristic (UBI-102), duplicated here rather than imported -- this
+// package stays independent of discoverydoc's own GCP-specific
+// concerns, the same real reasoning every other schema source pair in
+// this org already follows, and a pure, ~15-line string function costs
+// nothing to keep in sync by hand versus a cross-source dependency that
+// has no other reason to exist.
+//
+// The original version here (bare `strings.TrimSuffix(s, "s")`) was the
+// IDENTICAL bug discoverydoc.singularize's own doc comment already
+// named as its real twin at the time THAT fix was written -- "the
+// identical, deliberately approximate heuristic
+// internal/resourcemap.deriveNoun's own fallback path already uses for
+// the same real reason" -- and was never actually ported over. Found
+// live against DigitalOcean's own real spec (UBI-222): "byoip_prefixes"
+// -> "byoip_prefixe", "registries" -> "registrie", the exact same class
+// of real, embarrassing misspelling discoverydoc's own fix already
+// eliminated for GCP. Verified this ports cleanly: run directly against
+// both real, broken DigitalOcean strings, produces "prefix" and
+// "registry".
+func singularize(s string) string {
+	switch {
+	case strings.HasSuffix(s, "ies") && len(s) > 3:
+		return s[:len(s)-3] + "y"
+	case strings.HasSuffix(s, "es"):
+		stripped := strings.TrimSuffix(s, "es")
+		if strings.HasSuffix(stripped, "ss") || strings.HasSuffix(stripped, "x") ||
+			strings.HasSuffix(stripped, "z") || strings.HasSuffix(stripped, "ch") ||
+			strings.HasSuffix(stripped, "sh") {
+			return stripped
+		}
+		return strings.TrimSuffix(s, "s")
+	default:
+		return strings.TrimSuffix(s, "s")
+	}
 }
 
 // apiVersionPattern matches a real API version token -- "v1", "v1beta1",
