@@ -567,7 +567,7 @@ func TestNamespacesForSource_OpenAPI_BareNameCollision_ResourceWinsDeterministic
 func TestTagToNamespace(t *testing.T) {
 	cases := map[string]string{
 		"BYOIP Prefixes":       "byoipprefixes",
-		"1-Click Applications": "1clickapplications",
+		"1-Click Applications": "ns1clickapplications",
 		"Block Storage":        "blockstorage",
 		"Container Registry":   "containerregistry",
 	}
