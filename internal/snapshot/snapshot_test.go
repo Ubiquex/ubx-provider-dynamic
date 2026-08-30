@@ -152,12 +152,14 @@ func TestSaveSplitLoadSplit_RealRoundTrip(t *testing.T) {
 				SchemaSource: SchemaSourceOpenAPI,
 				Mode:         ModeResource,
 				BaseURL:      "https://api.widgetco.example",
+				SchemaURL:    "https://raw.githubusercontent.com/widgetco/openapi/main/spec.yaml",
 				RawSpec:      json.RawMessage(`{"openapi":"3.0.0"}`),
 			},
 			"widgetco_ds": {
 				SchemaSource: SchemaSourceOpenAPI,
 				Mode:         ModeDataSource,
 				BaseURL:      "https://api.widgetco.example",
+				SchemaURL:    "https://raw.githubusercontent.com/widgetco/openapi/main/spec.yaml",
 				RawSpec:      json.RawMessage(`{"openapi":"3.0.0"}`),
 			},
 		},
@@ -179,6 +181,27 @@ func TestSaveSplitLoadSplit_RealRoundTrip(t *testing.T) {
 		t.Fatalf("no real members/widgetco_ds.json written: %v", err)
 	}
 
+	// UBI-222: manifest.json's own real, on-disk schema_urls -- the one
+	// small file a drift-watch or a future snapshot cut is meant to read
+	// instead of ubiquex's own now-gone live config, or a full
+	// members/<name>.json per member. Read the raw bytes, not just
+	// LoadSplit's own round-trip, since the whole point is this being
+	// visible in the small file without needing the larger ones.
+	manifestBytes, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read manifest.json: %v", err)
+	}
+	var manOnDisk struct {
+		SchemaURLs map[string]string `json:"schema_urls"`
+	}
+	if err := json.Unmarshal(manifestBytes, &manOnDisk); err != nil {
+		t.Fatalf("parse manifest.json: %v", err)
+	}
+	wantURL := "https://raw.githubusercontent.com/widgetco/openapi/main/spec.yaml"
+	if manOnDisk.SchemaURLs["widgetco"] != wantURL || manOnDisk.SchemaURLs["widgetco_ds"] != wantURL {
+		t.Errorf("manifest.json schema_urls = %+v, want both members mapped to %q", manOnDisk.SchemaURLs, wantURL)
+	}
+
 	got, err := LoadSplit(dir)
 	if err != nil {
 		t.Fatalf("LoadSplit: %v", err)
@@ -195,6 +218,9 @@ func TestSaveSplitLoadSplit_RealRoundTrip(t *testing.T) {
 	}
 	if resourceMember.Mode != ModeResource {
 		t.Errorf("widgetco Mode = %q, want resource", resourceMember.Mode)
+	}
+	if resourceMember.SchemaURL != wantURL {
+		t.Errorf("widgetco SchemaURL = %q, want %q", resourceMember.SchemaURL, wantURL)
 	}
 	dsMember, err := got.Member("widgetco_ds")
 	if err != nil {
