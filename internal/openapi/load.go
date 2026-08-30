@@ -113,6 +113,19 @@ func location(source string) *url.URL {
 // YAML to JSON first; a JSON source round-trips through this unchanged
 // (JSON is valid YAML 1.2), so this is safe for every real source this
 // package has ever loaded, not just the new Swagger 2.0 case.
+//
+// UBI-217: that round-trip is not actually safe for every real JSON
+// source. Linode's own real, published OpenAPI 3.0.1 spec is valid JSON
+// containing a UTF-16 surrogate-pair Unicode escape (an emoji, JSON-legal
+// per RFC 8259) inside a field description -- oasdiff/yaml rejects it
+// outright ("found invalid Unicode character escape code") even though
+// encoding/json parses the identical bytes correctly, confirmed live via
+// json.Valid/json.Unmarshal against the exact same raw bytes. A genuinely
+// JSON source never needs YAML-to-JSON conversion in the first place
+// (that step exists only for genuinely YAML-encoded sources like
+// Datadog's), so checking json.Valid first and skipping the YAML library
+// entirely for real JSON sidesteps the whole class of YAML-parser-only
+// escape rejections, not just this one emoji.
 func Parse(raw []byte, loc *url.URL) (*openapi3.T, error) {
 	// Real, found-in-review bug, caught only when internal/snapshot's own
 	// network-free reload path became the first real caller to ever pass
@@ -130,9 +143,13 @@ func Parse(raw []byte, loc *url.URL) (*openapi3.T, error) {
 	if loc == nil {
 		loc = noLocation
 	}
-	jsonRaw, err := yaml.YAMLToJSON(raw)
-	if err != nil {
-		return nil, fmt.Errorf("not valid JSON or YAML: %w", err)
+	jsonRaw := raw
+	if !json.Valid(raw) {
+		var err error
+		jsonRaw, err = yaml.YAMLToJSON(raw)
+		if err != nil {
+			return nil, fmt.Errorf("not valid JSON or YAML: %w", err)
+		}
 	}
 
 	var probe versionProbe

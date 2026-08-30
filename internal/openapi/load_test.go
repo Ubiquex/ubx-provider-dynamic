@@ -6,6 +6,41 @@ import (
 	"testing"
 )
 
+// TestLoad_JSONSurrogatePairEscapeSurvives proves UBI-217's own real,
+// live-found bug stays fixed: Linode's real, published OpenAPI 3.0.1 spec
+// is valid JSON containing a UTF-16 surrogate-pair Unicode escape (an
+// emoji, JSON-legal per RFC 8259) inside a field description.
+// oasdiff/yaml, the shared YAML lib Parse used to route every source
+// through unconditionally, rejects this exact escape outright ("found
+// invalid Unicode character escape code") even though encoding/json
+// parses the identical bytes correctly -- confirmed live before this fix
+// landed. A genuinely JSON source (checked via json.Valid) now skips the
+// YAML library entirely, since it never needed YAML-to-JSON conversion in
+// the first place.
+func TestLoad_JSONSurrogatePairEscapeSurvives(t *testing.T) {
+	raw := []byte("{\"openapi\": \"3.0.1\", \"info\": {\"title\": \"test\", \"version\": \"1\"}, " +
+		"\"paths\": {\"/widgets\": {\"get\": {\"description\": \"book \\uD83D\\uDCD8 icon\", " +
+		"\"responses\": {\"200\": {\"description\": \"ok\"}}}}}}")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(raw)
+	}))
+	defer srv.Close()
+
+	doc, err := Load(srv.URL)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	path := doc.Paths.Find("/widgets")
+	if path == nil || path.Get == nil {
+		t.Fatalf("expected the real GET /widgets operation to survive parsing")
+	}
+	const want = "book \U0001F4D8 icon"
+	if path.Get.Description != want {
+		t.Fatalf("description = %q, want %q (the decoded surrogate pair)", path.Get.Description, want)
+	}
+}
+
 // TestLoad_SwaggerV2ConvertsToV3 proves the real Swagger 2.0 -> OpenAPI 3
 // conversion path against a small, real-shaped (not live) fixture -- a
 // real local httptest server, not a mocked openapi3.T, so Load's own real
