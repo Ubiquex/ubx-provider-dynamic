@@ -275,6 +275,46 @@ type Provider struct {
 	Retry     RetryConfig               `toml:"retry"`
 	Timeouts  TimeoutsConfig            `toml:"timeouts"`
 	Resources map[string]ResourceConfig `toml:"resources"`
+
+	// RedoclyBundle marks this entry's own real, published spec as
+	// needing Redocly's own bundler (the real, already-correct
+	// `@redocly/cli bundle`, shelled out to from internal/openapi) run
+	// against it BEFORE kin-openapi's own Load ever sees the bytes.
+	//
+	// UBI-217: DigitalOcean's real, public OpenAPI 3.0 spec uses two
+	// Redocly-only, non-standard $ref conventions real OpenAPI 3.0 does
+	// not define (a Tag Object's own "description" field as a $ref, and
+	// every Path Item's own HTTP-method field as a $ref to a separate
+	// per-operation file) -- kin-openapi's own Load silently loads every
+	// operation as empty rather than erroring, so this can't be detected
+	// generically after the fact; a provider whose own spec is shaped
+	// this way has to say so, deliberately, the same way TargetPrefix or
+	// VersionQualifier are real, declared properties of how a specific
+	// provider's own upstream is shaped, never guessed or auto-retried.
+	// internal/openapi.Bundle (a real, existing, DIFFERENT mechanism,
+	// deliberately NOT reused here) only ever rewrites already-resolved,
+	// standard external $refs kin-openapi's own Load already followed
+	// successfully -- it runs strictly after a successful Load, never
+	// before, and does not cover either of DigitalOcean's two real
+	// conventions even if reached.
+	//
+	// Deliberately a per-provider config flag, not a CLI argument and
+	// not an automatic retry whenever Load fails: this is a real,
+	// permanent property of how THIS provider's own spec is shaped, the
+	// same reasoning WireName/VersionQualifier/TargetPrefix already
+	// establish for their own respective real, provider-shaped
+	// properties -- something an operator diagnoses once, not something
+	// remembered at every invocation. It also means Node.js (needed to
+	// run `npx @redocly/cli`) is only ever required for a provider that
+	// explicitly sets this, never attempted for the five other real
+	// openapi-sourced providers already onboarded (kubernetes, github,
+	// azure, datadog), regardless of whether Node is present anywhere in
+	// the environment.
+	//
+	// Only meaningful for schema_source = "openapi"; validate() refuses
+	// it outright for any other schema_source, the same way data_sources
+	// is refused for cloudformation.
+	RedoclyBundle bool `toml:"redocly_bundle"`
 }
 
 func (p Provider) validate() error {
@@ -297,6 +337,9 @@ func (p Provider) validate() error {
 	}
 	if p.SchemaSource == SchemaSourceCloudFormation && p.DataSources {
 		return fmt.Errorf("dynamic_providers.%s: data_sources = true is not valid when schema_source is %q -- CloudFormation has no real data-source concept at all, this entry can only ever serve resources", p.Name, p.SchemaSource)
+	}
+	if p.RedoclyBundle && p.SchemaSource != SchemaSourceOpenAPI {
+		return fmt.Errorf("dynamic_providers.%s: redocly_bundle = true is not valid when schema_source is %q -- only a real openapi source can need Redocly's own bundler", p.Name, p.SchemaSource)
 	}
 	if p.BaseURL == "" {
 		return fmt.Errorf("dynamic_providers.%s: base_url is required", p.Name)
