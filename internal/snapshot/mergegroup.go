@@ -754,5 +754,20 @@ func tagToNamespace(tag string) string {
 			b.WriteRune(r)
 		}
 	}
-	return b.String()
+	out := b.String()
+	// A namespace becomes a real Go `package <name>` declaration
+	// verbatim (sdk/codegen/templates/go's own go.go, ubiquex) -- a
+	// leading digit there is not just cosmetic, it's a syntax error.
+	// Every other real source's own namespace was always identifier-safe
+	// by construction (a CFN/Smithy/discoverydoc service segment is
+	// never a bare number); an OpenAPI Tag is free-form human text with
+	// no such guarantee. Found live: DigitalOcean's own real "1-Click
+	// Applications" tag normalizes to "1clickapplications", which broke
+	// real Go codegen (CheckNoDuplicateDeclarations: "expected 'IDENT',
+	// found 1") the first time this ran against DigitalOcean's real
+	// spec end-to-end, not caught by any unit test at the time.
+	if len(out) > 0 && out[0] >= '0' && out[0] <= '9' {
+		out = "ns" + out
+	}
+	return out
 }
