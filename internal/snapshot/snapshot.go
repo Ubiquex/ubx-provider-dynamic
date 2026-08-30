@@ -234,6 +234,24 @@ type MemberSnapshot struct {
 	// time, every time, using whatever translation logic THIS build
 	// ships, is the whole point of the SchemaFormat/Version split.
 	RawSpec json.RawMessage `json:"raw_spec"`
+
+	// SchemaURL is the real, live URL RawSpec was fetched from (UBI-222).
+	// Before this field existed, the only place this URL was ever
+	// recorded was ubiquex's own live [dynamic_providers.<name>] table --
+	// fine while that table stayed live, but UBI-182 Stage E collapsed
+	// every migrated provider's own table down to a bare source/version
+	// pin, taking the URL with it. Four real hash-watch.yml workflows
+	// (datadog, azure, google, aws's own Smithy portion) depended on that
+	// now-gone table to know what to re-fetch for drift detection, and
+	// silently broke -- confirmed live, failed on 2026-08-27 with a red X
+	// nobody saw. Recording SchemaURL here, at the one place it is
+	// already known for real (every Generate<Source>Member already takes
+	// it as a real parameter), means drift detection and a future
+	// snapshot cut can both read it back from the published artifact
+	// itself -- the same artifact everything else already pins to -- and
+	// never again need a live table this format was explicitly built to
+	// retire.
+	SchemaURL string `json:"schema_url,omitempty"`
 }
 
 // Snapshot is one real, frozen file: everything the binary needs to
@@ -402,6 +420,17 @@ type manifest struct {
 	Members          []string            `json:"members"`
 	Exclude          map[string][]string `json:"exclude,omitempty"`
 	MinBinaryVersion string              `json:"min_binary_version,omitempty"`
+
+	// SchemaURLs is member name -> the real, live URL that member's own
+	// RawSpec was fetched from (UBI-222), surfaced here so a drift-watch
+	// or a future snapshot cut only ever needs this one small, already-
+	// published file -- never a full members/<name>.json (real weight
+	// at AWS's own scale) and never ubiquex's own live config, which
+	// UBI-182 Stage E already stopped carrying this for every migrated
+	// provider. Empty/omitted for a member generated before this field
+	// existed -- SaveSplit only ever writes what MemberSnapshot.SchemaURL
+	// actually has.
+	SchemaURLs map[string]string `json:"schema_urls,omitempty"`
 }
 
 // SaveSplit writes snap as a real, committable directory tree:
@@ -419,6 +448,15 @@ func SaveSplit(dir string, snap *Snapshot) error {
 
 	names := memberNames(snap.Members)
 	sort.Strings(names)
+	schemaURLs := make(map[string]string, len(names))
+	for _, name := range names {
+		if u := snap.Members[name].SchemaURL; u != "" {
+			schemaURLs[name] = u
+		}
+	}
+	if len(schemaURLs) == 0 {
+		schemaURLs = nil
+	}
 	man := manifest{
 		SchemaFormat:     snap.SchemaFormat,
 		Provider:         snap.Provider,
@@ -426,6 +464,7 @@ func SaveSplit(dir string, snap *Snapshot) error {
 		Members:          names,
 		Exclude:          snap.Exclude,
 		MinBinaryVersion: snap.MinBinaryVersion,
+		SchemaURLs:       schemaURLs,
 	}
 	manData, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
