@@ -3,6 +3,8 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -202,5 +204,78 @@ func TestGenerateGroupMembersFromSnapshot_MovedPaths_NamesEveryOneInOnePass(t *t
 		if !strings.Contains(msg, want) {
 			t.Errorf("expected the aggregate error to name %q, got: %s", want, msg)
 		}
+	}
+}
+
+// buildPrevSnapshotDir writes a real, minimal prev-snapshot directory
+// (SaveSplit, the same real on-disk shape --prev-snapshot reads) with
+// one real member, for runGenerateSnapshotGroup's own dev-binary
+// refusal tests below -- these exercise the whole real CLI path, not
+// just generateGroupMembersFromSnapshot, since the refusal check lives
+// in runGenerateSnapshotGroup itself, right before SaveSplit.
+func buildPrevSnapshotDir(t *testing.T, url string) string {
+	t.Helper()
+	m := buildRealMember(t, "widgetco", url)
+	prev := &snapshot.Snapshot{
+		SchemaFormat: snapshot.CurrentSchemaFormat,
+		Provider:     "widgetco",
+		Version:      "1.0.0",
+		Members:      map[string]*snapshot.MemberSnapshot{"widgetco": m},
+	}
+	dir := t.TempDir()
+	if err := snapshot.SaveSplit(dir, prev); err != nil {
+		t.Fatalf("SaveSplit prev snapshot: %v", err)
+	}
+	return dir
+}
+
+// TestRunGenerateSnapshotGroup_DevBinary_RefusedByDefault is UBI-229's
+// own real regression guard for the four snapshots (azure, google,
+// aws, datadog) that reached "dev" in their own committed
+// manifest.json with zero friction: a test binary's own
+// snapshot.BinaryVersion is "dev" (unset, the same real default every
+// non-release build carries), and this must refuse to write anything
+// at all unless --allow-dev-binary is passed.
+func TestRunGenerateSnapshotGroup_DevBinary_RefusedByDefault(t *testing.T) {
+	if snapshot.BinaryVersion != "dev" {
+		t.Fatalf("test assumes snapshot.BinaryVersion is the real, unstamped default \"dev\", got %q", snapshot.BinaryVersion)
+	}
+	prevDir := buildPrevSnapshotDir(t, serveSpec(t, widgetSpec))
+	outDir := filepath.Join(t.TempDir(), "out")
+
+	err := runGenerateSnapshotGroup(outDir, "widgetco", "", prevDir, "", false)
+	if err == nil {
+		t.Fatal("expected refusal, got nil")
+	}
+	if !strings.Contains(err.Error(), "dev") || !strings.Contains(err.Error(), "--allow-dev-binary") {
+		t.Errorf("expected the refusal to name both \"dev\" and \"--allow-dev-binary\", got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(outDir, "manifest.json")); !os.IsNotExist(statErr) {
+		t.Errorf("expected nothing written on refusal, but manifest.json exists (stat err: %v)", statErr)
+	}
+}
+
+func TestRunGenerateSnapshotGroup_DevBinary_AllowedWithFlag(t *testing.T) {
+	prevDir := buildPrevSnapshotDir(t, serveSpec(t, widgetSpec))
+	outDir := filepath.Join(t.TempDir(), "out")
+
+	if err := runGenerateSnapshotGroup(outDir, "widgetco", "", prevDir, "", true); err != nil {
+		t.Fatalf("runGenerateSnapshotGroup with --allow-dev-binary: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(outDir, "manifest.json")); statErr != nil {
+		t.Errorf("expected manifest.json to be written, stat error: %v", statErr)
+	}
+}
+
+func TestRunGenerateSnapshotGroup_RealBinaryVersion_WritesWithoutTheFlag(t *testing.T) {
+	orig := snapshot.BinaryVersion
+	snapshot.BinaryVersion = "1.2.3"
+	t.Cleanup(func() { snapshot.BinaryVersion = orig })
+
+	prevDir := buildPrevSnapshotDir(t, serveSpec(t, widgetSpec))
+	outDir := filepath.Join(t.TempDir(), "out")
+
+	if err := runGenerateSnapshotGroup(outDir, "widgetco", "", prevDir, "", false); err != nil {
+		t.Fatalf("runGenerateSnapshotGroup with a real, stamped BinaryVersion: %v", err)
 	}
 }

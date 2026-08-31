@@ -123,6 +123,25 @@ var groupExcludeFlag = flag.String("group-exclude", "", "JSON object of member n
 // left for a human to guess. Omit for a group's first-ever snapshot.
 var prevSnapshotFlag = flag.String("prev-snapshot", "", "DIRECTORY of the prior real GROUP snapshot (manifest.json plus members/) to diff against when deriving the new one's own version (omit for a group's first-ever snapshot)")
 
+// allowDevBinaryFlag is generateSnapshotGroupFlag's own real safety
+// gate: refuses to write a snapshot whose own MinBinaryVersion would
+// be the unstamped default "dev" unless explicitly overridden. UBI-229
+// follow-up -- four of this org's seven published group snapshots
+// (azure, google, aws, datadog) reached "dev" in their own real,
+// committed, merged manifest.json with zero friction, because a
+// locally-built (unreleased) binary produces a snapshot that is
+// byte-for-byte indistinguishable in review from one built by a real,
+// tagged release, aside from this one field nobody was checking.
+// "dev" is not a real version -- it cannot be resolved by
+// provider.AcquireDynamicProviderBinary, and it defeats the entire
+// real, unforgeable link MinBinaryVersion exists to record (see
+// BinaryVersion's own doc comment). Local, unreleased builds remain a
+// real, legitimate way to iterate on generation before a release
+// exists -- this flag is the deliberate, visible escape hatch for
+// that case, not a ban on it: passing it is a conscious, grep-able
+// choice, unlike today's silent default.
+var allowDevBinaryFlag = flag.Bool("allow-dev-binary", false, "allow writing a snapshot whose own min_binary_version would be the unstamped \"dev\" default -- refused by default, since a dev-stamped snapshot cannot be traced to any real, acquirable binary")
+
 // dumpGroupSummaryFlag is a real, plain CLI mode for one real, narrow
 // question: how many real resource/data-source types does this GROUP's
 // own real merge actually produce, right now, without ever printing a
@@ -190,7 +209,7 @@ func run() error {
 	// into one group container, so it has no single active
 	// UBX_DYNAMIC_PROVIDER_NAME to require at all.
 	if *generateSnapshotGroupFlag != "" {
-		return runGenerateSnapshotGroup(*generateSnapshotGroupFlag, *groupRepoNameFlag, *groupMembersFlag, *prevSnapshotFlag, *groupExcludeFlag)
+		return runGenerateSnapshotGroup(*generateSnapshotGroupFlag, *groupRepoNameFlag, *groupMembersFlag, *prevSnapshotFlag, *groupExcludeFlag, *allowDevBinaryFlag)
 	}
 
 	// Same real reason as group generation above -- a group summary
@@ -1301,7 +1320,7 @@ func runDumpGroupSummary(snapPath string) error {
 // real time via the source-and-mode-appropriate Generate<Source>Member,
 // and assembles them into ONE real, versioned group container
 // (AssembleGroup) written to outPath.
-func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJSON string) error {
+func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJSON string, allowDevBinary bool) error {
 	if repoName == "" {
 		return fmt.Errorf("--generate-snapshot-group requires --group-repo-name")
 	}
@@ -1354,6 +1373,10 @@ func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJS
 	group, err := snapshot.AssembleGroup(repoName, prev, members, levels, exclude)
 	if err != nil {
 		return fmt.Errorf("assemble group %q: %w", repoName, err)
+	}
+
+	if group.MinBinaryVersion == "dev" && !allowDevBinary {
+		return fmt.Errorf("refusing to write a snapshot with min_binary_version \"dev\" (this build has no real, released version -- pass --allow-dev-binary to write it anyway, a deliberate choice for local iteration, never for anything meant to be committed)")
 	}
 
 	if err := snapshot.SaveSplit(outPath, group); err != nil {
