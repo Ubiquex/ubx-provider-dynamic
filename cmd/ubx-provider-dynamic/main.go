@@ -1334,13 +1334,51 @@ func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJS
 	}
 
 	rawNames := strings.Split(membersCSV, ",")
+	members, levels, err := generateGroupMembers(allProviders, rawNames, prev)
+	if err != nil {
+		return err
+	}
+
+	group, err := snapshot.AssembleGroup(repoName, prev, members, levels, exclude)
+	if err != nil {
+		return fmt.Errorf("assemble group %q: %w", repoName, err)
+	}
+
+	if err := snapshot.SaveSplit(outPath, group); err != nil {
+		return fmt.Errorf("write snapshot to %s: %w", outPath, err)
+	}
+
+	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: wrote real group snapshot for %q, version %s, schema_format %d, %d member(s) -> %s\n",
+		repoName, group.Version, group.SchemaFormat, len(group.Members), outPath)
+	return nil
+}
+
+// generateGroupMembers generates every real named member for a group,
+// collecting every real generation failure instead of stopping at the
+// first one -- UBI-229's own real incident (one moved upstream spec
+// path blocked a real 302-member cut on a single named failure,
+// forcing a separate, out-of-band check of the other 301 to know
+// whether more than one had moved) is exactly what this exists to
+// shorten: one real run now names every bad member at once, rather
+// than a fix-one-rerun-hit-the-next cycle. Still a hard failure
+// overall -- a non-nil error here means the caller must not assemble
+// or write anything, matching the never-silently-skip rule every
+// other real gap-surfacing mechanism in this codebase already follows
+// (hash-watch's own error state, ErrDuplicateWireType's fail-loud
+// default). A member whose own [dynamic_providers.<name>] table is
+// missing from allProviders is collected as a real failure too, not
+// treated differently from a live generation error.
+func generateGroupMembers(allProviders map[string]config.Provider, rawNames []string, prev *snapshot.Snapshot) (map[string]*snapshot.MemberSnapshot, map[string]snapshot.ChangeLevel, error) {
 	members := make(map[string]*snapshot.MemberSnapshot, len(rawNames)*2)
 	levels := make(map[string]snapshot.ChangeLevel, len(rawNames)*2)
+	var errs []error
+
 	for _, rawName := range rawNames {
 		memberName := strings.TrimSpace(rawName)
 		cfg, ok := allProviders[memberName]
 		if !ok {
-			return fmt.Errorf("--group-members: no [dynamic_providers.%s] table in this process's own .ubx/config", memberName)
+			errs = append(errs, fmt.Errorf("--group-members: no [dynamic_providers.%s] table in this process's own .ubx/config", memberName))
+			continue
 		}
 		wireName := memberName
 		if cfg.WireName != "" {
@@ -1374,7 +1412,8 @@ func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJS
 				genErr = fmt.Errorf("[dynamic_providers.%s]'s own schema_source %q is not a real, known schema source", memberName, cfg.SchemaSource)
 			}
 			if genErr != nil {
-				return fmt.Errorf("generate member %q: %w", mn, genErr)
+				errs = append(errs, fmt.Errorf("generate member %q: %w", mn, genErr))
+				continue
 			}
 			members[mn] = member
 			levels[mn] = level
@@ -1382,16 +1421,8 @@ func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJS
 		}
 	}
 
-	group, err := snapshot.AssembleGroup(repoName, prev, members, levels, exclude)
-	if err != nil {
-		return fmt.Errorf("assemble group %q: %w", repoName, err)
+	if len(errs) > 0 {
+		return nil, nil, errors.Join(errs...)
 	}
-
-	if err := snapshot.SaveSplit(outPath, group); err != nil {
-		return fmt.Errorf("write snapshot to %s: %w", outPath, err)
-	}
-
-	fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: wrote real group snapshot for %q, version %s, schema_format %d, %d member(s) -> %s\n",
-		repoName, group.Version, group.SchemaFormat, len(group.Members), outPath)
-	return nil
+	return members, levels, nil
 }
