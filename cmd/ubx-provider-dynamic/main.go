@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -1304,8 +1305,8 @@ func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJS
 	if repoName == "" {
 		return fmt.Errorf("--generate-snapshot-group requires --group-repo-name")
 	}
-	if membersCSV == "" {
-		return fmt.Errorf("--generate-snapshot-group requires --group-members (comma-separated [dynamic_providers.<name>] table names)")
+	if membersCSV == "" && prevPath == "" {
+		return fmt.Errorf("--generate-snapshot-group requires --group-members (comma-separated [dynamic_providers.<name>] table names), or --prev-snapshot alone to re-derive every member's own generation input from the previous snapshot directly")
 	}
 
 	var exclude map[string][]string
@@ -1313,15 +1314,6 @@ func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJS
 		if err := json.Unmarshal([]byte(excludeJSON), &exclude); err != nil {
 			return fmt.Errorf("--group-exclude: invalid JSON: %w", err)
 		}
-	}
-
-	dir, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("determine working directory: %w", err)
-	}
-	allProviders, err := config.Load(dir)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
 	}
 
 	var prev *snapshot.Snapshot
@@ -1333,8 +1325,28 @@ func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJS
 		prev = p
 	}
 
-	rawNames := strings.Split(membersCSV, ",")
-	members, levels, err := generateGroupMembers(allProviders, rawNames, prev)
+	var members map[string]*snapshot.MemberSnapshot
+	var levels map[string]snapshot.ChangeLevel
+	var err error
+	if membersCSV != "" {
+		dir, dirErr := os.Getwd()
+		if dirErr != nil {
+			return fmt.Errorf("determine working directory: %w", dirErr)
+		}
+		allProviders, loadErr := config.Load(dir)
+		if loadErr != nil {
+			return fmt.Errorf("load config: %w", loadErr)
+		}
+		rawNames := strings.Split(membersCSV, ",")
+		members, levels, err = generateGroupMembers(allProviders, rawNames, prev)
+	} else {
+		// UBI-229: --group-members omitted, --prev-snapshot alone drives
+		// generation -- see generateGroupMembersFromSnapshot's own doc
+		// comment for the full real reasoning (this is the mode
+		// hash-watch.yml uses once it stops carrying its own embedded
+		// copy of the live per-member config).
+		members, levels, err = generateGroupMembersFromSnapshot(prev)
+	}
 	if err != nil {
 		return err
 	}
@@ -1396,21 +1408,7 @@ func generateGroupMembers(allProviders map[string]config.Provider, rawNames []st
 				prevMember = prev.Members[mn]
 			}
 
-			var member *snapshot.MemberSnapshot
-			var level snapshot.ChangeLevel
-			var genErr error
-			switch cfg.SchemaSource {
-			case config.SchemaSourceOpenAPI:
-				member, _, level, genErr = snapshot.GenerateOpenAPIMember(mn, wireName, cfg.SchemaURL, mode, cfg, prevMember)
-			case config.SchemaSourceCloudFormation:
-				member, _, level, genErr = snapshot.GenerateCloudFormationMember(mn, cfg.SchemaURL, mode, cfg, prevMember)
-			case config.SchemaSourceSmithy:
-				member, _, level, genErr = snapshot.GenerateSmithyMember(mn, wireName, cfg.SchemaURL, cfg.TargetPrefix, mode, cfg.DataSourceNamespace, cfg, prevMember)
-			case config.SchemaSourceDiscoveryDoc:
-				member, _, level, genErr = snapshot.GenerateDiscoveryDocMember(mn, wireName, cfg.SchemaURL, cfg.VersionQualifier, mode, cfg, prevMember)
-			default:
-				genErr = fmt.Errorf("[dynamic_providers.%s]'s own schema_source %q is not a real, known schema source", memberName, cfg.SchemaSource)
-			}
+			member, level, genErr := generateOneMember(mn, wireName, cfg, mode, prevMember)
 			if genErr != nil {
 				errs = append(errs, fmt.Errorf("generate member %q: %w", mn, genErr))
 				continue
@@ -1419,6 +1417,110 @@ func generateGroupMembers(allProviders map[string]config.Provider, rawNames []st
 			levels[mn] = level
 			fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: generated member %q (%s, %s), own change level: %s\n", mn, cfg.SchemaSource, mode, level)
 		}
+	}
+
+	if len(errs) > 0 {
+		return nil, nil, errors.Join(errs...)
+	}
+	return members, levels, nil
+}
+
+// generateOneMember is the one real place every Generate<Source>Member
+// dispatch happens -- shared by generateGroupMembers (config-driven,
+// reads a live .ubx/config) and generateGroupMembersFromSnapshot
+// (snapshot-driven, reads a previously committed group directly). Both
+// callers reconstruct the identical config.Provider shape from their
+// own real source before calling this; this function does not care
+// which source that was.
+func generateOneMember(mn, wireName string, cfg config.Provider, mode snapshot.Mode, prevMember *snapshot.MemberSnapshot) (*snapshot.MemberSnapshot, snapshot.ChangeLevel, error) {
+	switch cfg.SchemaSource {
+	case config.SchemaSourceOpenAPI:
+		member, _, level, err := snapshot.GenerateOpenAPIMember(mn, wireName, cfg.SchemaURL, mode, cfg, prevMember)
+		return member, level, err
+	case config.SchemaSourceCloudFormation:
+		member, _, level, err := snapshot.GenerateCloudFormationMember(mn, cfg.SchemaURL, mode, cfg, prevMember)
+		return member, level, err
+	case config.SchemaSourceSmithy:
+		member, _, level, err := snapshot.GenerateSmithyMember(mn, wireName, cfg.SchemaURL, cfg.TargetPrefix, mode, cfg.DataSourceNamespace, cfg, prevMember)
+		return member, level, err
+	case config.SchemaSourceDiscoveryDoc:
+		member, _, level, err := snapshot.GenerateDiscoveryDocMember(mn, wireName, cfg.SchemaURL, cfg.VersionQualifier, mode, cfg, prevMember)
+		return member, level, err
+	default:
+		return nil, snapshot.NoChange, fmt.Errorf("schema_source %q is not a real, known schema source", cfg.SchemaSource)
+	}
+}
+
+// generateGroupMembersFromSnapshot regenerates a group directly from
+// its own previously committed snapshot, with no live .ubx/config
+// involved at all (UBI-229). Every field a live [dynamic_providers.
+// <name>] table would have carried is already present on each
+// committed member's own MemberSnapshot -- SchemaSource, SchemaURL
+// (UBI-222), BaseURL, Auth, Retry, Timeouts, Resources, WireName,
+// VersionQualifier, TargetPrefix, DataSourceNamespace,
+// NamespaceFromTags -- exactly the set UBI-182's own doc comment on
+// MemberSnapshot says was carried through so a pinned member could be
+// "a real, complete replacement" for that table. Before this existed,
+// hash-watch.yml for every group-based provider (azure, google, aws)
+// had no choice but to carry its own full, separately maintained copy
+// of that live config just to know what to re-fetch -- a copy that
+// can silently drift from what is actually committed (this is
+// precisely what happened: azure_newrelic's own path moved upstream,
+// the copy was never updated, and the real committed snapshot was
+// never consulted to catch it), and, independent of drift, grew large
+// enough on its own to exceed GitHub Actions' own 21000-character
+// expression-length limit and fail to parse at all (confirmed
+// directly: azure's own embedded config's run block measured 31033
+// characters, google's 75678, aws's 164713, all three failing
+// workflow_dispatch outright with the identical parser error).
+// Iterates prev.Members in sorted key order -- determinism, not
+// incidental map order, the same discipline this project's own
+// hashing rules already require everywhere else.
+func generateGroupMembersFromSnapshot(prev *snapshot.Snapshot) (map[string]*snapshot.MemberSnapshot, map[string]snapshot.ChangeLevel, error) {
+	if prev == nil {
+		return nil, nil, fmt.Errorf("generateGroupMembersFromSnapshot: prev is nil")
+	}
+
+	names := make([]string, 0, len(prev.Members))
+	for name := range prev.Members {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	members := make(map[string]*snapshot.MemberSnapshot, len(names))
+	levels := make(map[string]snapshot.ChangeLevel, len(names))
+	var errs []error
+
+	for _, mn := range names {
+		prevMember := prev.Members[mn]
+		wireName := mn
+		if prevMember.WireName != "" {
+			wireName = prevMember.WireName
+		}
+		cfg := config.Provider{
+			Name:                mn,
+			SchemaSource:        config.SchemaSourceType(prevMember.SchemaSource),
+			SchemaURL:           prevMember.SchemaURL,
+			BaseURL:             prevMember.BaseURL,
+			Auth:                prevMember.Auth,
+			TargetPrefix:        prevMember.TargetPrefix,
+			WireName:            prevMember.WireName,
+			VersionQualifier:    prevMember.VersionQualifier,
+			DataSourceNamespace: prevMember.DataSourceNamespace,
+			NamespaceFromTags:   prevMember.NamespaceFromTags,
+			Retry:               prevMember.Retry,
+			Timeouts:            prevMember.Timeouts,
+			Resources:           prevMember.Resources,
+		}
+
+		member, level, genErr := generateOneMember(mn, wireName, cfg, prevMember.Mode, prevMember)
+		if genErr != nil {
+			errs = append(errs, fmt.Errorf("regenerate member %q from its own committed snapshot: %w", mn, genErr))
+			continue
+		}
+		members[mn] = member
+		levels[mn] = level
+		fmt.Fprintf(os.Stderr, "ubx-provider-dynamic: regenerated member %q (%s, %s) from its own committed snapshot, own change level: %s\n", mn, cfg.SchemaSource, prevMember.Mode, level)
 	}
 
 	if len(errs) > 0 {
