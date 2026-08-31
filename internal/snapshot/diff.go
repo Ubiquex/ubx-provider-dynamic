@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 )
 
 // ChangeLevel is DiffLevel's own real, closed outcome set, ordered so a
@@ -179,19 +180,17 @@ func diffAttribute(old, next *tfprotov6.SchemaAttribute) ChangeLevel {
 // rule, kept as precise as diffBlock's own BlockTypes recursion (never
 // downgraded to a coarse "any nested change = Major" shortcut, which
 // would over-report Major for a purely additive nested field): a flat
-// scalar/collection Type is compared by its own real .String() form
-// (unchanged from before this fix); a NestedType recurses field-by-field
-// exactly like diffBlock already does for BlockTypes; SWITCHING between
-// the two shapes (flat Type <-> NestedType) on the same field name is
-// always Major -- a real, structural shape change no caller's existing
-// code could survive either direction.
+// scalar/collection Type recurses through diffType (UBI-233 -- see its
+// own doc comment for why a plain .String() compare here was wrong); a
+// NestedType recurses field-by-field exactly like diffBlock already does
+// for BlockTypes; SWITCHING between the two shapes (flat Type <->
+// NestedType) on the same field name is always Major -- a real,
+// structural shape change no caller's existing code could survive
+// either direction.
 func diffAttributeType(old, next *tfprotov6.SchemaAttribute) ChangeLevel {
 	switch {
 	case old.NestedType == nil && next.NestedType == nil:
-		if old.Type.String() != next.Type.String() {
-			return Major
-		}
-		return NoChange
+		return diffType(old.Type, next.Type)
 	case old.NestedType != nil && next.NestedType != nil:
 		oldAttrs := attrsByName(old.NestedType.Attributes)
 		nextAttrs := attrsByName(next.NestedType.Attributes)
@@ -220,6 +219,168 @@ func diffAttributeType(old, next *tfprotov6.SchemaAttribute) ChangeLevel {
 	default:
 		return Major // flat Type <-> NestedType on the same field: a real, structural shape change
 	}
+}
+
+// diffType is UBI-233's own real fix. Before this, a flat tftypes.Type
+// (anything reaching here through diffAttributeType's own flat-Type
+// branch, never a NestedType -- those already recurse field-by-field
+// through diffAttribute) was compared with old.Type.String() !=
+// next.Type.String(), a full literal encoding of the type's entire
+// shape. Real, confirmed failure mode: a List of Objects (buildArray's
+// own real, deliberate shape for a nested array not reached through
+// BuildAttribute directly -- see translate.go's own doc comment) gains
+// one new, optional field somewhere inside that Object, and the
+// .String() form changes because the WHOLE literal changed, read by the
+// old code exactly like a field flipping from string to int. Confirmed
+// live: ubx-schema-github's own github_ds member reported Major for
+// exactly this, GitHub's Budget object gaining a purely additive
+// expires_at field, while the sibling github (resource) member's own
+// translation of the identical change correctly registered as Minor
+// (it goes through a real NestedType there, not a flat List of Object).
+//
+// diffType closes that gap by inspecting the type's own real structure
+// instead of its string form, for the three real container shapes this
+// codebase's own translate.go ever produces (Object, List/Set/Map,
+// Tuple -- checked directly, Tuple is never actually constructed today,
+// included anyway since the tftypes.Type interface allows it and a
+// silent fallback to Major for a real-but-rare shape would recreate
+// this exact bug for a different case). Anything else (a primitive
+// scalar, DynamicPseudoType, or two container kinds swapped for each
+// other on the same field) still falls back to a direct comparison --
+// correct there, since a primitive has no internal shape to look
+// inside, and swapping container kinds (a List becoming a Map) is
+// always a real, structural break no caller's existing code survives.
+func diffType(old, next tftypes.Type) ChangeLevel {
+	if old == nil && next == nil {
+		return NoChange
+	}
+	if old == nil || next == nil {
+		return Major // a real type appearing/disappearing where the other side had none
+	}
+
+	oldObj, oldIsObj := old.(tftypes.Object)
+	nextObj, nextIsObj := next.(tftypes.Object)
+	if oldIsObj || nextIsObj {
+		if !oldIsObj || !nextIsObj {
+			return Major // Object <-> something else: a real, structural shape change
+		}
+		return diffObjectType(oldObj, nextObj)
+	}
+
+	if oldList, ok := old.(tftypes.List); ok {
+		nextList, ok := next.(tftypes.List)
+		if !ok {
+			return Major
+		}
+		return diffType(oldList.ElementType, nextList.ElementType)
+	}
+	if oldSet, ok := old.(tftypes.Set); ok {
+		nextSet, ok := next.(tftypes.Set)
+		if !ok {
+			return Major
+		}
+		return diffType(oldSet.ElementType, nextSet.ElementType)
+	}
+	if oldMap, ok := old.(tftypes.Map); ok {
+		nextMap, ok := next.(tftypes.Map)
+		if !ok {
+			return Major
+		}
+		return diffType(oldMap.ElementType, nextMap.ElementType)
+	}
+	if oldTuple, ok := old.(tftypes.Tuple); ok {
+		nextTuple, ok := next.(tftypes.Tuple)
+		if !ok {
+			return Major
+		}
+		return diffTupleType(oldTuple, nextTuple)
+	}
+
+	// A primitive (String, Number, Bool, DynamicPseudoType) or any other
+	// leaf shape this codebase's own translator never builds a container
+	// out of -- no internal structure to inspect, its own literal form IS
+	// the whole shape, so comparing it directly is correct, not a
+	// fallback standing in for a missed case.
+	if old.String() != next.String() {
+		return Major
+	}
+	return NoChange
+}
+
+// diffObjectType compares two tftypes.Object values field by field,
+// exactly like diffBlock already does for a real tfprotov6.SchemaBlock's
+// own Attributes -- a new key is Minor (purely additive), a key that
+// disappeared is Major (real, breaking), a key present on both sides
+// recurses through diffType. OptionalAttributes is compared too even
+// though translate.go's own doc comment confirms this codebase never
+// actually populates it today (tftypes.Object.UsableAs panics
+// unconditionally once it's non-empty) -- correct to check anyway
+// rather than assume that stays true forever: a key moving OUT of
+// OptionalAttributes (was optional within the object, now always
+// present) is Major for the same real reason a field becoming Required
+// already is in diffAttributeFlags; moving IN is Minor, the same
+// direction as a field stopping being Required there.
+func diffObjectType(old, next tftypes.Object) ChangeLevel {
+	level := NoChange
+	raise := func(l ChangeLevel) {
+		if l > level {
+			level = l
+		}
+	}
+
+	for name, nt := range next.AttributeTypes {
+		ot, existed := old.AttributeTypes[name]
+		if !existed {
+			raise(Minor) // a new attribute inside the object -- purely additive
+			continue
+		}
+		raise(diffType(ot, nt))
+	}
+	for name := range old.AttributeTypes {
+		if _, stillExists := next.AttributeTypes[name]; !stillExists {
+			raise(Major) // an attribute disappeared from the object -- real, breaking
+		}
+	}
+
+	for name := range next.OptionalAttributes {
+		if _, wasOptional := old.OptionalAttributes[name]; !wasOptional {
+			if _, existedAtAll := old.AttributeTypes[name]; existedAtAll {
+				raise(Major) // was always-present, now optional-to-omit: a real narrowing for a caller relying on it always being there
+			}
+		}
+	}
+	for name := range old.OptionalAttributes {
+		if _, stillOptional := next.OptionalAttributes[name]; !stillOptional {
+			if _, stillExists := next.AttributeTypes[name]; stillExists {
+				raise(Minor) // was optional-to-omit, now always-present: purely additive
+			}
+		}
+	}
+
+	return level
+}
+
+// diffTupleType compares two tftypes.Tuple values positionally. Never
+// actually constructed by this codebase's own translate.go today (JSON
+// array types always become tftypes.List, never Tuple), included so a
+// real Tuple reaching here recurses correctly instead of falling
+// through to the crude whole-type .String() compare this fix exists to
+// remove. A length change is always Major here, deliberately
+// conservative: a Tuple's own positions are semantically distinct (not
+// a homogeneous collection the way a List's ElementType is), so neither
+// growing nor shrinking has a safe, generally-correct Minor reading the
+// way a new Object key or List-of-Object addition does.
+func diffTupleType(old, next tftypes.Tuple) ChangeLevel {
+	if len(old.ElementTypes) != len(next.ElementTypes) {
+		return Major
+	}
+	level := NoChange
+	for i, nt := range next.ElementTypes {
+		if l := diffType(old.ElementTypes[i], nt); l > level {
+			level = l
+		}
+	}
+	return level
 }
 
 func diffAttributeFlags(old, next *tfprotov6.SchemaAttribute) ChangeLevel {

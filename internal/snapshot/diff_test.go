@@ -252,3 +252,87 @@ func TestDiffLevel_NestedTypeAttribute_RealRegressionGuard(t *testing.T) {
 		}
 	})
 }
+
+// TestDiffLevel_FlatObjectType_RealRegressionGuard is UBI-233's own
+// regression guard, found live against ubx-schema-github's real spec:
+// a flat tftypes.List of tftypes.Object (buildArray's own real shape
+// for a nested array not reached through BuildAttribute directly, e.g.
+// GitHub's own Budget list) used to be compared by the WHOLE type's own
+// .String() form, so a purely additive field added anywhere inside that
+// Object changed the string and read as Major -- confirmed live:
+// github_ds's own budgets attribute reported Major for GitHub's Budget
+// object gaining one new, optional expires_at field, while the sibling
+// github (resource) member's own NestedType translation of the
+// identical change correctly read Minor. These cases prove a flat
+// List-of-Object (and a bare flat Object) are diffed with the same
+// real, granular precision NestedType already had, never by a coarse
+// "the type's own string changed" shortcut.
+func TestDiffLevel_FlatObjectType_RealRegressionGuard(t *testing.T) {
+	budgetObject := func(fields map[string]tftypes.Type) tftypes.Type {
+		return tftypes.List{ElementType: tftypes.Object{AttributeTypes: fields}}
+	}
+
+	t.Run("identical list of object: no change", func(t *testing.T) {
+		old := map[string]*tfprotov6.Schema{"widget": schemaWith(attr("budgets", budgetObject(map[string]tftypes.Type{
+			"id": tftypes.String, "amount": tftypes.Number,
+		}), false, false, true))}
+		next := map[string]*tfprotov6.Schema{"widget": schemaWith(attr("budgets", budgetObject(map[string]tftypes.Type{
+			"id": tftypes.String, "amount": tftypes.Number,
+		}), false, false, true))}
+		if got := DiffLevel(old, next); got != NoChange {
+			t.Errorf("DiffLevel(identical list of object) = %s, want none", got)
+		}
+	})
+
+	t.Run("new field inside object inside list: minor, not major (the real UBI-233 case)", func(t *testing.T) {
+		old := map[string]*tfprotov6.Schema{"widget": schemaWith(attr("budgets", budgetObject(map[string]tftypes.Type{
+			"id": tftypes.String, "amount": tftypes.Number,
+		}), false, false, true))}
+		next := map[string]*tfprotov6.Schema{"widget": schemaWith(attr("budgets", budgetObject(map[string]tftypes.Type{
+			"id": tftypes.String, "amount": tftypes.Number, "expires_at": tftypes.String,
+		}), false, false, true))}
+		if got := DiffLevel(old, next); got != Minor {
+			t.Errorf("DiffLevel(new field inside object inside list) = %s, want minor (real, purely additive, this is the exact live bug)", got)
+		}
+	})
+
+	t.Run("removed field inside object inside list: major", func(t *testing.T) {
+		old := map[string]*tfprotov6.Schema{"widget": schemaWith(attr("budgets", budgetObject(map[string]tftypes.Type{
+			"id": tftypes.String, "amount": tftypes.Number,
+		}), false, false, true))}
+		next := map[string]*tfprotov6.Schema{"widget": schemaWith(attr("budgets", budgetObject(map[string]tftypes.Type{
+			"id": tftypes.String,
+		}), false, false, true))}
+		if got := DiffLevel(old, next); got != Major {
+			t.Errorf("DiffLevel(removed field inside object inside list) = %s, want major (real, breaking, must not be missed by the fix)", got)
+		}
+	})
+
+	t.Run("field type changed inside object inside list: major", func(t *testing.T) {
+		old := map[string]*tfprotov6.Schema{"widget": schemaWith(attr("budgets", budgetObject(map[string]tftypes.Type{
+			"id": tftypes.String, "amount": tftypes.Number,
+		}), false, false, true))}
+		next := map[string]*tfprotov6.Schema{"widget": schemaWith(attr("budgets", budgetObject(map[string]tftypes.Type{
+			"id": tftypes.String, "amount": tftypes.String,
+		}), false, false, true))}
+		if got := DiffLevel(old, next); got != Major {
+			t.Errorf("DiffLevel(field type changed inside object inside list) = %s, want major (a real, incompatible shape change one level down must still be caught)", got)
+		}
+	})
+
+	t.Run("list becomes map on the same field: major", func(t *testing.T) {
+		old := map[string]*tfprotov6.Schema{"widget": schemaWith(attr("budgets", tftypes.List{ElementType: tftypes.Object{AttributeTypes: map[string]tftypes.Type{"id": tftypes.String}}}, false, false, true))}
+		next := map[string]*tfprotov6.Schema{"widget": schemaWith(attr("budgets", tftypes.Map{ElementType: tftypes.Object{AttributeTypes: map[string]tftypes.Type{"id": tftypes.String}}}, false, false, true))}
+		if got := DiffLevel(old, next); got != Major {
+			t.Errorf("DiffLevel(list -> map on same field) = %s, want major (swapping container kinds is a real, structural break)", got)
+		}
+	})
+
+	t.Run("new field inside a bare flat object (not wrapped in a list): minor", func(t *testing.T) {
+		old := map[string]*tfprotov6.Schema{"widget": schemaWith(attr("meta", tftypes.Object{AttributeTypes: map[string]tftypes.Type{"created_at": tftypes.String}}, false, false, true))}
+		next := map[string]*tfprotov6.Schema{"widget": schemaWith(attr("meta", tftypes.Object{AttributeTypes: map[string]tftypes.Type{"created_at": tftypes.String, "updated_at": tftypes.String}}, false, false, true))}
+		if got := DiffLevel(old, next); got != Minor {
+			t.Errorf("DiffLevel(new field inside bare flat object) = %s, want minor", got)
+		}
+	})
+}
