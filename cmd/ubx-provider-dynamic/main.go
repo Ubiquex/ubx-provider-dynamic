@@ -796,7 +796,59 @@ func run() error {
 		// service segment, not a re-split of a foreign legacy name) --
 		// true for a data-source-mode wire type too (deriveNoun is the
 		// identical real construction on both sides).
-		return json.NewEncoder(os.Stdout).Encode(map[string]string{})
+		//
+		// UBI-222: this unconditional empty result was real for every
+		// provider that never set NamespaceFromTags (true above), but
+		// wrong for one that does -- confirmed live, Cloudflare: this
+		// branch is the ONLY real code path a genuinely new, still-live
+		// (unpinned) OpenAPI provider's own onboarding ever exercises
+		// before a real ubx-schema-<name> snapshot exists, yet
+		// NamespaceFromTags was only ever wired into
+		// snapshot.namespacesFromTags -- the snapshot-GENERATION path
+		// (GenerateOpenAPIMember, --generate-snapshot-group), never this
+		// one. hop 3 of onboard-provider.md asks a session to check real
+		// grouping quality "before moving on" to creating that schema
+		// repo -- unreachable for an OpenAPI-sourced provider as this
+		// branch stood, since the one flag meant to fix bad grouping had
+		// no effect until a snapshot already existed, several hops later
+		// than the check it was meant to inform. Mirrors
+		// snapshot.namespacesFromTags' own real algorithm exactly (first
+		// tag wins, resources processed before data sources, never
+		// overwrite an entry already placed) rather than duplicating it
+		// by hand, calling resourcemap.Discover/DiscoverDataSources a
+		// second time here since dynserver.Build/resourcemap.BuildDataSources
+		// already discarded each candidate's own Tags by the time
+		// `resources`/`builtDS` reached this point.
+		out := map[string]string{}
+		if cfg.NamespaceFromTags {
+			liveResources, _, err := resourcemap.Discover(doc, wireName)
+			if err != nil {
+				return fmt.Errorf("resource mapping for namespace derivation: %w", err)
+			}
+			for _, r := range liveResources {
+				if r.ReadOperation == nil || len(r.ReadOperation.Tags) == 0 {
+					continue
+				}
+				if _, exists := out[r.TypeName]; exists {
+					continue
+				}
+				out[r.TypeName] = snapshot.TagToNamespace(r.ReadOperation.Tags[0])
+			}
+			liveDataSources, _, err := resourcemap.DiscoverDataSources(doc, wireName)
+			if err != nil {
+				return fmt.Errorf("data source mapping for namespace derivation: %w", err)
+			}
+			for _, ds := range liveDataSources {
+				if ds.Operation == nil || len(ds.Operation.Tags) == 0 {
+					continue
+				}
+				if _, exists := out[ds.TypeName]; exists {
+					continue
+				}
+				out[ds.TypeName] = snapshot.TagToNamespace(ds.Operation.Tags[0])
+			}
+		}
+		return json.NewEncoder(os.Stdout).Encode(out)
 	}
 
 	authenticator, err := auth.Build(cfg.Auth.Type, cfg.Auth.Params)

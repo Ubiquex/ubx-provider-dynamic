@@ -561,7 +561,7 @@ func TestNamespacesForSource_OpenAPI_BareNameCollision_ResourceWinsDeterministic
 	}
 }
 
-// TestTagToNamespace proves the real normalization tagToNamespace
+// TestTagToNamespace proves the real normalization TagToNamespace
 // applies to a raw OpenAPI Tag name -- lowercased, separator-free --
 // against real, representative DigitalOcean tag names (UBI-222).
 func TestTagToNamespace(t *testing.T) {
@@ -572,8 +572,8 @@ func TestTagToNamespace(t *testing.T) {
 		"Container Registry":   "containerregistry",
 	}
 	for tag, want := range cases {
-		if got := tagToNamespace(tag); got != want {
-			t.Errorf("tagToNamespace(%q) = %q, want %q", tag, got, want)
+		if got := TagToNamespace(tag); got != want {
+			t.Errorf("TagToNamespace(%q) = %q, want %q", tag, got, want)
 		}
 	}
 }

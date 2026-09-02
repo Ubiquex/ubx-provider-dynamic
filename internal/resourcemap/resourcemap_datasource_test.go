@@ -143,3 +143,50 @@ func TestDiscoverDataSources_FlatArrayResponse_NotMistakenForEnvelope(t *testing
 		t.Errorf("expected the flat-array AllowList to keep its own real name \"azure_allow_list\" (not unwrapped), got %q", got)
 	}
 }
+
+// TestDiscoverDataSources_PathFallbackNoun_UsesRealLastSegment is the
+// real, live-found deriveNoun fallback fix's own proof (UBI-222,
+// Cloudflare): a collection-listing GET with NO response-schema
+// component name at all (a genuinely inline schema, forcing deriveNoun's
+// own path-based fallback) and NO trailing {param} in its own read path
+// must derive its noun from the path's real LAST segment, not the
+// segment before it.
+//
+// Confirmed live against Cloudflare's own real spec: deriveNoun's
+// fallback loop started at len(segs)-2, correct only when the last
+// segment is always a {param} -- true for a single-item resource read
+// path, never checked for a collection-shaped data source path (the
+// wider candidate surface DiscoverDataSources' own doc comment
+// describes). Real, confirmed failures this produced: "ai" instead of
+// "finetune" for /accounts/{account_id}/ai/finetunes, "d1" instead of
+// "database" for /accounts/{account_id}/d1/database, "kv" instead of
+// "namespace" for /accounts/{account_id}/storage/kv/namespaces, and one
+// genuine crash: a path ending in a literal "-" segment
+// (/accounts/{account_id}/cloudforce-one/events/dataset/-/groups)
+// singularized "-" down to an empty string, producing a bare
+// "cloudflare_" TypeName that failed sdk/codegen/ir's own
+// ServiceAndLocalName outright ("wire type must be at least
+// <provider>_<service>") the moment a real `ubx sdk gen --dump-ir` run
+// reached it.
+func TestDiscoverDataSources_PathFallbackNoun_UsesRealLastSegment(t *testing.T) {
+	// No $ref at all -- an inline response schema, the one real case
+	// deriveNoun's own path-based fallback exists for.
+	inlineArray := openapi3.NewArraySchema()
+	inlineArray.Items = openapi3.NewSchemaRef("", openapi3.NewObjectSchema().WithProperty("name", openapi3.NewStringSchema()))
+	inlineResp := openapi3.NewSchemaRef("", inlineArray)
+
+	doc := newTestDoc(map[string]*testOp{
+		"/accounts/{account_id}/d1/database": {opID: "d1-list-databases", resp: inlineResp},
+	})
+
+	candidates, _, err := DiscoverDataSources(doc, "cloudflare")
+	if err != nil {
+		t.Fatalf("DiscoverDataSources: %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("expected exactly 1 candidate, got %d: %v", len(candidates), candidates)
+	}
+	if got := candidates[0].TypeName; got != "cloudflare_database" {
+		t.Errorf("expected the path's own real last segment \"database\" (not \"d1\", the segment before it), got %q", got)
+	}
+}
