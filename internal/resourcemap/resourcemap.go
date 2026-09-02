@@ -565,9 +565,18 @@ func deriveNoun(refName, readPath string) (service, version, noun string, note s
 		}
 		return "", "", toSnakeCase(refName), ""
 	}
+	// Starts at the TRUE last segment, not len(segs)-2 -- correct
+	// either way when the path ends in a {param} (a single-item
+	// resource read path: the param is skipped, same as before), but
+	// only correct when it doesn't (a collection-shaped data source
+	// path with no trailing {param}, real content skipped-then-lost
+	// there was the real UBI-222 Cloudflare bug: "ai" instead of
+	// "finetune" for .../ai/finetunes, "d1" instead of "database" for
+	// .../d1/database, and a genuine crash when the wrongly-picked
+	// segment singularized down to an empty string).
 	segs := strings.Split(strings.TrimSuffix(readPath, "/"), "/")
 	var last string
-	for i := len(segs) - 2; i >= 0; i-- {
+	for i := len(segs) - 1; i >= 0; i-- {
 		if !strings.HasPrefix(segs[i], "{") {
 			last = segs[i]
 			break

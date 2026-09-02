@@ -700,7 +700,7 @@ func namespacesFromTags(snap *Snapshot) (map[string]string, error) {
 			if _, exists := out[typeName]; exists {
 				continue
 			}
-			out[typeName] = tagToNamespace(r.ReadOperation.Tags[0])
+			out[typeName] = TagToNamespace(r.ReadOperation.Tags[0])
 		}
 	}
 
@@ -726,14 +726,14 @@ func namespacesFromTags(snap *Snapshot) (map[string]string, error) {
 			if _, exists := out[typeName]; exists {
 				continue
 			}
-			out[typeName] = tagToNamespace(ds.Operation.Tags[0])
+			out[typeName] = TagToNamespace(ds.Operation.Tags[0])
 		}
 	}
 
 	return out, nil
 }
 
-// tagToNamespace normalizes one real OpenAPI Tag Object's own name
+// TagToNamespace normalizes one real OpenAPI Tag Object's own name
 // ("BYOIP Prefixes", "1-Click Applications") into a namespace string
 // shaped the same way every other real source's own namespace already
 // is (CloudFormation's SplitTypeName, Smithy's ServiceNamespace): a
@@ -747,7 +747,7 @@ func namespacesFromTags(snap *Snapshot) (map[string]string, error) {
 // remainder as the local name, exactly the same real, safe degradation
 // CloudFormation's own namespace already has whenever ITS split doesn't
 // line up either -- never a hard failure either way.
-func tagToNamespace(tag string) string {
+func TagToNamespace(tag string) string {
 	var b strings.Builder
 	for _, r := range strings.ToLower(tag) {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
