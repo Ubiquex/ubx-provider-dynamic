@@ -570,3 +570,131 @@ func TestFindCreate_InlineEnvelopeFallback_MatchesGenuinePair(t *testing.T) {
 		t.Fatalf("expected create via POST /widgets, got %s %s", resources[0].CreateMethod, resources[0].CreatePath)
 	}
 }
+
+// fullyInlineEnvelope is genericEnvelope's own even weaker real
+// variant: the "result" field itself has no $ref either, a fully
+// anonymous inline object -- Cloudflare's own real dominant pattern,
+// confirmed live against its real spec (radar-get-entities-asn-by-id
+// and post_ImageUpload both wrap an inline, un-named "result" object,
+// not a $ref to any named schema at all). This is the real shape
+// TestFindCreate_InlineEnvelopeFallback_RequiresMatchingNestedRef's
+// own $ref-identity check has nothing to compare within -- both sides
+// have an empty Ref, so that check's own guard is a no-op here, and
+// only a real path relationship can tell these apart.
+func fullyInlineEnvelope(resultProps ...string) *openapi3.SchemaRef {
+	result := openapi3.NewObjectSchema()
+	for _, p := range resultProps {
+		result.WithProperty(p, openapi3.NewStringSchema())
+	}
+	s := openapi3.NewObjectSchema().WithProperty("success", openapi3.NewBoolSchema())
+	s.WithPropertyRef("result", openapi3.NewSchemaRef("", result))
+	return openapi3.NewSchemaRef("", s)
+}
+
+// TestFindCreate_InlineEnvelopeFallback_RequiresPathRelationship is the
+// real, live-found UBI-222 follow-up bug's own proof: when NEITHER
+// side of the inline-envelope fallback names its wrapped entity via
+// $ref (Cloudflare's own real dominant pattern, not the exception --
+// see fullyInlineEnvelope's own doc comment), the existing $ref-
+// identity guard has nothing to compare, and degrades silently back to
+// name-only matching. Confirmed live: 41 completely unrelated real
+// Cloudflare resources (Radar analytics reads, DNSSEC config, Zero
+// Trust gateway, Magic WAN routes, ...) all bound their own "create" to
+// the same POST /accounts/{accountId}/v1/images (Cloudflare Images
+// upload) purely because both sides share the generic
+// {result, success} shape with no $ref anywhere. A real path
+// relationship (pathIsAncestorOrSame) is the fix -- these two paths
+// share no real structural relationship at all.
+func TestFindCreate_InlineEnvelopeFallback_RequiresPathRelationship(t *testing.T) {
+	readOp := &openapi3.Operation{
+		OperationID: "radar-get-entities-asn-by-id",
+		Responses:   responses200(fullyInlineEnvelope("asn", "name", "country")),
+	}
+	unrelatedOp := &openapi3.Operation{
+		OperationID: "post_ImageUpload",
+		Responses:   responses200(fullyInlineEnvelope("id", "filename", "uploaded")),
+	}
+
+	doc := &openapi3.T{OpenAPI: "3.0.3", Info: &openapi3.Info{Title: "t", Version: "1"}}
+	doc.Paths = openapi3.NewPaths(
+		openapi3.WithPath("/radar/entities/asns/{asn}", &openapi3.PathItem{Get: readOp}),
+		openapi3.WithPath("/accounts/{accountId}/v1/images", &openapi3.PathItem{Post: unrelatedOp}),
+	)
+
+	resources, notes, err := Discover(doc, "cloudflare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 0 {
+		t.Fatalf("expected the unrelated Images-upload operation to NOT be matched as this Radar read's own create -- got %d resource(s): %+v", len(resources), resources)
+	}
+	found := false
+	for _, n := range notes {
+		if strings.Contains(n.Detail, "no matching create") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a real 'no matching create' note (correctly skipped, not silently matched), got: %+v", notes)
+	}
+}
+
+// TestFindCreate_InlineEnvelopeFallback_MatchesFullyInlinePathRelatedPair
+// is the fully-inline fallback's own real negative-path proof, matching
+// the real cloudflare_image case: a genuine create/read pair, neither
+// side naming its wrapped entity via $ref, whose paths share the real
+// ancestor relationship (PUT/GET on the same item path -- or here,
+// POST-on-collection under a read item path) must still match. The fix
+// narrows the match to a real structural relationship, it does not
+// require a $ref that Cloudflare's own real spec usually doesn't have.
+func TestFindCreate_InlineEnvelopeFallback_MatchesFullyInlinePathRelatedPair(t *testing.T) {
+	readOp := &openapi3.Operation{
+		OperationID: "images_get",
+		Responses:   responses200(fullyInlineEnvelope("id", "filename", "uploaded")),
+	}
+	createOp := &openapi3.Operation{
+		OperationID: "post_ImageUpload",
+		Responses:   responses200(fullyInlineEnvelope("id", "filename", "uploaded")),
+	}
+
+	doc := &openapi3.T{OpenAPI: "3.0.3", Info: &openapi3.Info{Title: "t", Version: "1"}}
+	doc.Paths = openapi3.NewPaths(
+		openapi3.WithPath("/accounts/{accountId}/v1/images/{imageId}", &openapi3.PathItem{Get: readOp}),
+		openapi3.WithPath("/accounts/{accountId}/v1/images", &openapi3.PathItem{Post: createOp}),
+	)
+
+	resources, _, err := Discover(doc, "cloudflare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("expected the genuine, path-related, fully-inline create/read pair to still match, got %d: %+v", len(resources), resources)
+	}
+	if resources[0].CreatePath != "/accounts/{accountId}/v1/images" || resources[0].CreateMethod != "POST" {
+		t.Fatalf("expected create via POST /accounts/{accountId}/v1/images, got %s %s", resources[0].CreateMethod, resources[0].CreatePath)
+	}
+}
+
+func TestPathIsAncestorOrSame(t *testing.T) {
+	tests := []struct {
+		name          string
+		readPath      string
+		candidatePath string
+		want          bool
+	}{
+		{"identical", "/widgets/{id}", "/widgets/{id}", true},
+		{"real ancestor collection", "/accounts/{accountId}/v1/images/{imageId}", "/accounts/{accountId}/v1/images", true},
+		{"param name differs, still positionally aligned", "/accounts/{account_id}/v1/images/{imageId}", "/accounts/{accountId}/v1/images", true},
+		{"unrelated literal segment", "/radar/entities/asns/{asn}", "/accounts/{accountId}/v1/images", false},
+		{"candidate longer than read path", "/widgets", "/widgets/{id}", false},
+		{"literal where read has a param", "/widgets/{id}", "/widgets/static", false},
+		{"param where read has a literal", "/widgets/static", "/widgets/{id}", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pathIsAncestorOrSame(tt.readPath, tt.candidatePath); got != tt.want {
+				t.Errorf("pathIsAncestorOrSame(%q, %q) = %v, want %v", tt.readPath, tt.candidatePath, got, tt.want)
+			}
+		})
+	}
+}

@@ -373,11 +373,15 @@ func findCreate(ops []op, readPath, refName string, readSchema *openapi3.Schema)
 			}
 			continue
 		}
-		// Neither side has a $ref name (both inline) -- fall back to a
-		// structural check: same set of top-level property names. Cheap
-		// and real enough to catch an inline-schema'd create/read pair
-		// without pulling in a full deep-equality comparison.
-		if refName == "" && candidateRef == "" && sameTopLevelProperties(readSchema, candidateSchema) {
+		// Neither side has a $ref name (both inline) -- the response
+		// shape alone is not a reliable signal here (see
+		// pathIsAncestorOrSame's own doc comment for why), so this
+		// branch also requires the candidate to sit on a real
+		// structural path relationship to the read path, on top of the
+		// existing top-level-property-name check.
+		if refName == "" && candidateRef == "" &&
+			pathIsAncestorOrSame(readPath, o.path) &&
+			sameTopLevelProperties(readSchema, candidateSchema) {
 			matches = append(matches, o)
 		}
 	}
@@ -464,6 +468,61 @@ func parentCollectionPath(path string) string {
 		return path
 	}
 	return strings.Join(segs[:len(segs)-1], "/")
+}
+
+// pathIsAncestorOrSame reports whether candidatePath is a genuine
+// structural ancestor of (or identical to) readPath: every literal
+// segment agrees, every {param} segment aligns positionally regardless
+// of its own literal name (Cloudflare's own real spec mixes
+// {accountId} and {account_id} for the same real path role across
+// different API generations, so param names can't be compared
+// literally), and candidatePath is never longer than readPath.
+//
+// findCreate's own inline-schema fallback (sameTopLevelProperties)
+// needs this on top of the shape check -- confirmed live, UBI-222:
+// with no path relationship required at all, that fallback matches
+// ANY POST/PUT in the whole spec whose response happens to share the
+// read's own top-level property names, tie-broken by fewest path
+// params then shortest path string. Cloudflare's real spec shares the
+// same generic inline envelope ("result"/"success", sometimes plus
+// "errors"/"messages") across nearly every operation, so the shape
+// check alone is close to meaningless there, and the tie-break just
+// converges on whichever matching-shaped POST/PUT happens to have the
+// globally shortest, least-parameterized path in the entire spec --
+// confirmed live, this made 41 completely unrelated resources (Radar
+// analytics reads, DNSSEC config, Zero Trust gateway, Magic WAN
+// routes, ...) all silently bind their own "create" to the same
+// POST /accounts/{accountId}/v1/images (Cloudflare Images upload),
+// the shortest fewest-param POST sharing that shape anywhere in the
+// spec. This is the same class of failure sameTopLevelProperties'
+// own $ref-identity check (see below) was built to close, just a
+// variant it can't see: that check has nothing to compare when
+// NEITHER side names its wrapped entity via $ref, which is
+// Cloudflare's dominant real pattern, not the exception. Path
+// structure is what every genuine create/read pair in this file
+// already relies on regardless (PUT-on-item is depth-equal to its own
+// read path; POST-on-collection is depth-minus-one via the read
+// path's own trailing {param}), so requiring it here closes the gap
+// at its real root instead of adding a third narrow shape-side guard
+// that the next generic envelope shape would just defeat again.
+func pathIsAncestorOrSame(readPath, candidatePath string) bool {
+	readSegs := strings.Split(strings.Trim(readPath, "/"), "/")
+	candidateSegs := strings.Split(strings.Trim(candidatePath, "/"), "/")
+	if len(candidateSegs) > len(readSegs) {
+		return false
+	}
+	for i, c := range candidateSegs {
+		r := readSegs[i]
+		cParam := strings.HasPrefix(c, "{") && strings.HasSuffix(c, "}")
+		rParam := strings.HasPrefix(r, "{") && strings.HasSuffix(r, "}")
+		if cParam != rParam {
+			return false
+		}
+		if !cParam && c != r {
+			return false
+		}
+	}
+	return true
 }
 
 // sameTopLevelProperties is findCreate's own inline-schema fallback
