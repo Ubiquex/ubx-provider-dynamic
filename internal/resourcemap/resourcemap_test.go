@@ -466,3 +466,107 @@ func keysOf(m map[string]Resource) []string {
 // internal/discoverydoc -- see that package for the real overlap-trim
 // test cases, including the GCP Discovery Docs one this extraction was
 // done for.
+
+// genericEnvelope builds a real, common inline response shape (an
+// "errors"/"messages"/"result"/"success" wrapper, Cloudflare's own real
+// generic API envelope) around whatever schema the caller passes as
+// "result" -- the exact real shape sameTopLevelProperties' own inline
+// fallback has to tell genuinely different real endpoints apart within.
+func genericEnvelope(resultRef *openapi3.SchemaRef) *openapi3.SchemaRef {
+	s := openapi3.NewObjectSchema().
+		WithProperty("errors", openapi3.NewArraySchema()).
+		WithProperty("messages", openapi3.NewArraySchema()).
+		WithProperty("success", openapi3.NewBoolSchema())
+	s.WithPropertyRef("result", resultRef)
+	return openapi3.NewSchemaRef("", s)
+}
+
+// TestFindCreate_InlineEnvelopeFallback_RequiresMatchingNestedRef is the
+// real, live-found UBI-222 Cloudflare bug's own proof: two completely
+// unrelated real operations, both wrapping their own response in the
+// identical generic envelope shape (real and common -- thousands of
+// Cloudflare endpoints share it), must NOT be matched as a create/read
+// pair just because their own top-level property NAMES happen to line
+// up. Confirmed live: cloudflare_abuse_report's own real CREATE
+// operation was wired to POST /accounts/move ("Batch move accounts...
+// Not implemented," per its own real description) purely because both
+// responses share this envelope -- the genuinely different real type
+// each one's own "result" field wraps (AbuseReport vs
+// BatchAccountMoveResponse) is exactly the real signal a name-only
+// comparison could not see.
+func TestFindCreate_InlineEnvelopeFallback_RequiresMatchingNestedRef(t *testing.T) {
+	abuseReportRef := openapi3.NewSchemaRef("#/components/schemas/AbuseReport",
+		openapi3.NewObjectSchema().WithProperty("id", openapi3.NewStringSchema()))
+	batchMoveRef := openapi3.NewSchemaRef("#/components/schemas/BatchAccountMoveResponse",
+		openapi3.NewObjectSchema().WithProperty("account_id", openapi3.NewStringSchema()))
+
+	readOp := &openapi3.Operation{
+		OperationID: "GetAbuseReport",
+		Responses:   responses200(genericEnvelope(abuseReportRef)),
+	}
+	unrelatedOp := &openapi3.Operation{
+		OperationID: "Accounts_batchMoveAccounts",
+		Responses:   responses200(genericEnvelope(batchMoveRef)),
+	}
+
+	doc := &openapi3.T{OpenAPI: "3.0.3", Info: &openapi3.Info{Title: "t", Version: "1"}}
+	doc.Paths = openapi3.NewPaths(
+		openapi3.WithPath("/accounts/{account_id}/abuse-reports/{report_id}", &openapi3.PathItem{Get: readOp}),
+		openapi3.WithPath("/accounts/move", &openapi3.PathItem{Post: unrelatedOp}),
+	)
+
+	resources, notes, err := Discover(doc, "cloudflare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 0 {
+		t.Fatalf("expected the unrelated /accounts/move operation to NOT be matched as this resource's own create -- got %d resource(s): %+v", len(resources), resources)
+	}
+	found := false
+	for _, n := range notes {
+		if strings.Contains(n.Detail, "no matching create") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a real 'no matching create' note (correctly skipped, not silently matched), got: %+v", notes)
+	}
+}
+
+// TestFindCreate_InlineEnvelopeFallback_MatchesGenuinePair is
+// TestFindCreate_InlineEnvelopeFallback_RequiresMatchingNestedRef's own
+// real negative-path proof: the inline-envelope fallback must still
+// match a genuine create/read pair that legitimately shares the
+// identical envelope AND the identical nested "result" $ref -- the fix
+// narrows the match, it does not remove the real case this fallback
+// exists for.
+func TestFindCreate_InlineEnvelopeFallback_MatchesGenuinePair(t *testing.T) {
+	widgetRef := openapi3.NewSchemaRef("#/components/schemas/Widget",
+		openapi3.NewObjectSchema().WithProperty("id", openapi3.NewStringSchema()))
+
+	readOp := &openapi3.Operation{
+		OperationID: "GetWidget",
+		Responses:   responses200(genericEnvelope(widgetRef)),
+	}
+	createOp := &openapi3.Operation{
+		OperationID: "CreateWidget",
+		Responses:   responses200(genericEnvelope(widgetRef)),
+	}
+
+	doc := &openapi3.T{OpenAPI: "3.0.3", Info: &openapi3.Info{Title: "t", Version: "1"}}
+	doc.Paths = openapi3.NewPaths(
+		openapi3.WithPath("/widgets/{widget_id}", &openapi3.PathItem{Get: readOp}),
+		openapi3.WithPath("/widgets", &openapi3.PathItem{Post: createOp}),
+	)
+
+	resources, _, err := Discover(doc, "cloudflare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("expected the genuine create/read pair (same envelope, same nested $ref) to still match, got %d: %+v", len(resources), resources)
+	}
+	if resources[0].CreatePath != "/widgets" || resources[0].CreateMethod != "POST" {
+		t.Fatalf("expected create via POST /widgets, got %s %s", resources[0].CreateMethod, resources[0].CreatePath)
+	}
+}

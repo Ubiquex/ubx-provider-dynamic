@@ -466,6 +466,31 @@ func parentCollectionPath(path string) string {
 	return strings.Join(segs[:len(segs)-1], "/")
 }
 
+// sameTopLevelProperties is findCreate's own inline-schema fallback
+// signal: cheap, real enough to catch an inline-schema'd create/read
+// pair without a full deep-equality comparison -- as long as matching
+// property NAMES alone is not the whole check. Confirmed live,
+// UBI-222: Cloudflare's own real generic response envelope
+// ("errors"/"messages"/"result"/"success", shared verbatim across
+// thousands of genuinely unrelated real endpoints) made a name-only
+// comparison match ANY two inline-schema'd operations using that
+// shape -- confirmed, cloudflare_abuse_report's own real CREATE
+// operation was wired to POST /accounts/move ("Batch move accounts...
+// Not implemented", per its own real description), a completely
+// unrelated endpoint that happens to share the identical four
+// property names. Both responses wrap their own real entity in a
+// "result" field that is itself a named $ref (abuse-reports_AbuseReport
+// vs organizations-api_BatchAccountMoveResponse) -- genuinely
+// different real types the name-only check could not see.
+//
+// Fixed by also requiring every shared property that is a named $ref
+// on EITHER side to be the IDENTICAL $ref on both -- the real,
+// discriminating signal a generic envelope's own boilerplate fields
+// (errors/messages/success, rarely $refs pointing at the entity
+// itself) don't carry, but the one field actually wrapping the real
+// entity (Cloudflare's own "result", not assumed to always be named
+// that -- checked generically, whichever shared property is itself
+// $ref'd) does.
 func sameTopLevelProperties(a, b *openapi3.Schema) bool {
 	if a == nil || b == nil || len(a.Properties) == 0 {
 		return false
@@ -473,8 +498,14 @@ func sameTopLevelProperties(a, b *openapi3.Schema) bool {
 	if len(a.Properties) != len(b.Properties) {
 		return false
 	}
-	for name := range a.Properties {
-		if _, ok := b.Properties[name]; !ok {
+	for name, aProp := range a.Properties {
+		bProp, ok := b.Properties[name]
+		if !ok {
+			return false
+		}
+		aRef := aProp.Ref
+		bRef := bProp.Ref
+		if (aRef != "" || bRef != "") && aRef != bRef {
 			return false
 		}
 	}
