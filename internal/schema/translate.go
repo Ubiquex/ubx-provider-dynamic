@@ -189,8 +189,49 @@ func (t *Translator) BuildAttribute(name string, sr *openapi3.SchemaRef, policy 
 // wrapping NestedType slot the way a nested field does; BuildAttribute
 // itself is for translating a NAMED field within some containing object,
 // not a document's own top-level request/response body).
+//
+// UBI-250: used to call buildProperties(s, path) directly regardless of
+// s's own shape, reading only s's own direct Properties. A schema
+// composed via allOf (real, common: ARM's own Resource/TrackedResource/
+// ProxyResource envelope, allOf: [{$ref: Resource}] plus the resource's
+// own sibling properties) never reached buildAllOf at all -- that path
+// only exists inside buildType, for a schema appearing as a NESTED
+// value, not for the top-level entry point every resource's own
+// create/read/input/output schema goes through. Confirmed real and
+// large-scale, not a theoretical case: Azure's own AnalysisServicesServer
+// is exactly this shape, and its own base Resource schema is where id,
+// name, type, location, tags, and sku live -- all silently absent from
+// the translated schema before this fix, on 731 of 1,106 real Azure
+// resources checked (731 missing id, 736 missing type). Checked directly
+// against isObjectType before this fix too: a schema that's PURELY
+// allOf-composed, with no direct type or properties of its own, failed
+// isObjectType's own gate and returned nil here, losing every field, not
+// just the allOf branch's -- both shapes are covered by checking AllOf
+// first, matching buildType's own real precedence (oneOf/anyOf/allOf
+// checked before isObjectType, translate.go's own buildType switch).
+//
+// The explicit enterObject/exitObject pair here, keyed on the real s
+// (not the fresh, synthetic schema mergeAllOf builds), mirrors
+// buildComposedType's own real fix for the identical class of bug
+// (this file's own doc comment on buildComposedType has the full
+// account, a real 60-level-deep infinite-seeming expansion on a
+// genuinely self-referential schema before that fix existed) --
+// without it, a self-referential top-level allOf schema would never be
+// caught, since buildProperties' own inner guard only ever sees
+// mergeAllOf's fresh pointer, never the real, stable one a repeated
+// visit could match against.
 func (t *Translator) BuildTopLevel(s *openapi3.Schema, path string) []*tfprotov6.SchemaAttribute {
-	if s == nil || !isObjectType(s) {
+	if s == nil {
+		return nil
+	}
+	if len(s.AllOf) > 0 {
+		if !t.enterObject(s, path) {
+			return nil
+		}
+		defer t.exitObject()
+		return t.buildProperties(mergeAllOf(s), path)
+	}
+	if !isObjectType(s) {
 		return nil
 	}
 	return t.buildProperties(s, path)
@@ -370,6 +411,7 @@ func (t *Translator) buildMap(s *openapi3.Schema, path string) tftypes.Type {
 //     coherent static shape at all in tfplugin's type system --
 //     DynamicPseudoType, fully opaque to Terraform's own type-checking,
 //     the same honest fallback a schema-less value gets.
+//
 // buildComposedType wraps buildFn (buildUnion for oneOf/anyOf, buildAllOf
 // for allOf) with this Translator's own real, existing cycle guard
 // (enterObject/exitObject) -- keyed on s ITSELF, the real, stable,
@@ -450,14 +492,17 @@ func (t *Translator) buildUnion(branches openapi3.SchemaRefs, kind, path string)
 	return tftypes.DynamicPseudoType
 }
 
-// buildAllOf translates JSON Schema composition (`allOf`, real, common
-// usage: "extends" a base object schema with additional properties) into
-// one merged object -- genuinely NOT lossy the way oneOf/anyOf are: allOf
-// branches are meant to hold simultaneously, so a plain property union
-// (later branches' properties winning on a name collision, matching JSON
-// Schema's own last-applied-wins merge semantics for object composition)
-// is a faithful translation, not a compromise.
-func (t *Translator) buildAllOf(s *openapi3.Schema, path string) tftypes.Type {
+// mergeAllOf flattens s's own allOf branches together with s's own
+// direct Properties into one synthetic schema -- shared by buildAllOf
+// (allOf appearing as a nested/value type) and BuildTopLevel (allOf
+// appearing as a resource's own top-level create/read/input/output
+// schema, UBI-250), which both need the identical composition
+// semantics. Returns a fresh *openapi3.Schema every call, deliberately
+// -- callers that need cycle protection against a self-referential s
+// must guard on s itself (the real, stable, $ref-deduped pointer),
+// never on this function's own return value, matching
+// buildComposedType's own doc comment.
+func mergeAllOf(s *openapi3.Schema) *openapi3.Schema {
 	merged := &openapi3.Schema{Properties: openapi3.Schemas{}, Required: append([]string{}, s.Required...)}
 	for _, branch := range s.AllOf {
 		bs := deref(branch)
@@ -472,7 +517,18 @@ func (t *Translator) buildAllOf(s *openapi3.Schema, path string) tftypes.Type {
 	for name, ref := range s.Properties {
 		merged.Properties[name] = ref
 	}
-	return objectValueType(t.buildProperties(merged, path))
+	return merged
+}
+
+// buildAllOf translates JSON Schema composition (`allOf`, real, common
+// usage: "extends" a base object schema with additional properties) into
+// one merged object -- genuinely NOT lossy the way oneOf/anyOf are: allOf
+// branches are meant to hold simultaneously, so a plain property union
+// (later branches' properties winning on a name collision, matching JSON
+// Schema's own last-applied-wins merge semantics for object composition)
+// is a faithful translation, not a compromise.
+func (t *Translator) buildAllOf(s *openapi3.Schema, path string) tftypes.Type {
+	return objectValueType(t.buildProperties(mergeAllOf(s), path))
 }
 
 // objectValueType builds the tftypes.Type a []*SchemaAttribute value would

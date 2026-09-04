@@ -174,6 +174,129 @@ func TestBuildAttribute_AllOfMerges(t *testing.T) {
 	}
 }
 
+// TestBuildTopLevel_AllOfMerges is UBI-250's own real regression test:
+// BuildTopLevel used to call buildProperties(s, path) directly, reading
+// only s's own direct Properties, so a resource composed via allOf --
+// ARM's own real, common Resource/TrackedResource/ProxyResource envelope
+// shape, allOf: [{$ref: Resource}] plus the resource's own sibling
+// properties -- lost every field the allOf branch carried. Reproduces
+// that exact real shape (base Resource: id/name/type, the resource's
+// own sibling "properties" field), confirmed against Azure's own real
+// AnalysisServicesServer schema.
+func TestBuildTopLevel_AllOfMerges(t *testing.T) {
+	base := openapi3.NewObjectSchema().
+		WithProperty("id", openapi3.NewStringSchema()).
+		WithProperty("name", openapi3.NewStringSchema()).
+		WithProperty("type", openapi3.NewStringSchema())
+	s := &openapi3.Schema{
+		AllOf: openapi3.SchemaRefs{ref(base)},
+		Properties: openapi3.Schemas{
+			"properties": openapi3.NewSchemaRef("", openapi3.NewObjectSchema().WithProperty("sku", openapi3.NewStringSchema())),
+		},
+	}
+
+	tr := NewTranslator()
+	attrs := tr.BuildTopLevel(s, "azure_analysisservices_server")
+
+	found := map[string]bool{}
+	for _, a := range attrs {
+		found[a.Name] = true
+	}
+	for _, want := range []string{"id", "name", "type", "properties"} {
+		if !found[want] {
+			t.Fatalf("expected %q in top-level attributes, got %+v", want, found)
+		}
+	}
+}
+
+// TestBuildTopLevel_AllOfOnly_NoDirectProperties covers the other real
+// shape UBI-250 found: a schema that is PURELY allOf-composed, with no
+// direct type or properties of its own at all. Before this fix,
+// isObjectType's own gate (s.Type == nil, len(s.Properties) == 0) failed
+// for this shape and BuildTopLevel returned nil outright -- losing every
+// field, not just the allOf branch's.
+func TestBuildTopLevel_AllOfOnly_NoDirectProperties(t *testing.T) {
+	base := openapi3.NewObjectSchema().WithProperty("id", openapi3.NewStringSchema())
+	s := &openapi3.Schema{AllOf: openapi3.SchemaRefs{ref(base)}}
+
+	tr := NewTranslator()
+	attrs := tr.BuildTopLevel(s, "pure_allof")
+	if len(attrs) != 1 || attrs[0].Name != "id" {
+		t.Fatalf("expected exactly [id], got %+v", attrs)
+	}
+}
+
+// TestBuildTopLevel_SelfReferentialAllOf_DoesNotHang is UBI-250's own
+// cycle-guard regression: BuildTopLevel's new allOf path hands
+// mergeAllOf's fresh, synthetic schema to buildProperties, never s
+// itself, so a self-referential top-level allOf schema needs its own
+// enterObject/exitObject guard keyed on the real s -- the identical
+// class of bug buildComposedType's own doc comment already documents
+// for the nested-value allOf path (checkpoint 12), reproduced here for
+// the top-level entry point specifically.
+func TestBuildTopLevel_SelfReferentialAllOf_DoesNotHang(t *testing.T) {
+	// node is PURELY allOf-composed (no direct Properties of its own) --
+	// the cyclic "children" field lives inside the allOf branch itself,
+	// so reaching it necessarily goes through BuildTopLevel's own new
+	// mergeAllOf(node) path, not node's own direct Properties. This is
+	// the shape that specifically needs BuildTopLevel's own
+	// enterObject(node)/exitObject guard: without it, the recursive
+	// re-entry into node (via the array item) would only be caught one
+	// level deeper, by buildComposedType's own pre-existing guard, not
+	// missed entirely, but not the real, tight fix either.
+	node := &openapi3.Schema{}
+	childrenArray := openapi3.NewArraySchema()
+	childrenArray.Items = openapi3.NewSchemaRef("#/components/schemas/node", node)
+	base := openapi3.NewObjectSchema().WithProperty("name", openapi3.NewStringSchema())
+	base.Properties["children"] = openapi3.NewSchemaRef("", childrenArray)
+	node.AllOf = openapi3.SchemaRefs{openapi3.NewSchemaRef("#/components/schemas/base", base)}
+
+	tr := NewTranslator()
+	done := make(chan []*tfprotov6.SchemaAttribute, 1)
+	go func() {
+		done <- tr.BuildTopLevel(node, "root")
+	}()
+
+	var attrs []*tfprotov6.SchemaAttribute
+	select {
+	case attrs = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("BuildTopLevel hung on a self-referential top-level allOf schema -- cycle guard did not stop recursion")
+	}
+
+	found := map[string]bool{}
+	for _, a := range attrs {
+		found[a.Name] = true
+	}
+	if !found["name"] || !found["children"] {
+		t.Fatalf("expected a real top-level result, got %+v", attrs)
+	}
+
+	foundCycleNote := false
+	for _, n := range tr.Notes {
+		if strings.Contains(n.Detail, "self-referential") {
+			foundCycleNote = true
+		}
+	}
+	if !foundCycleNote {
+		t.Fatalf("expected a self-referential Note, got %+v", tr.Notes)
+	}
+
+	// The real, load-bearing assertion, matching
+	// TestBuildAttribute_IndirectCycleThroughOneOf_CaughtQuickly's own
+	// convention: the cycle must be caught within a couple of real
+	// levels, not run anywhere near defaultMaxDepth.
+	var children *tfprotov6.SchemaAttribute
+	for _, a := range attrs {
+		if a.Name == "children" {
+			children = a
+		}
+	}
+	if children == nil || children.Type == nil {
+		t.Fatalf("expected a real children attribute, got %+v", attrs)
+	}
+}
+
 // TestBuildAttribute_SelfReferentialSchema_DoesNotHang reproduces the real
 // failure this translator hit live against Datadog's own published OpenAPI
 // spec before the cycle guard existed: a schema whose own property
