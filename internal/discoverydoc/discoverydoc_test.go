@@ -257,7 +257,7 @@ func TestDiscover_ReadOnlyNode_SkippedWithNote(t *testing.T) {
 	}
 }
 
-func TestBuild_TranslatesRealShape_ReadOnlyMergesToOptionalComputed_EnumCarried(t *testing.T) {
+func TestBuild_TranslatesRealShape_ReadOnlyMergesToComputedOnly_EnumCarried(t *testing.T) {
 	doc := buildPubSubShapedDoc()
 	built, notes, err := Build(doc, "google", "")
 	if err != nil {
@@ -289,17 +289,19 @@ func TestBuild_TranslatesRealShape_ReadOnlyMergesToOptionalComputed_EnumCarried(
 	if !foundName || !nameOptional {
 		t.Fatalf("expected a real, Optional 'name' attribute (no required-field signal exists in a real Discovery Document body schema -- see this package's own doc comment)")
 	}
-	// "state" is readOnly in the Topic schema, but that same schema is
+	// "state" is readOnly in the Topic schema, and that same schema is
 	// referenced by BOTH create's own request AND the read response (the
-	// real, confirmed shape Pub/Sub's own live discovery document uses)
-	// -- MergeResourceAttributes' own real, documented rule for "both
-	// sides, create Optional (not Required)" is Optional+Computed ("the
-	// user may set it, or leave it for the server to default"), not
-	// Computed-only; readOnly alone never produces Required on the
-	// create side, so this is the correct, expected merged result, not
-	// a bug.
-	if !foundState || !stateComputed || stateRequired || !stateOptional {
-		t.Fatalf("expected 'state' to merge to Optional+Computed (MergeResourceAttributes' own real rule), got computed=%v required=%v optional=%v", stateComputed, stateRequired, stateOptional)
+	// real, confirmed shape Pub/Sub's own live discovery document uses).
+	// UBI-248: this used to assert Optional+Computed here, reasoning that
+	// create's own independent agreement (it also sees readOnly, off the
+	// same shared schema) was evidence the field might genuinely be
+	// settable. It isn't -- it's the same vendor marker read twice off
+	// one object, not a second, independent signal. MergeResourceAttributes
+	// now lets read's own readOnly marker win regardless of whether create
+	// already agrees, so this merges to Computed only, the same as the
+	// asymmetric case (Kubernetes's own ObjectMeta.uid).
+	if !foundState || !stateComputed || stateRequired || stateOptional {
+		t.Fatalf("expected 'state' to merge to Computed only (readOnly wins over the symmetric case), got computed=%v required=%v optional=%v", stateComputed, stateRequired, stateOptional)
 	}
 
 	sig := br.Signals["state"]

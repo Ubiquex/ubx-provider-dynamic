@@ -128,3 +128,33 @@ func TestMergeResourceAttributes_AsymmetricNestedType_NoRecursion(t *testing.T) 
 		t.Fatalf("thing.NestedType.Attributes lost create's own inner field")
 	}
 }
+
+// UBI-248: a field readOnly in a schema BOTH create and read reference
+// identically (Google Compute's own Instance -- insert.request and
+// get.response both $ref the same schema, so self_link's own real
+// readOnly: true reaches create's own translation too) used to be read
+// as create "already agreeing" the field was settable, which suppressed
+// the correction and merged it to Optional+Computed instead of Computed
+// only. Create seeing the same marker off the same shared schema is not
+// independent confirmation -- it is the one real signal, read twice.
+func TestMergeResourceAttributes_SymmetricReadOnly_CreateSharesSameMarker(t *testing.T) {
+	// create side: self_link comes from the same shared Instance schema
+	// as read, so create's own translation already saw readOnly: true
+	// too -- Computed only, not Optional, exactly like read's own copy.
+	createSelfLink := attr("self_link", func(a *tfprotov6.SchemaAttribute) { a.Computed = true })
+	readSelfLink := attr("self_link", func(a *tfprotov6.SchemaAttribute) { a.Computed = true })
+
+	merged := MergeResourceAttributes(
+		[]*tfprotov6.SchemaAttribute{createSelfLink},
+		[]*tfprotov6.SchemaAttribute{readSelfLink},
+	)
+
+	selfLink := findAttr(merged, "self_link")
+	if selfLink == nil {
+		t.Fatalf("self_link missing from merged result")
+	}
+	if !selfLink.Computed || selfLink.Optional || selfLink.Required {
+		t.Fatalf("self_link: got Computed=%v Optional=%v Required=%v, want Computed=true, Optional=false, Required=false",
+			selfLink.Computed, selfLink.Optional, selfLink.Required)
+	}
+}
