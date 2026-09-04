@@ -20,29 +20,25 @@ import (
 //     a mismatch against read's own type for the same name is real but rare
 //     enough in practice not to need a distinct third outcome here).
 //   - both sides, read genuinely readOnly (Computed, not Optional, not
-//     Required) and create does NOT already independently agree (create's
-//     own translation of the same field name isn't already Computed-only
-//     too): final Computed only. This is the asymmetric case -- read's
-//     schema marks the field readOnly and create's own schema for the
-//     same field name does not, the real shape a create-request and a
-//     read-response that only partially overlap produce (Kubernetes's
-//     own ObjectMeta: name/namespace are genuinely settable on create,
-//     uid/resourceVersion/creationTimestamp are not, and only the
-//     read-response schema says so). Read's marker wins here because
-//     create's mere non-required presence of the same field name is not
-//     evidence a client may actually set it -- it is at least as likely
-//     to mean create's own copy of a shared/reused component schema
-//     simply doesn't repeat a marker the response side does carry.
-//   - both sides, everything else (create Optional and not Required, and
-//     either create ALSO already independently marks the field
-//     Computed-only -- the SYMMETRIC case, e.g. a single shared schema
-//     referenced identically by both create and read, confirmed real for
-//     Google Pub/Sub's own Topic.state -- or neither side treats it as
-//     readOnly at all): final Optional+Computed -- the user may set it,
-//     or leave it for the server to default. Deliberately NOT narrowed
-//     to the asymmetric case above: when both sides already agree, or
-//     neither says readOnly, this package has no basis to override that
-//     agreement toward a stricter, user-facing-immutable classification.
+//     Required): final Computed only, regardless of what create's own
+//     translation of the same field name independently produced. A real
+//     readOnly marker is the vendor's own statement that the field is
+//     server-set -- create's own view of the same field name never
+//     overrides that, whether create is silent about it (the asymmetric
+//     case: Kubernetes's own ObjectMeta, where name/namespace are
+//     genuinely settable on create and uid/resourceVersion/
+//     creationTimestamp are not, and only the read-response schema says
+//     so) or create ALSO carries the identical marker because create and
+//     read share the literal same schema object (the symmetric case:
+//     Google Compute's own Instance, where insert.request and get.response
+//     both $ref the same schema, and selfLink/creationTimestamp/id/status
+//     all carry a real, structural readOnly: true there). Create's own
+//     agreement in the symmetric case is not independent confirmation
+//     that the field is settable -- it is the same marker read twice off
+//     one shared schema, so it cannot be evidence against itself.
+//   - both sides, neither side says readOnly: final Optional+Computed --
+//     the user may set it, or leave it for the server to default. This is
+//     the only case this package still has no basis to override.
 //   - create only: kept exactly as create's own translation produced it
 //     (Required/Optional, WriteOnly if the request schema itself said so) --
 //     a field the API accepts but never echoes back.
@@ -51,9 +47,11 @@ import (
 //     writeOnly -- unusual, but by definition unsettable here since create
 //     never mentions it at all).
 //
-// UBI-248: two real bugs here, not one, both only visible once a real
+// UBI-248: three real bugs here, not one, found in two passes once a real
 // create/read pair with a nested, asymmetrically-readOnly shared object
-// was checked end to end (Kubernetes's own ObjectMeta, described above).
+// was checked end to end (Kubernetes's own ObjectMeta, described above),
+// and again once the fix for those two was checked against providers
+// whose create/read pair shares one literal schema object.
 //
 // First: a field present on both sides used to keep create's own
 // NestedType wholesale (a shallow struct copy, `merged := *c`), so a
@@ -65,18 +63,30 @@ import (
 //
 // Second, only visible once the first fix let read's own child attribute
 // reach this function at all: "both sides, create not Required" was
-// unconditionally forced to Optional+Computed even in the asymmetric
-// case above, where read's own schema had already marked the field
-// genuinely readOnly and create's own view of the same field name had
-// not. Narrowed to the asymmetric case specifically -- confirmed real
-// and load-bearing for the SYMMETRIC case via this package's own
-// existing test (TestBuild_TranslatesRealShape_ReadOnlyMergesToOptionalComputed_EnumCarried,
-// internal/discoverydoc): Pub/Sub's real live discovery document uses
-// the identical Topic schema for both the create request and the read
-// response, so state's own readOnly marker already reaches BOTH create's
-// and read's independent translations identically, and that test's own
-// real, considered reasoning for keeping Optional+Computed there was not
-// disturbed.
+// unconditionally forced to Optional+Computed even when read's own
+// schema had already marked the field genuinely readOnly and create's
+// own view of the same field name had not.
+//
+// Third: the fix for the second bug only covered the asymmetric case,
+// gated on create NOT already independently agreeing the field was
+// Computed-only -- reasoned at the time to be load-bearing for this
+// package's own existing test (now TestBuild_TranslatesRealShape_
+// ReadOnlyMergesToComputedOnly_EnumCarried, internal/discoverydoc),
+// which models Pub/Sub's own Topic.state. Checking that test's own real
+// spec directly found state DOES carry a real readOnly: true marker
+// (Pub/Sub's create and get both $ref the identical Topic schema, same
+// shape as Compute's Instance) -- the test was never a case with no
+// marker, and asserting Optional+Computed for a field the vendor marks
+// readOnly was itself the same class of bug as the first two, just
+// gated on symmetric schema reuse instead of a missing nested-field
+// check. Measured before removing this gate: 110 of 1,106 Azure resource
+// pages and 71 of 1,562 Google resource pages showed a real Output
+// properties section (Azure and Google reuse one schema across create
+// and read on 1,675 of 1,753 real resource pairs checked, the dominant
+// shape for both, not an edge case) -- Kubernetes and Cloudflare/GitHub/
+// DigitalOcean's own create/read pairs are already mostly asymmetric, so
+// they were already covered by the second bug's own fix and are
+// unaffected by removing this gate.
 func MergeResourceAttributes(create, read []*tfprotov6.SchemaAttribute) []*tfprotov6.SchemaAttribute {
 	createByName := map[string]*tfprotov6.SchemaAttribute{}
 	for _, a := range create {
@@ -114,9 +124,8 @@ func MergeResourceAttributes(create, read []*tfprotov6.SchemaAttribute) []*tfpro
 				}
 			}
 			readSaysReadOnly := r.Computed && !r.Optional && !r.Required
-			createAlreadyAgrees := c.Computed && !c.Optional && !c.Required
 			switch {
-			case readSaysReadOnly && !createAlreadyAgrees:
+			case readSaysReadOnly:
 				merged.Required, merged.Optional, merged.WriteOnly = false, false, false
 				merged.Computed = true
 			case !c.Required:
