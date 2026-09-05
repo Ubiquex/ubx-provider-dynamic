@@ -423,10 +423,10 @@ func TestAssembleGroup_StampsRealBinaryVersion(t *testing.T) {
 // TestAssembleGroup_GeneratedByBinaryVersionOnlyChange_ForcesPatchBump is
 // UBI-194's own real, direct proof of the gap a live hash-watch.yml run
 // against Kubernetes' own real, unchanged swagger.json actually hit:
-// every member reports NoChange, but the group's own prior
-// GeneratedByBinaryVersion differs from this build's real BinaryVersion (the
-// live, common case -- absent, for every one of the six snapshots
-// published before this field existed). Without a forced bump, the
+// every member reports NoChange, but the group has no
+// GeneratedByBinaryVersion at all yet and this build has one to stamp
+// (the real bootstrap case, absent -> present, for every one of the six
+// snapshots published before the field existed). Without a forced bump, the
 // group's own Version stays byte-identical to what's already committed,
 // so every real hash-watch.yml's own "is this newer" gate sees no
 // change and silently discards the freshly-stamped GeneratedByBinaryVersion
@@ -602,5 +602,61 @@ func TestCheckFormat_RejectsFormat2_RealBreak(t *testing.T) {
 		t.Fatal("CheckFormat(2) should refuse the old, single-member format now that Min/Max are both 3")
 	} else if !errors.Is(err, ErrUnsupportedSchemaFormat) {
 		t.Errorf("error doesn't wrap ErrUnsupportedSchemaFormat: %v", err)
+	}
+}
+
+// TestAssembleGroup_GeneratedByBinaryVersionMoves_DoesNotBump is
+// UBI-249's own narrowing of the rule above, and the real regression
+// guard against the drift generator it used to be.
+//
+// The condition was once `prev != BinaryVersion`, which fired on ANY
+// change of the value, not just acquiring it. BinaryVersion moves on
+// every ubx-provider-dynamic release whether or not that release
+// changed anything about how snapshots are cut or served, and every
+// hash-watch.yml in this org rebuilds the binary fresh on each run. So
+// one unrelated tag made all eight providers manufacture a schema
+// release whose entire diff was a version string, and each of those
+// silently staled the corresponding ubiquex pin, which nothing watches.
+// A group whose content is unchanged and which already carries a real
+// value must now stay at its committed version.
+func TestAssembleGroup_GeneratedByBinaryVersionMoves_DoesNotBump(t *testing.T) {
+	old := BinaryVersion
+	t.Cleanup(func() { BinaryVersion = old })
+
+	BinaryVersion = "1.0.6"
+	resourceMember, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
+	if err != nil {
+		t.Fatalf("prev resource member: %v", err)
+	}
+	prevGroup, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": resourceMember}, map[string]ChangeLevel{"widgetco": Minor}, nil)
+	if err != nil {
+		t.Fatalf("AssembleGroup (prev): %v", err)
+	}
+	if prevGroup.GeneratedByBinaryVersion != "1.0.6" {
+		t.Fatalf("test setup: prevGroup.GeneratedByBinaryVersion = %q, want 1.0.6 (a provider that already carries a real value, like all eight published ones)", prevGroup.GeneratedByBinaryVersion)
+	}
+
+	// A newer translator release, nothing else. This is the exact shape
+	// of ubx-schema-azure#17's own 1.0.6 -> 1.0.10 move.
+	BinaryVersion = "1.0.10"
+	nextMember, _, level, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource, config.Provider{BaseURL: "https://api.widgetco.example"}, resourceMember)
+	if err != nil {
+		t.Fatalf("next resource member: %v", err)
+	}
+	if level != NoChange {
+		t.Fatalf("member level = %s, want none (test setup -- identical spec)", level)
+	}
+
+	nextGroup, err := AssembleGroup("widgetco", prevGroup, map[string]*MemberSnapshot{"widgetco": nextMember}, map[string]ChangeLevel{"widgetco": level}, nil)
+	if err != nil {
+		t.Fatalf("AssembleGroup (next): %v", err)
+	}
+	if nextGroup.Version != prevGroup.Version {
+		t.Fatalf("group version moved %q -> %q on a GeneratedByBinaryVersion change alone -- that manufactures a content-free schema release and stales every ubiquex pin behind it", prevGroup.Version, nextGroup.Version)
+	}
+	// The fresh fingerprint is still stamped; it just does not, on its
+	// own, justify a release.
+	if nextGroup.GeneratedByBinaryVersion != "1.0.10" {
+		t.Fatalf("GeneratedByBinaryVersion = %q, want the fresh 1.0.10 still stamped", nextGroup.GeneratedByBinaryVersion)
 	}
 }

@@ -59,23 +59,41 @@ func AssembleGroup(repoName string, prev *Snapshot, members map[string]*MemberSn
 				level = Major
 			}
 		}
-		// UBI-194: a real GeneratedByBinaryVersion transition (the committed
-		// snapshot's own prior value differs from this build's real
-		// BinaryVersion -- most commonly absent -> present, for the six
-		// snapshots published before this field existed) must force at
-		// least a Patch-level bump even when no member's own translated
-		// content changed at all. Without this, NextVersion(prev.Version,
-		// NoChange) returns prev.Version unmodified, the caller's own
-		// "is this newer than what's committed" gate (every real
-		// hash-watch.yml in this org) sees no change, and the real,
-		// freshly-stamped GeneratedByBinaryVersion is silently discarded instead
-		// of committed -- the exact real, live failure this comment exists
-		// to prevent (confirmed against a genuine run: Kubernetes'
-		// swagger.json is unchanged, memberLevels reported "none" for
-		// both real members, and the assembled group was thrown away
-		// with no PR opened, even though it now carried a real
-		// GeneratedByBinaryVersion the committed manifest.json still lacks).
-		if level == NoChange && prev.GeneratedByBinaryVersion != BinaryVersion {
+		// UBI-194, narrowed by UBI-249: acquiring GeneratedByBinaryVersion
+		// for the FIRST time must force at least a Patch-level bump even
+		// when no member's own translated content changed at all.
+		// Without this, NextVersion(prev.Version, NoChange) returns
+		// prev.Version unmodified, the caller's own "is this newer than
+		// what's committed" gate (every real hash-watch.yml in this org)
+		// sees no change, and the freshly-stamped value is silently
+		// discarded instead of committed -- the exact real, live failure
+		// this comment exists to prevent (confirmed against a genuine
+		// run: Kubernetes' swagger.json was unchanged, memberLevels
+		// reported "none" for both real members, and the assembled group
+		// was thrown away with no PR opened, even though it now carried a
+		// real value the committed manifest.json still lacked).
+		//
+		// This deliberately fires ONLY on the absent -> present
+		// transition, not on any change of the value. It used to be
+		// `prev != BinaryVersion`, which was a one-time bootstrap need
+		// generalized into a permanent trigger, and that was wrong:
+		// BinaryVersion moves on EVERY ubx-provider-dynamic release
+		// whether or not the release changed anything about how
+		// snapshots are cut or served, and hash-watch.yml rebuilds the
+		// binary fresh on every run. So a single unrelated tag made all
+		// eight providers manufacture a schema release whose entire diff
+		// was a version string. Each of those then silently staled every
+		// ubiquex pin, which nothing watches (UBI-249 found Azure adrift
+		// a full major version that way, by hand, days later). The fix
+		// removes the recurring source of that drift rather than
+		// detecting it afterwards.
+		//
+		// The bootstrap case this guards is already satisfied for all
+		// eight published providers, so in practice this should now never
+		// fire again -- but it is kept, not deleted, because a provider
+		// onboarded from a genuinely old snapshot would otherwise hit the
+		// original discard bug with nothing to catch it.
+		if level == NoChange && prev.GeneratedByBinaryVersion == "" && BinaryVersion != "" {
 			level = Patch
 		}
 		version, err = NextVersion(prev.Version, level)
