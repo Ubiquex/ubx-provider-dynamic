@@ -379,7 +379,7 @@ func TestAssembleGroup_FirstEverGroup_RealVersion100(t *testing.T) {
 
 // TestAssembleGroup_StampsRealBinaryVersion is UBI-194's own real,
 // direct proof: AssembleGroup stamps whatever BinaryVersion this build
-// carries into every new snapshot's own real MinBinaryVersion,
+// carries into every new snapshot's own real GeneratedByBinaryVersion,
 // unconditionally -- and SaveSplit/LoadSplit round-trip it through the
 // real, committed manifest.json shape, not just the in-memory struct.
 func TestAssembleGroup_StampsRealBinaryVersion(t *testing.T) {
@@ -395,8 +395,8 @@ func TestAssembleGroup_StampsRealBinaryVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AssembleGroup: %v", err)
 	}
-	if group.MinBinaryVersion != "1.2.3" {
-		t.Fatalf("MinBinaryVersion = %q, want 1.2.3", group.MinBinaryVersion)
+	if group.GeneratedByBinaryVersion != "1.2.3" {
+		t.Fatalf("GeneratedByBinaryVersion = %q, want 1.2.3", group.GeneratedByBinaryVersion)
 	}
 
 	dir := t.TempDir()
@@ -407,8 +407,8 @@ func TestAssembleGroup_StampsRealBinaryVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSplit: %v", err)
 	}
-	if reloaded.MinBinaryVersion != "1.2.3" {
-		t.Fatalf("reloaded MinBinaryVersion = %q, want 1.2.3 (real round trip through manifest.json)", reloaded.MinBinaryVersion)
+	if reloaded.GeneratedByBinaryVersion != "1.2.3" {
+		t.Fatalf("reloaded GeneratedByBinaryVersion = %q, want 1.2.3 (real round trip through manifest.json)", reloaded.GeneratedByBinaryVersion)
 	}
 
 	manifestRaw, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
@@ -420,18 +420,18 @@ func TestAssembleGroup_StampsRealBinaryVersion(t *testing.T) {
 	}
 }
 
-// TestAssembleGroup_MinBinaryVersionOnlyChange_ForcesPatchBump is
+// TestAssembleGroup_GeneratedByBinaryVersionOnlyChange_ForcesPatchBump is
 // UBI-194's own real, direct proof of the gap a live hash-watch.yml run
 // against Kubernetes' own real, unchanged swagger.json actually hit:
 // every member reports NoChange, but the group's own prior
-// MinBinaryVersion differs from this build's real BinaryVersion (the
+// GeneratedByBinaryVersion differs from this build's real BinaryVersion (the
 // live, common case -- absent, for every one of the six snapshots
 // published before this field existed). Without a forced bump, the
 // group's own Version stays byte-identical to what's already committed,
 // so every real hash-watch.yml's own "is this newer" gate sees no
-// change and silently discards the freshly-stamped MinBinaryVersion
+// change and silently discards the freshly-stamped GeneratedByBinaryVersion
 // instead of committing it.
-func TestAssembleGroup_MinBinaryVersionOnlyChange_ForcesPatchBump(t *testing.T) {
+func TestAssembleGroup_GeneratedByBinaryVersionOnlyChange_ForcesPatchBump(t *testing.T) {
 	old := BinaryVersion
 	t.Cleanup(func() { BinaryVersion = old })
 
@@ -444,8 +444,8 @@ func TestAssembleGroup_MinBinaryVersionOnlyChange_ForcesPatchBump(t *testing.T) 
 	if err != nil {
 		t.Fatalf("AssembleGroup (prev): %v", err)
 	}
-	if prevGroup.MinBinaryVersion != "" {
-		t.Fatalf("test setup: prevGroup.MinBinaryVersion = %q, want empty (matching the six real, pre-UBI-194 snapshots)", prevGroup.MinBinaryVersion)
+	if prevGroup.GeneratedByBinaryVersion != "" {
+		t.Fatalf("test setup: prevGroup.GeneratedByBinaryVersion = %q, want empty (matching the six real, pre-UBI-194 snapshots)", prevGroup.GeneratedByBinaryVersion)
 	}
 
 	BinaryVersion = "1.0.0"
@@ -462,13 +462,13 @@ func TestAssembleGroup_MinBinaryVersionOnlyChange_ForcesPatchBump(t *testing.T) 
 		t.Fatalf("AssembleGroup (next): %v", err)
 	}
 	if nextGroup.Version == prevGroup.Version {
-		t.Fatalf("group version stayed at %q despite a real MinBinaryVersion transition (%q -> %q) -- this is exactly the real, live gap that silently discarded a regeneration", nextGroup.Version, prevGroup.MinBinaryVersion, nextGroup.MinBinaryVersion)
+		t.Fatalf("group version stayed at %q despite a real GeneratedByBinaryVersion transition (%q -> %q) -- this is exactly the real, live gap that silently discarded a regeneration", nextGroup.Version, prevGroup.GeneratedByBinaryVersion, nextGroup.GeneratedByBinaryVersion)
 	}
 	if nextGroup.Version != "1.0.1" {
-		t.Fatalf("group version = %q, want a Patch-level bump (1.0.1) from a MinBinaryVersion-only transition", nextGroup.Version)
+		t.Fatalf("group version = %q, want a Patch-level bump (1.0.1) from a GeneratedByBinaryVersion-only transition", nextGroup.Version)
 	}
-	if nextGroup.MinBinaryVersion != "1.0.0" {
-		t.Fatalf("MinBinaryVersion = %q, want 1.0.0", nextGroup.MinBinaryVersion)
+	if nextGroup.GeneratedByBinaryVersion != "1.0.0" {
+		t.Fatalf("GeneratedByBinaryVersion = %q, want 1.0.0", nextGroup.GeneratedByBinaryVersion)
 	}
 }
 

@@ -243,3 +243,70 @@ func TestSaveSplitLoadSplit_RealRoundTrip(t *testing.T) {
 		t.Fatal("LoadSplit accepted a real, on-disk manifest with an unsupported schema_format")
 	}
 }
+
+// TestManifest_LegacyMinBinaryVersionOnly_StillResolves is the real
+// regression guard for UBI-249's rename of MinBinaryVersion to
+// GeneratedByBinaryVersion. Every one of the eight already-published
+// ubx-schema-<provider> snapshots carries ONLY the legacy
+// min_binary_version key, so a bare tag rename would have made all of
+// them read as absent. That is not a cosmetic loss: an absent value
+// silently downgrades resolution to the SchemaFormat bootstrap fallback
+// (cloudflare's real 1.0.10 would become 1.0.0), and it makes
+// AssembleGroup's own prev-vs-current comparison see a change on every
+// run, manufacturing a spurious Patch release for all eight providers.
+func TestManifest_LegacyMinBinaryVersionOnly_StillResolves(t *testing.T) {
+	var m manifest
+	if err := json.Unmarshal([]byte(`{
+  "schema_format": 3,
+  "provider": "widgetco",
+  "version": "1.0.0",
+  "members": ["widgetco"],
+  "min_binary_version": "1.0.10"
+}`), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := m.generatedByBinaryVersion(); got != "1.0.10" {
+		t.Fatalf("generatedByBinaryVersion() = %q, want 1.0.10 read from the legacy min_binary_version key", got)
+	}
+}
+
+// TestManifest_NewNameWinsOverLegacy proves the precedence runs the way
+// the rename intends: once a snapshot is re-cut by a post-rename binary
+// it carries both keys, and the new one is authoritative.
+func TestManifest_NewNameWinsOverLegacy(t *testing.T) {
+	var m manifest
+	if err := json.Unmarshal([]byte(`{
+  "schema_format": 3,
+  "generated_by_binary_version": "1.0.13",
+  "min_binary_version": "1.0.10"
+}`), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := m.generatedByBinaryVersion(); got != "1.0.13" {
+		t.Fatalf("generatedByBinaryVersion() = %q, want 1.0.13 (new name must win over the legacy mirror)", got)
+	}
+}
+
+// TestSaveSplit_WritesBothNames proves the transitional mirror is really
+// written, which is what keeps already-released ubx binaries (they read
+// min_binary_version only) resolving a freshly-cut snapshot exactly as
+// before the rename.
+func TestSaveSplit_WritesBothNames(t *testing.T) {
+	var m manifest
+	m.GeneratedByBinaryVersion = "1.0.13"
+	m.LegacyMinBinaryVersion = m.GeneratedByBinaryVersion
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if raw["generated_by_binary_version"] != "1.0.13" {
+		t.Fatalf("generated_by_binary_version = %v, want 1.0.13", raw["generated_by_binary_version"])
+	}
+	if raw["min_binary_version"] != "1.0.13" {
+		t.Fatalf("min_binary_version mirror = %v, want 1.0.13 (transitional, keeps pre-rename readers working)", raw["min_binary_version"])
+	}
+}

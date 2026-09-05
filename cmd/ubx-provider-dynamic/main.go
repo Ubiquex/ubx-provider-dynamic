@@ -124,7 +124,7 @@ var groupExcludeFlag = flag.String("group-exclude", "", "JSON object of member n
 var prevSnapshotFlag = flag.String("prev-snapshot", "", "DIRECTORY of the prior real GROUP snapshot (manifest.json plus members/) to diff against when deriving the new one's own version (omit for a group's first-ever snapshot)")
 
 // allowDevBinaryFlag is generateSnapshotGroupFlag's own real safety
-// gate: refuses to write a snapshot whose own MinBinaryVersion would
+// gate: refuses to write a snapshot whose own GeneratedByBinaryVersion would
 // be the unstamped default "dev" unless explicitly overridden. UBI-229
 // follow-up -- four of this org's seven published group snapshots
 // (azure, google, aws, datadog) reached "dev" in their own real,
@@ -134,7 +134,7 @@ var prevSnapshotFlag = flag.String("prev-snapshot", "", "DIRECTORY of the prior 
 // tagged release, aside from this one field nobody was checking.
 // "dev" is not a real version -- it cannot be resolved by
 // provider.AcquireDynamicProviderBinary, and it defeats the entire
-// real, unforgeable link MinBinaryVersion exists to record (see
+// real, unforgeable link GeneratedByBinaryVersion exists to record (see
 // BinaryVersion's own doc comment). Local, unreleased builds remain a
 // real, legitimate way to iterate on generation before a release
 // exists -- this flag is the deliberate, visible escape hatch for
@@ -185,7 +185,7 @@ const snapshotPathEnvVar = "UBX_SNAPSHOT_PATH"
 // real, released version -- "dev" for a local, unreleased build) and
 // exits -- UBI-194's own real, minimal operational visibility: the same
 // real value every snapshot this build generates now stamps into its
-// own MinBinaryVersion, so a real release always has a way to confirm
+// own GeneratedByBinaryVersion, so a real release always has a way to confirm
 // what it actually is without decoding a snapshot's own manifest.json.
 var versionFlag = flag.Bool("version", false, "print this build's own real, released version (snapshot.BinaryVersion) and exit")
 
@@ -1427,7 +1427,7 @@ func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJS
 		return fmt.Errorf("assemble group %q: %w", repoName, err)
 	}
 
-	if group.MinBinaryVersion == "dev" && !allowDevBinary {
+	if group.GeneratedByBinaryVersion == "dev" && !allowDevBinary {
 		return fmt.Errorf("refusing to write a snapshot with min_binary_version \"dev\" (this build has no real, released version -- pass --allow-dev-binary to write it anyway, a deliberate choice for local iteration, never for anything meant to be committed)")
 	}
 

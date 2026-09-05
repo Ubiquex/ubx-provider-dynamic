@@ -299,12 +299,38 @@ type Snapshot struct {
 	// before this existed).
 	Exclude map[string][]string `json:"exclude,omitempty"`
 
-	// MinBinaryVersion is UBI-194's own real answer to "which
-	// ubx-provider-dynamic binary can correctly SERVE this snapshot" --
-	// stamped by AssembleGroup at generation time from BinaryVersion
-	// (this exact build's own real, embedded release version), not
-	// inferred from SchemaFormat. Confirmed live, not assumed, why
-	// SchemaFormat alone can't answer this: AWS's own real mixed-source
+	// GeneratedByBinaryVersion records WHICH ubx-provider-dynamic binary
+	// actually cut this snapshot -- stamped by AssembleGroup at
+	// generation time from BinaryVersion (this exact build's own real,
+	// embedded release version), unconditionally.
+	//
+	// Renamed from MinBinaryVersion / min_binary_version. The old name
+	// promised a floor this field has never computed and does not
+	// contain: it is the version KNOWN to work (exact by construction --
+	// the generating binary definitely serves what it just wrote), never
+	// the LOWEST version that would work, which is unknown and in
+	// practice usually lower. Reading a jump in this field as evidence
+	// of a new serving requirement is therefore wrong, and it read that
+	// way to more than one reader before the rename (UBI-249 follow-on:
+	// ubx-schema-azure#17 moved it 1.0.6 -> 1.0.10 alongside a typo fix
+	// and one relaxed constraint, with nothing in the diff that could
+	// plausibly demand a newer serving binary). The error direction is
+	// safe -- this can only ever overstate the requirement, never
+	// understate it -- but a fingerprint should not be named like a
+	// bound. Behaviour is completely unchanged by the rename; only the
+	// name moved.
+	//
+	// Deliberately NOT converted into a real floor. Doing that
+	// reintroduces exactly the hand-maintained SchemaFormat-to-binary
+	// compatibility table this design already rejected, which would need
+	// updating in lockstep with every real serving-capability fix,
+	// forever, with no way to correct already-published snapshots
+	// retroactively.
+	//
+	// Confirmed live, not assumed, why SchemaFormat alone cannot answer
+	// which binary can serve a snapshot (the original reason this field
+	// exists at all, unchanged by the rename):
+	// AWS's own real mixed-source
 	// group needed internal/mixedserver (a real SERVING-time capability)
 	// before it could be served at all, but SchemaFormat never moved for
 	// that fix -- a snapshot generated the day before vs. the day after
@@ -325,7 +351,7 @@ type Snapshot struct {
 	// bootstrap case, not a silent, permanent second meaning (see
 	// provider.AcquireDynamicProviderBinary's own doc comment in
 	// ubiquex).
-	MinBinaryVersion string `json:"min_binary_version,omitempty"`
+	GeneratedByBinaryVersion string `json:"generated_by_binary_version,omitempty"`
 }
 
 // BinaryVersion is THIS BUILD's own real, released version -- set via
@@ -334,9 +360,9 @@ type Snapshot struct {
 // (UBI-194), left at its own real, honest "dev" default for any build
 // that didn't set it (a local `go build`, a worktree checkout used for
 // this arc's own live-proof verification, etc.) -- AssembleGroup stamps
-// whatever's here into every new snapshot's own real MinBinaryVersion,
+// whatever's here into every new snapshot's own real GeneratedByBinaryVersion,
 // unconditionally; "dev" is a real, deliberately-not-a-semver value a
-// caller resolving MinBinaryVersion must already treat as absent/
+// caller resolving GeneratedByBinaryVersion must already treat as absent/
 // untrusted the same way it treats a genuinely empty string, so a local
 // build can never be mistaken for a real, fetchable release.
 var BinaryVersion = "dev"
@@ -414,12 +440,34 @@ func Save(path string, snap *Snapshot) error {
 // problem at AWS's 430-member scale: one flat file would exceed
 // GitHub's own real 100MB commit limit by more than 2x).
 type manifest struct {
-	SchemaFormat     int                 `json:"schema_format"`
-	Provider         string              `json:"provider"`
-	Version          string              `json:"version"`
-	Members          []string            `json:"members"`
-	Exclude          map[string][]string `json:"exclude,omitempty"`
-	MinBinaryVersion string              `json:"min_binary_version,omitempty"`
+	SchemaFormat             int                 `json:"schema_format"`
+	Provider                 string              `json:"provider"`
+	Version                  string              `json:"version"`
+	Members                  []string            `json:"members"`
+	Exclude                  map[string][]string `json:"exclude,omitempty"`
+	GeneratedByBinaryVersion string              `json:"generated_by_binary_version,omitempty"`
+
+	// LegacyMinBinaryVersion is the pre-rename spelling of
+	// GeneratedByBinaryVersion, kept live on BOTH the read and the write
+	// path, deliberately, because a bare tag rename would NOT have been
+	// behaviour-preserving (UBI-249 follow-on, confirmed against the real
+	// published artifacts before writing this, not reasoned about):
+	//
+	// Read: all eight already-published ubx-schema-<provider> snapshots
+	// carry min_binary_version and nothing else. Dropping the read would
+	// make every one of them resolve as absent, which silently downgrades
+	// them to the SchemaFormat bootstrap fallback (cloudflare's real
+	// 1.0.10 would become 1.0.0) and, worse, makes AssembleGroup's own
+	// prev-vs-current comparison in generate.go see a change on every
+	// single run, manufacturing a spurious Patch release for all eight
+	// providers immediately.
+	//
+	// Write: ubx binaries already released into the wild read
+	// min_binary_version only. Writing the new name alone would make
+	// every newly-cut snapshot resolve as absent for them. So both names
+	// are written, carrying the identical value, until those readers are
+	// known to be gone. This mirror is transitional, not permanent.
+	LegacyMinBinaryVersion string `json:"min_binary_version,omitempty"`
 
 	// SchemaURLs is member name -> the real, live URL that member's own
 	// RawSpec was fetched from (UBI-222), surfaced here so a drift-watch
@@ -458,13 +506,18 @@ func SaveSplit(dir string, snap *Snapshot) error {
 		schemaURLs = nil
 	}
 	man := manifest{
-		SchemaFormat:     snap.SchemaFormat,
-		Provider:         snap.Provider,
-		Version:          snap.Version,
-		Members:          names,
-		Exclude:          snap.Exclude,
-		MinBinaryVersion: snap.MinBinaryVersion,
-		SchemaURLs:       schemaURLs,
+		SchemaFormat:             snap.SchemaFormat,
+		Provider:                 snap.Provider,
+		Version:                  snap.Version,
+		Members:                  names,
+		Exclude:                  snap.Exclude,
+		GeneratedByBinaryVersion: snap.GeneratedByBinaryVersion,
+		// Same value under the pre-rename name, so already-released ubx
+		// binaries (which read min_binary_version only) keep resolving
+		// this snapshot exactly as before. Transitional, see the field's
+		// own doc comment.
+		LegacyMinBinaryVersion: snap.GeneratedByBinaryVersion,
+		SchemaURLs:             schemaURLs,
 	}
 	manData, err := json.MarshalIndent(man, "", "  ")
 	if err != nil {
@@ -521,13 +574,25 @@ func LoadSplit(dir string) (*Snapshot, error) {
 	}
 
 	return &Snapshot{
-		SchemaFormat:     man.SchemaFormat,
-		Provider:         man.Provider,
-		Version:          man.Version,
-		Members:          members,
-		Exclude:          man.Exclude,
-		MinBinaryVersion: man.MinBinaryVersion,
+		SchemaFormat:             man.SchemaFormat,
+		Provider:                 man.Provider,
+		Version:                  man.Version,
+		Members:                  members,
+		Exclude:                  man.Exclude,
+		GeneratedByBinaryVersion: man.generatedByBinaryVersion(),
 	}, nil
+}
+
+// generatedByBinaryVersion resolves the new name over the pre-rename
+// one. Every already-published snapshot carries only the legacy
+// spelling, so this fallback is what keeps them resolving identically
+// rather than reading as absent -- see LegacyMinBinaryVersion's own doc
+// comment for what absent would actually break.
+func (m manifest) generatedByBinaryVersion() string {
+	if m.GeneratedByBinaryVersion != "" {
+		return m.GeneratedByBinaryVersion
+	}
+	return m.LegacyMinBinaryVersion
 }
 
 // Load reads and real-validates path's own snapshot -- CheckFormat runs
