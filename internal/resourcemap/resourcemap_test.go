@@ -698,3 +698,102 @@ func TestPathIsAncestorOrSame(t *testing.T) {
 		})
 	}
 }
+
+// TestFindCreate_NestedResourceBindsToItsOwnCollectionNotItsGrandparent
+// is UBI-246's own real, live-found shape, reduced.
+//
+// Cloudflare's AI Gateway nests real resources several levels deep and
+// wraps every response in the same envelope with an inline result, so
+// sameTopLevelProperties passes between a child's read and its
+// grandparent's create. Being a structural ancestor was the only other
+// requirement, and every ancestor qualifies at once, so the fewest-path-
+// params tie-break then picked the SHALLOWEST of them. Eight distinct
+// resources all bound to POST /accounts/{account_id}/ai-gateway/gateways
+// while their own real creates sat unused in the same spec.
+//
+// The consequence was not cosmetic. Applying a cloudflare_dataset would
+// have posted to the gateways collection and created a gateway.
+func TestFindCreate_NestedResourceBindsToItsOwnCollectionNotItsGrandparent(t *testing.T) {
+	// Inline, deliberately: a named $ref here would be caught by the
+	// nested-ref check UBI-222 already added, and the real spec's
+	// results are inline, which is exactly why that check cannot see
+	// this one.
+	inlineResult := func() *openapi3.SchemaRef {
+		return openapi3.NewSchemaRef("", openapi3.NewObjectSchema().
+			WithProperty("id", openapi3.NewStringSchema()))
+	}
+	op := func(id string) *openapi3.Operation {
+		return &openapi3.Operation{OperationID: id, Responses: responses200(genericEnvelope(inlineResult()))}
+	}
+
+	doc := &openapi3.T{OpenAPI: "3.0.3", Info: &openapi3.Info{Title: "t", Version: "1"}}
+	doc.Paths = openapi3.NewPaths(
+		openapi3.WithPath("/accounts/{account_id}/ai-gateway/gateways",
+			&openapi3.PathItem{Post: op("CreateGateway"), Get: op("ListGateways")}),
+		openapi3.WithPath("/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/datasets",
+			&openapi3.PathItem{Post: op("CreateDataset")}),
+		openapi3.WithPath("/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/datasets/{id}",
+			&openapi3.PathItem{Get: op("GetDataset")}),
+	)
+
+	resources, _, err := Discover(doc, "cloudflare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dataset *Resource
+	for i := range resources {
+		if strings.HasSuffix(resources[i].ReadPath, "/datasets/{id}") {
+			dataset = &resources[i]
+		}
+	}
+	if dataset == nil {
+		t.Fatalf("the nested dataset read was not discovered at all, got %+v", resources)
+	}
+	want := "/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/datasets"
+	if dataset.CreatePath != want {
+		t.Fatalf("nested resource bound to the wrong create.\n got %s %s\nwant POST %s\nBinding a child to its grandparent's collection means applying it creates the WRONG KIND of thing.",
+			dataset.CreateMethod, dataset.CreatePath, want)
+	}
+}
+
+// A nested read whose own collection has no create at all must be
+// skipped, never promoted onto an ancestor's create. Cloudflare's real
+// .../gateways/{gateway_id}/logs/{id} is exactly this: readable and
+// deletable, never creatable, and it was being reported as a resource
+// whose create posted to the gateways collection.
+func TestFindCreate_NestedResourceWithNoCreateOfItsOwnIsSkipped(t *testing.T) {
+	inlineResult := func() *openapi3.SchemaRef {
+		return openapi3.NewSchemaRef("", openapi3.NewObjectSchema().
+			WithProperty("id", openapi3.NewStringSchema()))
+	}
+	op := func(id string) *openapi3.Operation {
+		return &openapi3.Operation{OperationID: id, Responses: responses200(genericEnvelope(inlineResult()))}
+	}
+
+	doc := &openapi3.T{OpenAPI: "3.0.3", Info: &openapi3.Info{Title: "t", Version: "1"}}
+	doc.Paths = openapi3.NewPaths(
+		openapi3.WithPath("/accounts/{account_id}/ai-gateway/gateways",
+			&openapi3.PathItem{Post: op("CreateGateway")}),
+		openapi3.WithPath("/accounts/{account_id}/ai-gateway/gateways/{gateway_id}/logs/{id}",
+			&openapi3.PathItem{Get: op("GetLog"), Delete: op("DeleteLog")}),
+	)
+
+	resources, notes, err := Discover(doc, "cloudflare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range resources {
+		if strings.Contains(r.ReadPath, "/logs/") {
+			t.Fatalf("a read-only nested log was promoted to a resource with create %s %s", r.CreateMethod, r.CreatePath)
+		}
+	}
+	found := false
+	for _, n := range notes {
+		if strings.Contains(n.Path, "/logs/") && strings.Contains(n.Detail, "no matching create") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a real 'no matching create' note for the log read, got: %+v", notes)
+	}
+}
