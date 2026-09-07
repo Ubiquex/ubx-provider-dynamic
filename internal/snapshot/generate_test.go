@@ -660,3 +660,75 @@ func TestAssembleGroup_GeneratedByBinaryVersionMoves_DoesNotBump(t *testing.T) {
 		t.Fatalf("GeneratedByBinaryVersion = %q, want the fresh 1.0.10 still stamped", nextGroup.GeneratedByBinaryVersion)
 	}
 }
+
+// TestAssembleGroup_ForceBinaryVersionBump is UBI-241's own regression,
+// in both directions.
+//
+// The default must stay UBI-249's: a binary version change alone does
+// NOT bump, because the unconditional version of that made a single
+// unrelated tag manufacture a release across all eight providers.
+//
+// But with the force asked for, it must bump, because otherwise a
+// release that changes WHAT the binary derives cannot reach a snapshot
+// whose upstream spec has not moved. That is not hypothetical: it is
+// exactly what blocked the collection-naming fix, and the symptom was
+// silent, a regeneration that produced the identical version and opened
+// no PR.
+func TestAssembleGroup_ForceBinaryVersionBump(t *testing.T) {
+	member, _, _, err := GenerateOpenAPIMember("widgetco", "widgetco", serveSpec(t, widgetSpecV1), ModeResource,
+		config.Provider{BaseURL: "https://api.widgetco.example"}, nil)
+	if err != nil {
+		t.Fatalf("generate resource member: %v", err)
+	}
+	prev, err := AssembleGroup("widgetco", nil, map[string]*MemberSnapshot{"widgetco": member},
+		map[string]ChangeLevel{"widgetco": Minor}, nil)
+	if err != nil {
+		t.Fatalf("AssembleGroup (prev): %v", err)
+	}
+	// A previous snapshot that already records a binary version, which is
+	// the case that matters: the bootstrap guard does not fire here.
+	prev.GeneratedByBinaryVersion = "1.0.13"
+
+	old := BinaryVersion
+	BinaryVersion = "1.1.0"
+	defer func() { BinaryVersion = old }()
+
+	unchanged := map[string]ChangeLevel{"widgetco": NoChange}
+
+	t.Run("default does not bump", func(t *testing.T) {
+		got, err := AssembleGroup("widgetco", prev, map[string]*MemberSnapshot{"widgetco": member}, unchanged, nil)
+		if err != nil {
+			t.Fatalf("AssembleGroup: %v", err)
+		}
+		if got.Version != prev.Version {
+			t.Fatalf("a binary change alone must not bump by default: %s -> %s", prev.Version, got.Version)
+		}
+	})
+
+	t.Run("force bumps", func(t *testing.T) {
+		got, err := AssembleGroup("widgetco", prev, map[string]*MemberSnapshot{"widgetco": member}, unchanged, nil,
+			ForceBinaryVersionBump())
+		if err != nil {
+			t.Fatalf("AssembleGroup: %v", err)
+		}
+		if got.Version == prev.Version {
+			t.Fatalf("with the force asked for, a binary change must bump, but the version stayed %s", got.Version)
+		}
+		if got.GeneratedByBinaryVersion != "1.1.0" {
+			t.Fatalf("the bumped snapshot must record the binary that made it, got %q", got.GeneratedByBinaryVersion)
+		}
+	})
+
+	t.Run("force does not bump when the version is unchanged", func(t *testing.T) {
+		same := *prev
+		same.GeneratedByBinaryVersion = "1.1.0"
+		got, err := AssembleGroup("widgetco", &same, map[string]*MemberSnapshot{"widgetco": member}, unchanged, nil,
+			ForceBinaryVersionBump())
+		if err != nil {
+			t.Fatalf("AssembleGroup: %v", err)
+		}
+		if got.Version != same.Version {
+			t.Fatalf("the same binary version must not bump even with the force: %s -> %s", same.Version, got.Version)
+		}
+	})
+}

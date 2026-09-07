@@ -140,6 +140,19 @@ var prevSnapshotFlag = flag.String("prev-snapshot", "", "DIRECTORY of the prior 
 // exists -- this flag is the deliberate, visible escape hatch for
 // that case, not a ban on it: passing it is a conscious, grep-able
 // choice, unlike today's silent default.
+// forceBinaryVersionBumpFlag is for a release that changes WHAT a binary
+// derives, not merely which version derived it.
+//
+// UBI-241's collection naming fix was one: it changed which data sources
+// the binary finds, and with the default behaviour it could not reach a
+// snapshot whose upstream spec had not moved. Kubernetes regenerated to
+// the identical version, the gate saw no change, and nothing propagated.
+//
+// Deliberately opt-in, so UBI-249's default holds. See
+// snapshot.ForceBinaryVersionBump for the full account of why the
+// unconditional version of this was removed.
+var forceBinaryVersionBumpFlag = flag.Bool("force-binary-version-bump", false, "force at least a patch bump when this binary's own version differs from the one that generated the previous snapshot, even if no member content changed -- for a release that changes what the binary derives, not merely which version derived it")
+
 var allowDevBinaryFlag = flag.Bool("allow-dev-binary", false, "allow writing a snapshot whose own min_binary_version would be the unstamped \"dev\" default -- refused by default, since a dev-stamped snapshot cannot be traced to any real, acquirable binary")
 
 // dumpGroupSummaryFlag is a real, plain CLI mode for one real, narrow
@@ -209,7 +222,7 @@ func run() error {
 	// into one group container, so it has no single active
 	// UBX_DYNAMIC_PROVIDER_NAME to require at all.
 	if *generateSnapshotGroupFlag != "" {
-		return runGenerateSnapshotGroup(*generateSnapshotGroupFlag, *groupRepoNameFlag, *groupMembersFlag, *prevSnapshotFlag, *groupExcludeFlag, *allowDevBinaryFlag)
+		return runGenerateSnapshotGroup(*generateSnapshotGroupFlag, *groupRepoNameFlag, *groupMembersFlag, *prevSnapshotFlag, *groupExcludeFlag, *allowDevBinaryFlag, *forceBinaryVersionBumpFlag)
 	}
 
 	// Same real reason as group generation above -- a group summary
@@ -1372,7 +1385,7 @@ func runDumpGroupSummary(snapPath string) error {
 // real time via the source-and-mode-appropriate Generate<Source>Member,
 // and assembles them into ONE real, versioned group container
 // (AssembleGroup) written to outPath.
-func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJSON string, allowDevBinary bool) error {
+func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJSON string, allowDevBinary, forceBinaryVersionBump bool) error {
 	if repoName == "" {
 		return fmt.Errorf("--generate-snapshot-group requires --group-repo-name")
 	}
@@ -1422,7 +1435,11 @@ func runGenerateSnapshotGroup(outPath, repoName, membersCSV, prevPath, excludeJS
 		return err
 	}
 
-	group, err := snapshot.AssembleGroup(repoName, prev, members, levels, exclude)
+	var assembleOpts []snapshot.AssembleOption
+	if forceBinaryVersionBump {
+		assembleOpts = append(assembleOpts, snapshot.ForceBinaryVersionBump())
+	}
+	group, err := snapshot.AssembleGroup(repoName, prev, members, levels, exclude, assembleOpts...)
 	if err != nil {
 		return fmt.Errorf("assemble group %q: %w", repoName, err)
 	}

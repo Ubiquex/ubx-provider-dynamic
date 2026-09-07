@@ -39,7 +39,42 @@ import (
 // wins), passed through by whatever real caller already has it (the
 // group's own hash-watch.yml, via --group-exclude), not invented fresh
 // here. May be nil for a group with no known real collisions.
-func AssembleGroup(repoName string, prev *Snapshot, members map[string]*MemberSnapshot, memberLevels map[string]ChangeLevel, exclude map[string][]string) (*Snapshot, error) {
+// AssembleOption configures AssembleGroup. Variadic rather than a wider
+// signature so the eighteen existing call sites stay as they are, and so
+// the default behaviour is the one you get by not asking for anything.
+type AssembleOption func(*assembleConfig)
+
+type assembleConfig struct{ forceOnBinaryChange bool }
+
+// ForceBinaryVersionBump makes a CHANGE of GeneratedByBinaryVersion force
+// at least a Patch bump, even when no member's own content moved.
+//
+// Off by default, deliberately, and that default is UBI-249's: the bump
+// used to fire on every value change, which meant a single unrelated
+// ubx-provider-dynamic tag made all eight providers manufacture a schema
+// release whose entire diff was a version string, and each of those
+// silently staled every ubiquex pin.
+//
+// But a release CAN change what a snapshot means. UBI-241's collection
+// naming fix changed which data sources the binary derives, and with the
+// bump off there was no way for that to reach a snapshot whose upstream
+// spec happened not to move: Kubernetes regenerated to the identical
+// version, the gate saw no change, no PR opened, and the fix could not
+// propagate at all. Five other providers would have sailed through
+// purely because their specs had drifted that week.
+//
+// So the answer is not to widen the default but to make the rare case
+// explicit. A behaviour-changing release is a deliberate act by whoever
+// cut it, and this is how they say so.
+func ForceBinaryVersionBump() AssembleOption {
+	return func(c *assembleConfig) { c.forceOnBinaryChange = true }
+}
+
+func AssembleGroup(repoName string, prev *Snapshot, members map[string]*MemberSnapshot, memberLevels map[string]ChangeLevel, exclude map[string][]string, opts ...AssembleOption) (*Snapshot, error) {
+	var cfg assembleConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	var version string
 	var err error
 	if prev == nil {
@@ -94,6 +129,12 @@ func AssembleGroup(repoName string, prev *Snapshot, members map[string]*MemberSn
 		// onboarded from a genuinely old snapshot would otherwise hit the
 		// original discard bug with nothing to catch it.
 		if level == NoChange && prev.GeneratedByBinaryVersion == "" && BinaryVersion != "" {
+			level = Patch
+		}
+		// The explicit force, off unless the caller asked. See
+		// ForceBinaryVersionBump for why this is opt-in rather than the
+		// default, and what it cost to learn that.
+		if level == NoChange && cfg.forceOnBinaryChange && BinaryVersion != "" && prev.GeneratedByBinaryVersion != BinaryVersion {
 			level = Patch
 		}
 		version, err = NextVersion(prev.Version, level)
