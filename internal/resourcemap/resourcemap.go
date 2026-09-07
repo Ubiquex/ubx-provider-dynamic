@@ -380,7 +380,7 @@ func findCreate(ops []op, readPath, refName string, readSchema *openapi3.Schema)
 		// structural path relationship to the read path, on top of the
 		// existing top-level-property-name check.
 		if refName == "" && candidateRef == "" &&
-			pathIsAncestorOrSame(readPath, o.path) &&
+			pathIsSelfOrParentCollection(readPath, o.path) &&
 			sameTopLevelProperties(readSchema, candidateSchema) {
 			matches = append(matches, o)
 		}
@@ -505,6 +505,48 @@ func parentCollectionPath(path string) string {
 // path's own trailing {param}), so requiring it here closes the gap
 // at its real root instead of adding a third narrow shape-side guard
 // that the next generic envelope shape would just defeat again.
+// pathIsSelfOrParentCollection narrows pathIsAncestorOrSame to the only
+// two places a resource's own create can legitimately live: the read
+// path itself (a PUT-style create at a caller-chosen id) or its own
+// immediate parent collection (the ordinary POST). Anything further up
+// belongs to a DIFFERENT resource.
+//
+// Being an ancestor is not enough, and UBI-246 is what that costs.
+// pathIsAncestorOrSame was added by UBI-222 to stop the inline-schema
+// branch matching any POST in the spec, and it works, but it still
+// admits every ancestor at once. Cloudflare wraps every response in the
+// same envelope, so sameTopLevelProperties passes for all of them, and
+// the tie-break that follows prefers the FEWEST path params, which is
+// the FURTHEST ancestor rather than the nearest. Eight distinct AI
+// Gateway resources therefore all resolved to POST
+// /accounts/{account_id}/ai-gateway/gateways:
+//
+//	GET .../gateways/{gateway_id}/datasets/{id}       -> POST .../gateways
+//	GET .../gateways/{gateway_id}/routes/{id}         -> POST .../gateways
+//	GET .../gateways/{gateway_id}/evaluations/{id}    -> POST .../gateways
+//	...
+//
+// Their own real creates exist in the same spec (POST .../datasets,
+// POST .../routes, POST .../evaluations) and were passed over. This was
+// filed as a naming defect, ten unrelated generated names for what
+// looked like one resource, and the names were never the problem: these
+// are genuinely different resources, correctly named, that were each
+// wired to their grandparent's create. Applying a cloudflare_dataset
+// would have posted to the gateways collection and created a gateway.
+//
+// Restricting to self-or-parent-collection leaves the ordinary shape
+// untouched. For a read at /things/{id} the candidates are still
+// /things/{id} and /things, and the fewest-params tie-break still
+// prefers POST /things over a same-path PUT, exactly as before.
+func pathIsSelfOrParentCollection(readPath, candidatePath string) bool {
+	if !pathIsAncestorOrSame(readPath, candidatePath) {
+		return false
+	}
+	readSegs := len(strings.Split(strings.Trim(readPath, "/"), "/"))
+	candSegs := len(strings.Split(strings.Trim(candidatePath, "/"), "/"))
+	return candSegs >= readSegs-1
+}
+
 func pathIsAncestorOrSame(readPath, candidatePath string) bool {
 	readSegs := strings.Split(strings.Trim(readPath, "/"), "/")
 	candidateSegs := strings.Split(strings.Trim(candidatePath, "/"), "/")
