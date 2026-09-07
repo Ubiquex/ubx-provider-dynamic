@@ -243,7 +243,7 @@ func TestRunGenerateSnapshotGroup_DevBinary_RefusedByDefault(t *testing.T) {
 	prevDir := buildPrevSnapshotDir(t, serveSpec(t, widgetSpec))
 	outDir := filepath.Join(t.TempDir(), "out")
 
-	err := runGenerateSnapshotGroup(outDir, "widgetco", "", prevDir, "", false)
+	err := runGenerateSnapshotGroup(outDir, "widgetco", "", prevDir, "", false, false)
 	if err == nil {
 		t.Fatal("expected refusal, got nil")
 	}
@@ -259,7 +259,7 @@ func TestRunGenerateSnapshotGroup_DevBinary_AllowedWithFlag(t *testing.T) {
 	prevDir := buildPrevSnapshotDir(t, serveSpec(t, widgetSpec))
 	outDir := filepath.Join(t.TempDir(), "out")
 
-	if err := runGenerateSnapshotGroup(outDir, "widgetco", "", prevDir, "", true); err != nil {
+	if err := runGenerateSnapshotGroup(outDir, "widgetco", "", prevDir, "", true, false); err != nil {
 		t.Fatalf("runGenerateSnapshotGroup with --allow-dev-binary: %v", err)
 	}
 	if _, statErr := os.Stat(filepath.Join(outDir, "manifest.json")); statErr != nil {
@@ -275,7 +275,7 @@ func TestRunGenerateSnapshotGroup_RealBinaryVersion_WritesWithoutTheFlag(t *test
 	prevDir := buildPrevSnapshotDir(t, serveSpec(t, widgetSpec))
 	outDir := filepath.Join(t.TempDir(), "out")
 
-	if err := runGenerateSnapshotGroup(outDir, "widgetco", "", prevDir, "", false); err != nil {
+	if err := runGenerateSnapshotGroup(outDir, "widgetco", "", prevDir, "", false, false); err != nil {
 		t.Fatalf("runGenerateSnapshotGroup with a real, stamped BinaryVersion: %v", err)
 	}
 }
