@@ -95,13 +95,40 @@ func DiscoverDataSources(doc *openapi3.T, providerName string) ([]DataSourceCand
 		// allow-list, say -- a flat array of strings, not a wrapper
 		// around another named type) is never mistakenly unwrapped.
 		nounSourceRefName := refName
+		isCollection := false
 		if item, ok := collectionItemRefName(respSchema); ok {
 			nounSourceRefName = item
+			isCollection = true
 		}
 
 		service, _, noun, nounNote := deriveNoun(nounSourceRefName, o.path)
 		if nounNote != "" {
 			notes = append(notes, Note{Path: o.path, Detail: nounNote})
+		}
+
+		// A COLLECTION SAYS SO IN ITS NAME (UBI-241). Unwrapping the
+		// envelope gives the right noun, "deployment" rather than
+		// "deployment_list_result", and that part was correct. Naming the
+		// collection AFTER the item was not: a list GET and an item GET
+		// then derive the identical type name, and only one of them can
+		// have it.
+		//
+		// What that cost, measured on the real kubernetes artifact
+		// before this change: single-item data sources fell from 35 to 6
+		// across one regeneration. `ops` is sorted by path, so
+		// /apis/apps/v1/deployments sorts before
+		// /apis/apps/v1/namespaces/{namespace}/deployments/{name} and the
+		// list won every collision on nothing but lexical order. The
+		// surviving kubernetes_apps_deployment returned every deployment
+		// while reading one by name became unreachable, and its name
+		// still said "deployment".
+		//
+		// So the two are named apart and both survive. The item read
+		// keeps the plain noun, which is what it always meant, and the
+		// collection takes the _list suffix, which is what the generated
+		// names carried before the unwrap was introduced.
+		if isCollection {
+			noun += "_list"
 		}
 
 		operationName := ""
@@ -119,8 +146,17 @@ func DiscoverDataSources(doc *openapi3.T, providerName string) ([]DataSourceCand
 		}
 
 		typeName := typename.Combine(providerName, service, noun)
+		// A genuine remaining collision is two paths that really do
+		// describe the same thing, which is rare now that a collection
+		// and its item are named apart. Still skipped rather than
+		// disambiguated, but the note says which path won, so a real one
+		// is diagnosable from the notes rather than only from a diff of
+		// what came out.
 		if seenTypeNames[typeName] {
-			notes = append(notes, Note{Path: o.path, Detail: "data source type name \"" + typeName + "\" already claimed by another read-only path -- skipped rather than disambiguated"})
+			notes = append(notes, Note{
+				Path:   o.path,
+				Detail: "data source type name \"" + typeName + "\" already claimed by an earlier read-only path -- skipped rather than disambiguated",
+			})
 			continue
 		}
 		seenTypeNames[typeName] = true

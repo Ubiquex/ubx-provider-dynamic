@@ -1,6 +1,7 @@
 package resourcemap
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -85,9 +86,20 @@ func TestDiscoverDataSources_UBI181Rules_ExcludesOperationAndWatch(t *testing.T)
 // whose response schema is a real envelope wrapper (Azure's own
 // "TargetTypeListResult" convention -- a "value" array of $ref'd items
 // plus a "nextLink" pagination field, confirmed live against the real
-// Azure chaos studio spec) must yield the real item noun
-// ("azure_target_type"), never the wrapper's own literal name
+// Azure chaos studio spec) must be named from the real item noun,
+// never from the wrapper's own literal name
 // ("azure_target_type_list_result").
+//
+// UBI-241 amended what it then expects. The unwrap is unchanged and
+// still the point of this test; what changed is that the collection now
+// carries a _list suffix rather than taking the item's own bare name.
+// Naming a collection after its item meant a list GET and an item GET
+// derived the same type name, and only one survived: on the real
+// kubernetes artifact that took single-item data sources from 35 to 6,
+// with the list winning every collision on lexical path order alone.
+//
+// So this asserts both halves now: the wrapper name is still gone, AND
+// the collection is distinguishable from the item.
 func TestDiscoverDataSources_CollectionEnvelope_UnwrapsToRealItemNoun(t *testing.T) {
 	itemRef := openapi3.NewSchemaRef("#/components/schemas/TargetType",
 		openapi3.NewObjectSchema().WithProperty("id", openapi3.NewStringSchema()))
@@ -110,8 +122,56 @@ func TestDiscoverDataSources_CollectionEnvelope_UnwrapsToRealItemNoun(t *testing
 	if len(candidates) != 1 {
 		t.Fatalf("expected exactly 1 candidate, got %d: %v", len(candidates), candidates)
 	}
-	if got := candidates[0].TypeName; got != "azure_target_type" {
-		t.Errorf("expected the collection envelope to unwrap to the real item noun \"azure_target_type\", got %q", got)
+	got := candidates[0].TypeName
+	if got != "azure_target_type_list" {
+		t.Errorf("expected the collection to be named from the item noun with a _list suffix, \"azure_target_type_list\", got %q", got)
+	}
+	// The original point of this test, kept explicit rather than implied
+	// by the assertion above: the wrapper's own name must never surface.
+	if strings.Contains(got, "list_result") {
+		t.Errorf("the envelope wrapper's own name leaked into the type name: %q", got)
+	}
+}
+
+// TestDiscoverDataSources_ItemAndCollection_BothSurvive is UBI-241's own
+// regression: a list GET and an item GET over the same type are two data
+// sources, not a name clash. Before the fix they derived the identical
+// name and the one sorting later by path was dropped with a note.
+func TestDiscoverDataSources_ItemAndCollection_BothSurvive(t *testing.T) {
+	item := openapi3.NewObjectSchema().WithProperty("id", openapi3.NewStringSchema())
+	itemRef := openapi3.NewSchemaRef("#/components/schemas/Widget", item)
+
+	envelope := openapi3.NewObjectSchema().WithProperty("nextLink", openapi3.NewStringSchema())
+	arr := openapi3.NewArraySchema()
+	arr.Items = itemRef
+	envelope.WithPropertyRef("value", openapi3.NewSchemaRef("", arr))
+	envelopeRef := openapi3.NewSchemaRef("#/components/schemas/WidgetListResult", envelope)
+
+	// The collection path sorts FIRST, which is what used to let it claim
+	// the shared name and drop the item read.
+	doc := newTestDoc(map[string]*testOp{
+		"/widgets":              {opID: "widgets_list", resp: envelopeRef},
+		"/widgets/{widgetName}": {opID: "widgets_get", resp: itemRef},
+	})
+
+	candidates, notes, err := DiscoverDataSources(doc, "azure")
+	if err != nil {
+		t.Fatalf("DiscoverDataSources: %v", err)
+	}
+	names := map[string]bool{}
+	for _, c := range candidates {
+		names[c.TypeName] = true
+	}
+	if !names["azure_widget"] {
+		t.Errorf("the single-item read should survive as azure_widget, got %v", names)
+	}
+	if !names["azure_widget_list"] {
+		t.Errorf("the collection should survive as azure_widget_list, got %v", names)
+	}
+	for _, n := range notes {
+		if strings.Contains(n.Detail, "already claimed") {
+			t.Errorf("neither should be dropped as a name clash, but one was: %s", n.Detail)
+		}
 	}
 }
 
