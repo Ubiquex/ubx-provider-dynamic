@@ -299,6 +299,37 @@ type Snapshot struct {
 	// before this existed).
 	Exclude map[string][]string `json:"exclude,omitempty"`
 
+	// Identity is resource type name -> the ubx attribute names that
+	// identify one instance of it, written to its own identity.json
+	// rather than into the manifest.
+	//
+	// It exists because identity has no channel in the tfplugin6 schema.
+	// A SchemaAttribute can say Required, Optional, Computed or
+	// Sensitive, and none of those means "this is how you find the
+	// resource again", so ubx had to guess: an attribute named "id", or
+	// failing that the Required ones. A CloudFormation resource has
+	// neither, since its primaryIdentifier is readOnly and therefore
+	// Computed, which ubx's derivation deliberately excludes as unstable.
+	// The measured result was no lookup key at all for 10% of AWS
+	// resource types and a key missing the identifier for another 53%,
+	// leaving those resources undeletable and outside drift detection.
+	//
+	// Reported through the snapshot rather than the protocol because the
+	// schema is HashiCorp's wire format and not ours to extend, while the
+	// snapshot is already ours and already travels with the provider.
+	//
+	// Its own file, not a manifest field, for the reason the manifest's
+	// own doc comment gives: the manifest is deliberately everything
+	// about the group EXCEPT per-member content, kept small because one
+	// flat file at AWS's 430-member scale already overran GitHub's commit
+	// limit. An identity map at 1728 resource types is small in absolute
+	// terms and still not group-level metadata.
+	//
+	// Absent or empty is always legal and means "this snapshot cannot say",
+	// which is what every snapshot generated before this field says. ubx
+	// falls back to its own derivation, exactly as before.
+	Identity map[string][]string `json:"identity,omitempty"`
+
 	// GeneratedByBinaryVersion records WHICH ubx-provider-dynamic binary
 	// actually cut this snapshot -- stamped by AssembleGroup at
 	// generation time from BinaryVersion (this exact build's own real,
@@ -488,6 +519,11 @@ type manifest struct {
 // shape a release's own snapshot.tar.gz archive bundles (provider.Acquire
 // Schema, ubiquex) -- SaveSplit's own output IS what gets tar'd, not a
 // separately-derived representation.
+// identityFilename is the split format's own third file, alongside
+// manifest.json and members/. Named as a constant so ubiquex's own reader
+// and this writer cannot drift on the spelling.
+const identityFilename = "identity.json"
+
 func SaveSplit(dir string, snap *Snapshot) error {
 	membersDir := filepath.Join(dir, "members")
 	if err := os.MkdirAll(membersDir, 0o755); err != nil {
@@ -526,6 +562,17 @@ func SaveSplit(dir string, snap *Snapshot) error {
 	manData = append(manData, '\n')
 	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), manData, 0o644); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
+	}
+
+	if len(snap.Identity) > 0 {
+		identData, err := json.MarshalIndent(snap.Identity, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshal identity: %w", err)
+		}
+		identData = append(identData, '\n')
+		if err := os.WriteFile(filepath.Join(dir, identityFilename), identData, 0o644); err != nil {
+			return fmt.Errorf("write identity: %w", err)
+		}
 	}
 
 	for _, name := range names {
@@ -573,6 +620,23 @@ func LoadSplit(dir string) (*Snapshot, error) {
 		members[name] = &member
 	}
 
+	// Absent identity.json is legal, not an error: every snapshot
+	// generated before this file existed simply cannot say, and ubx falls
+	// back to its own derivation. A present but unreadable one IS an
+	// error, since silently continuing would look identical to "this
+	// provider has no identity to report" and reintroduce the exact
+	// silence this file exists to remove.
+	var identity map[string][]string
+	identData, err := os.ReadFile(filepath.Join(dir, identityFilename))
+	switch {
+	case err == nil:
+		if err := json.Unmarshal(identData, &identity); err != nil {
+			return nil, fmt.Errorf("parse %s in %s: %w", identityFilename, dir, err)
+		}
+	case !os.IsNotExist(err):
+		return nil, fmt.Errorf("read %s in %s: %w", identityFilename, dir, err)
+	}
+
 	return &Snapshot{
 		SchemaFormat:             man.SchemaFormat,
 		Provider:                 man.Provider,
@@ -580,6 +644,7 @@ func LoadSplit(dir string) (*Snapshot, error) {
 		Members:                  members,
 		Exclude:                  man.Exclude,
 		GeneratedByBinaryVersion: man.generatedByBinaryVersion(),
+		Identity:                 identity,
 	}, nil
 }
 

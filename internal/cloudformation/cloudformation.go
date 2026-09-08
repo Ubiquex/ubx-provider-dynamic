@@ -127,7 +127,7 @@ type BuiltResource struct {
 	NamingStrategy       smithy.Strategy
 	Schema               *tfprotov6.Schema
 	ObjectType           tftypes.Type
-	PrimaryIdentifier    []string // real top-level property names (CFN-cased, e.g. "QueueUrl")
+	PrimaryIdentifier    []string // ubx attribute names, already snake_cased by Build (e.g. "queue_url")
 	CreateOnlyProperties map[string]bool
 	WireNames            WireNames // real, recursive snake_case -> CFN-cased property name map
 }
@@ -452,4 +452,53 @@ func nestedObjectType(o *tfprotov6.SchemaObject) tftypes.Type {
 	default:
 		return obj
 	}
+}
+
+// IdentityAttrs returns the ubx attribute names that identify one
+// instance of this resource type, in the resource's own declared order.
+//
+// This is CloudFormation's own `primaryIdentifier`, translated from its
+// CFN-cased property names into the snake_case attribute names ubx
+// actually sees, via the same WireNames map every other translation here
+// goes through.
+//
+// It exists because identity has no channel in the tfplugin6 schema. A
+// SchemaAttribute can say Required, Optional, Computed or Sensitive, and
+// none of those means "this is how you find the resource again". ubx
+// therefore had to guess, and guessed the Terraform way: an attribute
+// literally named "id", or failing that the Required ones. A CCAPI
+// resource has neither. Its identifier is in readOnlyProperties, so it is
+// Computed, and ubx's derivation deliberately excludes Computed
+// attributes as unstable. The result was that ubx recorded no lookup key
+// for 10% of AWS resource types and a key missing the identifier for
+// another 53%, which left those resources undeletable and, worse, outside
+// drift detection entirely.
+//
+// Reported through the snapshot rather than the protocol: the schema is
+// HashiCorp's wire format and not ours to extend, while the snapshot is
+// already ours and already travels with the provider.
+func (b *BuiltResource) IdentityAttrs() []string {
+	if b == nil || len(b.PrimaryIdentifier) == 0 {
+		return nil
+	}
+	have := map[string]bool{}
+	if b.Schema != nil && b.Schema.Block != nil {
+		for _, a := range b.Schema.Block.Attributes {
+			have[a.Name] = true
+		}
+	}
+	out := make([]string, 0, len(b.PrimaryIdentifier))
+	for _, name := range b.PrimaryIdentifier {
+		if !have[name] {
+			// A primary identifier naming an attribute this resource does
+			// not actually expose is a real translation gap, not something
+			// to paper over: reporting a partial identity would produce a
+			// lookup that silently cannot re-find the resource, which is
+			// the exact failure this mechanism exists to end. Report
+			// nothing and let ubx fall back rather than report a lie.
+			return nil
+		}
+		out = append(out, name)
+	}
+	return out
 }

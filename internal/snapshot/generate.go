@@ -143,14 +143,67 @@ func AssembleGroup(repoName string, prev *Snapshot, members map[string]*MemberSn
 		}
 	}
 
-	return &Snapshot{
+	snap := &Snapshot{
 		SchemaFormat:             CurrentSchemaFormat,
 		Provider:                 repoName,
 		Version:                  version,
 		Members:                  members,
 		Exclude:                  exclude,
 		GeneratedByBinaryVersion: BinaryVersion,
-	}, nil
+	}
+	snap.Identity = collectIdentity(members)
+	return snap, nil
+}
+
+// collectIdentity computes the group's own resource-type -> identifying-
+// attribute map at generation time, from the same Build every member
+// already goes through.
+//
+// Generation time rather than launch time on purpose: ubx needs this and
+// ubx never launches the builders. It reads the snapshot directory and
+// otherwise treats members as opaque payload for the provider, which is
+// the boundary that keeps schema-format knowledge out of ubx entirely.
+// Computing identity here and publishing it as one normalized map is what
+// lets ubx consume it without learning to parse CloudFormation, Smithy,
+// OpenAPI and discovery documents itself.
+//
+// Only CloudFormation members contribute today, and that is deliberate
+// scope rather than an oversight. CFN is where the gap actually bites:
+// its primaryIdentifier is readOnly, therefore Computed, therefore
+// excluded from ubx's own derivation, so 10% of AWS resource types get no
+// lookup key at all. The other sources already surface their identifying
+// values as Required attributes, which ubx's existing derivation does
+// pick up: smithy's ensureIdentifyingAttrsPresent synthesizes the read
+// operation's required input members, and dynserver's
+// ensurePathParamsPresent does the same for read-path parameters. They
+// can report here later, and the format is ready for them, but they are
+// not currently broken and a regeneration of all eight providers is not
+// free.
+//
+// A member that cannot be reloaded is skipped rather than failing the
+// whole group: identity is an enhancement over an existing fallback, and
+// losing a snapshot cut over it would trade a soft limitation for a hard
+// one.
+func collectIdentity(members map[string]*MemberSnapshot) map[string][]string {
+	out := map[string][]string{}
+	for name, member := range members {
+		if member == nil || member.SchemaSource != SchemaSourceCloudFormation {
+			continue
+		}
+		resources, err := LoadCloudFormationMember(name, member)
+		if err != nil {
+			continue
+		}
+		for typeName, rt := range resources {
+			if ident := rt.IdentityAttrs(); len(ident) > 0 {
+				out[typeName] = ident
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // memberChangeLevel is every Generate<Source>Member's own shared "how
