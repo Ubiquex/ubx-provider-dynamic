@@ -60,17 +60,60 @@ func attrToString(v tftypes.Value) (string, error) {
 	return string(b), nil
 }
 
+// objectAsMap converts an object Value into a snake_case-keyed
+// map[string]any, skipping Unknown (Computed, not yet known) attributes
+// entirely and preserving null ones as a nil entry.
+//
+// The per-attribute skip has to happen BEFORE wire.ToJSON is reached, and
+// that ordering is the whole point of this function. ToJSON recurses into
+// an object and refuses the first unknown field it meets, so converting a
+// whole planned object in one call cannot skip anything: on a create,
+// every Computed attribute absent from config is unknown by design (ubx's
+// own ctyvalue.go marks it so, standard planning semantics), and the
+// primary identifier is Computed on essentially every CCAPI resource.
+// desiredStateJSON did convert wholesale and filtered Computed attributes
+// afterwards, one step too late, so `ubx ship` could not create any AWS
+// resource carrying a computed attribute -- 96% of them -- failing with
+// `create resource: encode planned state: wire: field "queue_url": wire:
+// cannot serialize an unknown value to JSON`.
+//
+// Unknown only, and NOT null, which is the one place this deliberately
+// differs from smithy/server's own stateAsMap and dynserver's own
+// requestBody. Those two build a request body, where a null attribute
+// means "do not send this field" and dropping it is right. buildPatch
+// builds an RFC 6902 patch, where a planned null against a non-null prior
+// means "remove this field" and is only detectable because the key is
+// present with a nil value -- dropping nulls here would silently stop
+// emitting every remove operation, turning "unset this attribute" into a
+// no-op. wire.ToJSON already renders a null as nil, so preserving them
+// costs nothing beyond not skipping them. desiredStateJSON does want
+// nulls gone and drops them itself, one line later, exactly as before.
+func objectAsMap(v tftypes.Value) (map[string]any, error) {
+	var m map[string]tftypes.Value
+	if err := v.As(&m); err != nil {
+		return nil, fmt.Errorf("value is not an object: %w", err)
+	}
+	out := make(map[string]any, len(m))
+	for name, attr := range m {
+		if !attr.IsKnown() {
+			continue
+		}
+		jv, err := wire.ToJSON(attr)
+		if err != nil {
+			return nil, fmt.Errorf("field %q: %w", name, err)
+		}
+		out[name] = jv
+	}
+	return out, nil
+}
+
 // desiredStateJSON builds CCAPI's own real, JSON-string-encoded
 // "DesiredState" from planned -- every non-null, non-Computed top-level
 // attribute, real-cased via rt.WireNames.
 func desiredStateJSON(planned tftypes.Value, rt *cloudformation.BuiltResource) (string, error) {
-	j, err := wire.ToJSON(planned)
+	m, err := objectAsMap(planned)
 	if err != nil {
 		return "", fmt.Errorf("encode planned state: %w", err)
-	}
-	m, ok := j.(map[string]any)
-	if !ok {
-		return "", fmt.Errorf("planned state is not an object")
 	}
 	computed := computedAttrNames(rt.Schema.Block.Attributes)
 
@@ -111,16 +154,20 @@ func computedAttrNames(attrs []*tfprotov6.SchemaAttribute) map[string]bool {
 // attribute genuinely changes -- ubx core's own plan step, not this
 // provider's job to re-derive here.
 func buildPatch(prior, planned tftypes.Value, rt *cloudformation.BuiltResource) (string, error) {
-	priorJSON, err := wire.ToJSON(prior)
+	// Same per-attribute skip as desiredStateJSON, for the same reason: an
+	// update's own planned state carries unknowns too, for any Computed
+	// attribute absent from config, so converting either side wholesale
+	// fails identically. A skipped attribute simply produces no patch
+	// operation, which is correct: an unknown is a value CCAPI is about to
+	// decide, never one to send it.
+	priorMap, err := objectAsMap(prior)
 	if err != nil {
 		return "", fmt.Errorf("encode prior state: %w", err)
 	}
-	plannedJSON, err := wire.ToJSON(planned)
+	plannedMap, err := objectAsMap(planned)
 	if err != nil {
 		return "", fmt.Errorf("encode planned state: %w", err)
 	}
-	priorMap, _ := priorJSON.(map[string]any)
-	plannedMap, _ := plannedJSON.(map[string]any)
 	computed := computedAttrNames(rt.Schema.Block.Attributes)
 
 	type op struct {
