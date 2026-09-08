@@ -136,8 +136,16 @@ func (f *fakeCCAPIServer) handler() http.HandlerFunc {
 			identifier := body["Identifier"].(string)
 			props, ok := f.created[identifier]
 			if !ok || f.deleted[identifier] {
-				w.WriteHeader(http.StatusNotFound)
-				w.Write([]byte(`{"__type":"ResourceNotFoundException","Message":"not found"}`))
+				// HTTP 400 with a typed body, which is what real CCAPI
+				// answers, NOT a REST-shaped 404. This fake returned 404
+				// and that is exactly why the suite never caught the
+				// classification gap: restexec.IsNotFound matched the
+				// fake's 404 and never the real thing, so ReadResource's
+				// own "gone" branch looked reachable here and was
+				// unreachable in production. A fake that is easier to
+				// satisfy than the real API is worse than no fake.
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte(`{"__type":"com.amazon.cloudapiservice#ResourceNotFoundException","Message":"Resource of type 'AWS::SQS::Queue' with identifier 'x' was not found. (HandlerErrorCode: NotFound)"}`))
 				return
 			}
 			propsJSON, _ := json.Marshal(props)
@@ -152,6 +160,15 @@ func (f *fakeCCAPIServer) handler() http.HandlerFunc {
 
 		case "CloudApiService.DeleteResource":
 			identifier := body["Identifier"].(string)
+			if _, ok := f.created[identifier]; !ok {
+				// Real CCAPI refuses to delete what it cannot find, with
+				// the same 400-plus-__type shape GetResource uses. The
+				// fake used to succeed unconditionally, which hid the
+				// destroy half of the classification gap.
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte(`{"__type":"com.amazon.cloudapiservice#ResourceNotFoundException","Message":"not found"}`))
+				return
+			}
 			f.deleted[identifier] = true
 			token := "delete-" + identifier
 			f.polls[token] = 0
