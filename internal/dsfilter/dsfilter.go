@@ -133,7 +133,34 @@ var executionOrEventWords = []string{"execution", "event", "activity", "activity
 // "availability" -- a bare word would also match "availability_zone",
 // which is genuinely rule 5's own high-volume reference duplication,
 // not a computed check.
-var computedValueWords = []string{"name_availability", "sku_availability", "estimate", "estimation", "quota", "usage", "cost", "validation", "capability", "capabilities", "eligibility", "compatibility"}
+//
+// A bare "quota" used to be on this list and was the same mistake this
+// comment already warns about, one word later. This rule means "a
+// derived check or estimate, not a real stored lookup", and a quota is
+// usually the opposite: a stored object with a spec someone authored,
+// where only its status is derived. Every quota-bearing type in the real
+// corpus is one of those:
+//
+//	kubernetes  core.ResourceQuota          spec.hard is authored
+//	google      netapp.QuotaRule            a rule you write
+//	google      cloudquotas.QuotaPreference a preference you set
+//	aws         batch.QuotaShare            share configuration
+//	azure       netapp.VolumeQuotaRule      a rule you write
+//	datadog     rum.RetentionQuotaConfig    configuration
+//
+// matchesExact matches on whole "_"-delimited components, so the bare
+// token caught every one of them. They all still exist as RESOURCES,
+// because they have ordinary collection creates and never reach the
+// create-verb allowlist this filter also gates; what the token removed
+// was the ability to READ one, which is why the corpus has essentially
+// no quota data sources.
+//
+// The genuinely derived quota shapes are still excluded, by the words
+// that actually describe them: "quota_usage" matches "usage",
+// "quota_estimate" matches "estimate", "quota_cost" matches "cost".
+// Nothing was added to compensate, because inventing compound tokens for
+// shapes the corpus does not contain would be guessing.
+var computedValueWords = []string{"name_availability", "sku_availability", "estimate", "estimation", "usage", "cost", "validation", "capability", "capabilities", "eligibility", "compatibility"}
 
 var referenceDuplicationWords = []string{"location", "region", "zone", "availability_zone"}
 

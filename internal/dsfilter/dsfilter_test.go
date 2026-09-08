@@ -211,3 +211,42 @@ func TestSamePathAction(t *testing.T) {
 		}
 	}
 }
+
+// TestComputedValue_QuotaIsNotDerivedByItself is the correction to a
+// token that failed this rule's own definition.
+//
+// Rule 4 means "a derived check or estimate, not a real stored lookup".
+// A bare "quota" caught every quota-bearing type in the real corpus, and
+// all of them are stored objects with authored specs where only the
+// status is derived: kubernetes core.ResourceQuota, google
+// netapp.QuotaRule and cloudquotas.QuotaPreference, aws batch.QuotaShare,
+// azure netapp.VolumeQuotaRule, datadog rum.RetentionQuotaConfig.
+//
+// name_availability is the precedent, and its own comment one line above
+// warns about exactly this: a bare word matching more than the shape it
+// describes.
+func TestComputedValue_QuotaIsNotDerivedByItself(t *testing.T) {
+	stored := []string{
+		"quota",
+		"resource_quota",
+		"quota_rule",
+		"quota_preference",
+		"quota_share",
+		"volume_quota_rule",
+		"retention_quota_config",
+	}
+	for _, noun := range stored {
+		if reason, ex := Excluded(Candidate{Noun: noun, Path: "/x", OperationName: "Get"}); ex {
+			t.Errorf("%q is a stored object with an authored spec, excluded as %q", noun, reason)
+		}
+	}
+
+	// The genuinely derived shapes stay excluded, by the words that
+	// actually describe them rather than by the noun they attach to.
+	derived := []string{"quota_usage", "quota_estimate", "quota_cost", "usage", "estimate", "name_availability"}
+	for _, noun := range derived {
+		if _, ex := Excluded(Candidate{Noun: noun, Path: "/x", OperationName: "Get"}); !ex {
+			t.Errorf("%q is a derived value and should still be excluded", noun)
+		}
+	}
+}
