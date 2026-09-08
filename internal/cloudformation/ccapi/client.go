@@ -40,6 +40,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -290,4 +291,52 @@ func (c *Client) AwaitTerminal(ctx context.Context, requestToken string, interva
 			return nil, fmt.Errorf("await terminal status for %s: %w", requestToken, ctx.Err())
 		}
 	}
+}
+
+// IsNotFound reports whether err is CCAPI's own "this resource does not
+// exist" answer.
+//
+// restexec.IsNotFound is not enough here, and the difference is the whole
+// reason this exists. That helper matches HTTP 404, "matching every real
+// provider's own not-found convention" as its doc comment says, which is
+// true of REST APIs and false of this one. CCAPI speaks awsJson1_0, where
+// the HTTP status carries almost nothing and the error identity lives in
+// the body's own "__type" field. A missing resource comes back as
+// HTTP 400 with:
+//
+//	{"__type":"com.amazon.cloudapiservice#ResourceNotFoundException",
+//	 "Message":"... with identifier '...' was not found. (HandlerErrorCode: NotFound ...)"}
+//
+// So the 404 check never fired, ReadResource's own "gone" branch
+// (server.go: newVal == nil) was unreachable for a deleted resource, and
+// the read surfaced a hard provider error instead. That made an
+// out-of-band deletion invisible to ubx on every AWS resource: `ubx scan`
+// failed rather than recording the disappearance, and drift detection
+// could not report it either.
+//
+// Matched on the shape after "#" rather than the full name, since the
+// service prefix is AWS's to change and the exception name is the part
+// that carries the meaning.
+func IsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if restexec.IsNotFound(err) {
+		return true
+	}
+	var apiErr *restexec.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	var payload struct {
+		Type string `json:"__type"`
+	}
+	if jsonErr := json.Unmarshal([]byte(apiErr.Body), &payload); jsonErr != nil {
+		return false
+	}
+	name := payload.Type
+	if i := strings.LastIndex(name, "#"); i >= 0 {
+		name = name[i+1:]
+	}
+	return name == "ResourceNotFoundException"
 }

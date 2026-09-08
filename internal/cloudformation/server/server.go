@@ -223,7 +223,14 @@ func (s *Server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 func (s *Server) readFromAPI(ctx context.Context, rt *cloudformation.BuiltResource, identifier string) (*tftypes.Value, []*tfprotov6.Diagnostic, error) {
 	propsJSON, err := s.CCAPI.GetResource(ctx, rt.TypeName, identifier)
 	if err != nil {
-		if restexec.IsNotFound(err) {
+		// ccapi.IsNotFound, not restexec.IsNotFound: CCAPI speaks
+		// awsJson1_0 and reports a missing resource as HTTP 400 carrying
+		// a "__type" of ResourceNotFoundException, never a 404. The 404
+		// check never fired, so ReadResource's own "gone" branch below
+		// (newVal == nil) was unreachable for a deleted resource and the
+		// read surfaced a hard provider error instead, making every
+		// out-of-band deletion invisible to ubx.
+		if ccapi.IsNotFound(err) {
 			return nil, nil, nil
 		}
 		diags, ambiguous := classifyError("read resource", err)
@@ -375,6 +382,18 @@ func (s *Server) applyDestroy(ctx context.Context, rt *cloudformation.BuiltResou
 
 	pe, err := s.CCAPI.DeleteResource(ctx, rt.TypeName, identifier)
 	if err != nil {
+		// Already gone is success, not failure. ubx ship is idempotent by
+		// contract (docs/executor.md), and a destroy that has to be
+		// retried after the delete itself succeeded, or that races an
+		// out-of-band deletion, must converge rather than wedge the
+		// proposal. Same classification gap as the read above: without
+		// it, CCAPI's 400-with-__type answer read as a hard error.
+		if ccapi.IsNotFound(err) {
+			// Same empty response the normal destroy success returns
+			// below, so "already gone" and "just deleted it" are
+			// indistinguishable to the caller, which is the point.
+			return &tfprotov6.ApplyResourceChangeResponse{}, nil
+		}
 		diags, ambiguous := classifyError("destroy resource", err)
 		if ambiguous != nil {
 			return nil, ambiguous
