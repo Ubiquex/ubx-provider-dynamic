@@ -12,6 +12,59 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
+      # The base branch is main, enforced rather than asked.
+      #
+      # TRAPS.md's own "a stacked PR is only safe while its base is
+      # unmerged" trap. A PR based on another branch merges into THAT
+      # branch. GitHub retargets it when the base lands on main, but
+      # only if it gets there first, and twice in ubiquex it did not:
+      # the dependent PR merged into an already-dead base seconds
+      # later, showed MERGED, and its content never reached main.
+      #
+      # stale-base-check (where this org has it) asks the narrower
+      # question, whether the base is ALREADY merged, and it is a real
+      # guard. It cannot catch this shape though: it triggers on
+      # pull_request opened/synchronize/reopened, so it evaluates when
+      # the PR is pushed and never at the moment the merge button is
+      # clicked, which is the one moment the trap fires. A PR opened
+      # while its base was healthy stays green through the base
+      # merging out from under it.
+      #
+      # This question does not depend on when it is asked. The base is
+      # main or it is not, and that cannot change between opening and
+      # merging except by retargeting, which only moves it toward main.
+      #
+      # It lives inside a job branch protection already requires, so a
+      # stacked PR cannot merge rather than merely being discouraged,
+      # and no branch-protection change was needed to add it.
+      - name: The base branch is main
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ "$BASE" = "main" ]; then
+            echo "base is main"
+            exit 0
+          fi
+          {
+            echo "This PR targets \"$BASE\", not main."
+            echo
+            echo "A PR based on another branch merges into THAT branch. If the base"
+            echo "reaches main first, this PR merges into a dead branch, reports MERGED,"
+            echo "and its content never lands. Nothing tells that apart from a real merge"
+            echo "except an explicit ancestry check after the fact."
+            echo
+            echo "Branch from main and open this against main. If it genuinely depends on"
+            echo "unmerged work, wait for that to land and rebase onto main:"
+            echo
+            echo "    git rebase --onto main <old-base> <this-branch>"
+            echo
+            echo "If a non-main base is ever genuinely right in this repo, change this step"
+            echo "deliberately, in its own reviewed PR, rather than working around it."
+          } >&2
+          exit 1
+
       - name: Check out
         uses: actions/checkout@v4
 
