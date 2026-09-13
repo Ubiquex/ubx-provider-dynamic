@@ -186,6 +186,7 @@ func Build(files map[string]*ResourceSchema, known smithy.KnownNames) (map[strin
 		applyReadOnly(root, rs.ReadOnlyProperties)
 
 		attrs := tr.BuildTopLevel(root, typeName)
+		markServerDefaultable(attrs)
 		if len(attrs) == 0 {
 			notes = append(notes, Note{TypeName: typeName, Detail: "no usable top-level properties -- skipped"})
 			continue
@@ -501,4 +502,78 @@ func (b *BuiltResource) IdentityAttrs() []string {
 		out = append(out, name)
 	}
 	return out
+}
+
+// markServerDefaultable turns every plain-Optional attribute into
+// Optional+Computed, recursively (UBI-268).
+//
+// tfplugin's Optional-alone means "you may set this, and if you do not,
+// nothing will". Optional+Computed means "you may set this, and if you do
+// not, the provider will". Almost every optional CloudFormation property
+// is the second, and this source declared all of them as the first: zero
+// Optional+Computed attributes across 15,967, measured against the real
+// registry.
+//
+// That is not a bug in a rule, it is a rule that could never fire.
+// uschema.fieldPolicy is a strict three-way over one schema's own
+// signals, and its own doc comment says where the combination comes from:
+// uschema.MergeResourceAttributes, combining a create-request schema with
+// a read-response schema. Every other source calls it. CloudFormation
+// cannot, because the registry publishes ONE schema per resource. There is
+// no second schema to merge.
+//
+// So the combination has to be asserted rather than derived, and the
+// question is what to assert it from. The answer, measured rather than
+// assumed, is that the registry does not carry the information:
+//
+//   - 153 of 8,051 optional properties (1.9%) carry a `default`.
+//   - 229 (2.8%) have a description whose prose implies one. Combined
+//     coverage with `default` is 4.5%.
+//   - Every other field the registry publishes was enumerated. None
+//     indicates server-defaulting.
+//
+// None of that would have fixed the case this came from. AWS::SQS::Queue
+// has no property with a `default` at all, and MaximumMessageSize matches
+// no prose pattern, yet AWS sets it, SqsManagedSseEnabled and
+// VisibilityTimeout at creation. A modify that did not mention them
+// planned to REMOVE all three from a live queue.
+//
+// HashiCorp's own awscc provider generates from this identical registry
+// and reached the same conclusion. Its aws_sqs_queue declares 7
+// Optional+Computed, 2 Computed-only (the readOnlyProperties), and zero
+// Optional-only, including for the two attributes that carry no signal.
+// It applies the blanket rule too.
+//
+// The asymmetry settles it. Declaring Optional+Computed for a property
+// nothing actually defaults is conservative: a consumer keeps a value it
+// could have discarded. Declaring Optional-alone for one that IS defaulted
+// is destructive: a consumer strips a real setting from live
+// infrastructure, which is what nearly happened.
+//
+// readOnly attributes are untouched: they arrive Computed and NOT
+// Optional, which is the stronger, accurate statement that a user cannot
+// set them at all. Preserving that distinction is load-bearing on the
+// consuming side, where "the provider owns this outright" and "the
+// provider may supply this" answer different questions (ubiquex UBI-268's
+// own predicate split, which landed first precisely so this change would
+// not silently suppress drift on ~8,000 attributes).
+//
+// WriteOnly is excluded for the same reason inverted: a write-only
+// attribute is never returned, so the provider cannot be said to supply
+// its value. CloudFormation drops writeOnlyProperties at parse time today
+// and produces none, so this guard is currently unreachable; it is here so
+// the rule stays correct if that changes rather than quietly becoming
+// wrong.
+func markServerDefaultable(attrs []*tfprotov6.SchemaAttribute) {
+	for _, a := range attrs {
+		if a == nil {
+			continue
+		}
+		if a.Optional && !a.Computed && !a.WriteOnly {
+			a.Computed = true
+		}
+		if a.NestedType != nil {
+			markServerDefaultable(a.NestedType.Attributes)
+		}
+	}
 }
