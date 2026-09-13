@@ -206,9 +206,29 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("%s %s: HTTP %d: %s", e.Method, e.Path, e.StatusCode, body)
 }
 
-// IsNotFound reports whether err represents a real HTTP 404 -- ReadResource's
-// own "the resource is genuinely gone" signal, matching every real
-// provider's own not-found convention.
+// IsNotFound reports whether err represents a real HTTP 404 --
+// ReadResource's own "the resource is genuinely gone" signal.
+//
+// This is the REST convention, and it is NOT universal. An earlier
+// version of this comment claimed it matched "every real provider's own
+// not-found convention", and that claim is what produced a real bug:
+// CCAPI speaks awsJson1_0, where the HTTP status carries almost nothing
+// and the error identity lives in the body's own "__type" field, so a
+// missing resource comes back as HTTP 400 with a
+// ResourceNotFoundException. This helper never fired for it,
+// ReadResource's "gone" branch was unreachable in production, and every
+// out-of-band deletion was invisible to ubx on every AWS resource.
+//
+// Before reusing this for a new API, check what that API actually
+// answers rather than assuming 404. Where it differs, write a
+// protocol-specific classifier next to that client, as
+// ccapi.IsNotFound does, rather than widening this one: a 404 check
+// that also accepts other shapes would start matching errors that are
+// not not-found for the protocols where 404 IS the convention.
+//
+// (UBI-252, which is about fixtures being more permissive than the real
+// APIs they stand in for. This comment was the other half of the same
+// problem: a claim about the real API that nothing verified.)
 func IsNotFound(err error) bool {
 	var apiErr *APIError
 	return errors.As(err, &apiErr) && apiErr.StatusCode == 404
