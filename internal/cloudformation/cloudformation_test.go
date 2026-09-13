@@ -3,6 +3,7 @@ package cloudformation
 import (
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
 	"github.com/ubiquex/ubx-provider-dynamic/internal/smithy"
@@ -167,5 +168,105 @@ func TestBuild_NullableTypeArray(t *testing.T) {
 	}
 	if _, ok := built["aws_test_thing"]; !ok {
 		t.Fatalf("expected aws_test_thing, got keys: %v", keysOf(built))
+	}
+}
+
+// TestBuild_OptionalPropertiesAreServerDefaultable is UBI-268.
+//
+// A CloudFormation property that is neither readOnly nor required must be
+// declared Optional AND Computed: a user may set it, and AWS supplies a
+// value when they do not. This source declared every one of them
+// Optional-alone, which says nothing supplies it, across all 15,967
+// attributes in the real registry.
+//
+// The consequence was destructive rather than cosmetic. A consumer that
+// branches on Computed to decide whether an omitted attribute should be
+// preserved will read Optional-alone as "the user removed this", and a
+// modify that never mentioned an AWS-defaulted setting planned to strip it
+// from a live queue.
+//
+// The three flag combinations are pinned together on purpose, because
+// getting the rule right means getting all three right at once: the
+// readOnly case must NOT gain Optional, and the required case must not
+// gain Computed.
+func TestBuild_OptionalPropertiesAreServerDefaultable(t *testing.T) {
+	built, _, err := Build(
+		map[string]*ResourceSchema{"AWS::SQS::Queue": realQueueFixture()},
+		smithy.KnownNames{"aws_sqs_queue": true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := built["aws_sqs_queue"]
+
+	byName := map[string]*tfprotov6.SchemaAttribute{}
+	for _, a := range rt.Schema.Block.Attributes {
+		byName[a.Name] = a
+	}
+
+	// Neither readOnly nor required: the case that was wrong.
+	for _, name := range []string{"delay_seconds", "redrive_policy", "tags"} {
+		a, ok := byName[name]
+		if !ok {
+			t.Fatalf("%s missing from the built schema", name)
+		}
+		if !a.Optional || !a.Computed {
+			t.Fatalf("%s: optional=%v computed=%v, want both -- a user may set it and AWS supplies it otherwise",
+				name, a.Optional, a.Computed)
+		}
+	}
+
+	// readOnly stays Computed and NOT Optional. This is the stronger,
+	// accurate statement that a user cannot set it at all, and the
+	// distinction is load-bearing on the consuming side: "the provider
+	// owns this outright" and "the provider may supply this" answer
+	// different questions.
+	for _, name := range []string{"queue_url", "arn"} {
+		a, ok := byName[name]
+		if !ok {
+			t.Fatalf("%s missing from the built schema", name)
+		}
+		if !a.Computed || a.Optional {
+			t.Fatalf("%s: optional=%v computed=%v, want computed-only -- a readOnly property is not something a user may set",
+				name, a.Optional, a.Computed)
+		}
+	}
+
+	// required stays required, and must not pick up Computed.
+	if a := byName["queue_name"]; a == nil || !a.Required || a.Computed || a.Optional {
+		t.Fatalf("queue_name: %+v, want required-only", a)
+	}
+}
+
+// TestBuild_NestedOptionalPropertiesAreServerDefaultable covers the
+// recursion. 3,489 of the registry's 16,017 top-level properties are
+// object- or ref-typed, so a rule that stopped at the top level would
+// leave most of the schema saying the same untrue thing one level down.
+func TestBuild_NestedOptionalPropertiesAreServerDefaultable(t *testing.T) {
+	built, _, err := Build(
+		map[string]*ResourceSchema{"AWS::SQS::Queue": realQueueFixture()},
+		smithy.KnownNames{"aws_sqs_queue": true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var redrive *tfprotov6.SchemaAttribute
+	for _, a := range built["aws_sqs_queue"].Schema.Block.Attributes {
+		if a.Name == "redrive_policy" {
+			redrive = a
+		}
+	}
+	if redrive == nil || redrive.NestedType == nil {
+		t.Fatal("redrive_policy: expected a nested object attribute")
+	}
+	if len(redrive.NestedType.Attributes) == 0 {
+		t.Fatal("redrive_policy: nested attributes missing, so this test proves nothing")
+	}
+	for _, a := range redrive.NestedType.Attributes {
+		if !a.Optional || !a.Computed {
+			t.Fatalf("redrive_policy.%s: optional=%v computed=%v, want both -- the rule must recurse",
+				a.Name, a.Optional, a.Computed)
+		}
 	}
 }
